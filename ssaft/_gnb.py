@@ -1,6 +1,6 @@
-"""Gaussian naive Bayes celltype mapping for cellman.spatial.
+"""Gaussian naive Bayes celltype mapping for ssaft.
 
-An alternative to the centroid-correlation mapper (:func:`cellman.spatial._count.map_corr`).
+An alternative to the centroid-correlation mapper (:func:`ssaft._count.map_corr`).
 A :class:`~sklearn.naive_bayes.GaussianNB` (cuML on GPU, scikit-learn on CPU) is fitted on
 the labeled ``normalized_vectors`` — ALL of them, streamed via ``partial_fit`` so the full
 matrix is never resident — and every field voxel is classified by its posterior. Being

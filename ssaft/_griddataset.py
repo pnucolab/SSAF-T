@@ -9,7 +9,7 @@ the count path rasterizes counts onto a grid and GPU-blurs them into a
 KDE-equivalent vector field (see :meth:`Analysis.compute_vf`).
 
 ``GridDataset`` is the lightweight hand-off between a platform loader
-(:mod:`cellman.spatial._io`) and that backend. It deliberately does **not** wrap a
+(:mod:`ssaft._io`) and that backend. It deliberately does **not** wrap a
 SpatialData object.
 """
 
@@ -86,7 +86,7 @@ class GridDataset:
     raw : AnnData
         Point/bin-level counts. ``obsm['spatial']`` holds x,y in **µm**;
         ``var_names`` are gene symbols. This is the unit HVG selection and
-        rasterization operate on (via :func:`cellman.spatial._io.aggregate_to_grid`).
+        rasterization operate on (via :func:`ssaft._io.aggregate_to_grid`).
     image : numpy.ndarray
         Morphology / staining image used for tissue-mask voxel sampling. Either
         ``(c, y, x)`` or ``(y, x)``. ssDNA (Stereo-seq), H&E (Visium HD /

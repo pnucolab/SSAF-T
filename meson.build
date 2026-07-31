@@ -1,4 +1,4 @@
-project('cellman', 'cpp',
+project('ssaft', 'cpp',
   version: '0.1.0',
   license: 'BSD-3-Clause',
   meson_version: '>= 0.64.0',
@@ -45,9 +45,9 @@ if get_option('debug-symbols')
   cpp_args += ['-g']
 endif
 
-# C++ extension module (compiled from cellman/spatial/_core/utils.cpp; installed as cellman.spatial.utils)
+# C++ extension module (compiled from ssaft/_core/utils.cpp; installed as ssaft.utils)
 utils_ext = py.extension_module('utils',
-  sources: ['cellman/spatial/_core/utils.cpp'],
+  sources: ['ssaft/_core/utils.cpp'],
   include_directories: [
     include_directories(incdir_numpy),
   ],
@@ -55,31 +55,27 @@ utils_ext = py.extension_module('utils',
   cpp_args: cpp_args,
   link_args: link_args,
   install: true,
-  subdir: 'cellman/spatial'
+  subdir: 'ssaft'
 )
 
 # Pure-Python package sources
 py.install_sources([
-  'cellman/__init__.py',
-], subdir: 'cellman')
-
-py.install_sources([
-  'cellman/spatial/__init__.py',
-  'cellman/spatial/_analysis.py',
-  'cellman/spatial/_dataset.py',
-  'cellman/spatial/_kde_gpu.py',
-  'cellman/spatial/_mapping_gpu.py',
+  'ssaft/__init__.py',
+  'ssaft/_analysis.py',
+  'ssaft/_dataset.py',
+  'ssaft/_kde_gpu.py',
+  'ssaft/_mapping_gpu.py',
   # count-based (blur) backend
-  'cellman/spatial/_griddataset.py',
-  'cellman/spatial/_panel.py',
-  'cellman/spatial/_count.py',
-  'cellman/spatial/_gnb.py',
-  'cellman/spatial/_mapping_inputs.py',
-], subdir: 'cellman/spatial')
+  'ssaft/_griddataset.py',
+  'ssaft/_panel.py',
+  'ssaft/_count.py',
+  'ssaft/_gnb.py',
+  'ssaft/_mapping_inputs.py',
+], subdir: 'ssaft')
 
 # count-based loaders subpackage
 py.install_sources([
-  'cellman/spatial/_io/__init__.py',
-  'cellman/spatial/_io/_grid.py',
-  'cellman/spatial/_io/_loaders.py',
-], subdir: 'cellman/spatial/_io')
+  'ssaft/_io/__init__.py',
+  'ssaft/_io/_grid.py',
+  'ssaft/_io/_loaders.py',
+], subdir: 'ssaft/_io')

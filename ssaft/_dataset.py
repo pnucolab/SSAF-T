@@ -31,7 +31,7 @@ except ImportError:
 
 class Dataset(object):
     """
-    A class to store initial values and results of a ``cellman.spatial`` analysis.
+    A class to store initial values and results of a ``ssaft`` analysis.
 
     :param genes: The genes that will be used for the analysis.
     :type genes: list(str)    

@@ -2071,7 +2071,7 @@ static struct PyMethodDef module_methods[] = {
 #if PY_MAJOR_VERSION >= 3
 static struct PyModuleDef moduledef_utils = {
         PyModuleDef_HEAD_INIT,
-        "cellman.spatial.utils",
+        "ssaft.utils",
         NULL,
         -1,
         module_methods

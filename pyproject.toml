@@ -8,9 +8,9 @@ requires = [
 build-backend = "mesonpy"
 
 [project]
-name = "cellman"
+name = "ssaft"
 version = "0.1.0"
-description = "CeLLMan — agentic KG-based cell-type annotation + segmentation-free spatial cell-type mapping"
+description = "SSAF-T — Spatial Segmentation-free Agentic Framework for Transcriptomics"
 readme = "README.md"
 license = {text = "BSD-3-Clause"}
 requires-python = ">=3.9"

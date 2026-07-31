@@ -1,3 +1,13 @@
+"""SSAF-T — Spatial Segmentation-free Agentic Framework for Transcriptomics.
+
+Segmentation-free, multi-platform spatial cell-type mapping: transcript-level
+KDE vector field, per-pixel cell-type assignment (``import ssaft``).
+
+The agentic annotation component ships as a separate repository, CeLLMan
+(https://github.com/pnucolab/CeLLMan), linked here as the ``CeLLMan/``
+submodule. It is driven by an LLM host, not imported from this package.
+"""
+
 from ._analysis import Analysis
 from ._dataset import Dataset
 

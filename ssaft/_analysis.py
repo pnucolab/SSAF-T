@@ -114,7 +114,7 @@ else:
 
 class Analysis(object):
     """
-    A class to run a ``cellman.spatial`` analysis.
+    A class to run a ``ssaft`` analysis.
     
     Supports both pandas.DataFrame and spatialdata.SpatialData as input data formats.
     
@@ -553,7 +553,7 @@ class Analysis(object):
     def _celltype_names_colors(self, cmap=None):
         """``(names, colors)`` for the celltype ids 0..K-1, both length K.
 
-        Written by :func:`~cellman.spatial._mapping_inputs.build_centroids_from_h5ad`.
+        Written by :func:`~ssaft._mapping_inputs.build_centroids_from_h5ad`.
         K is ``centroids.shape[0]`` — every class the mapping can emit, including
         the ones that never win a voxel — so the palette never depends on which
         classes happen to survive filtering. Stores built before these keys
@@ -1350,12 +1350,12 @@ class Analysis(object):
         Transcript platforms do NOT call this — their field is computed per-chunk
         inside :meth:`map_celltypes`.
 
-        Two independent resolutions (see :func:`cellman.spatial._count.compute_vf_blur`):
+        Two independent resolutions (see :func:`ssaft._count.compute_vf_blur`):
 
         Parameters
         ----------
         grid : GridDataset or AnnData
-            A :class:`cellman.spatial.GridDataset` (raw counts are aggregated to a
+            A :class:`ssaft.GridDataset` (raw counts are aggregated to a
             ``bin_um`` grid using ``grid.origin``), or a pre-aggregated bin-level
             AnnData with ``obs['array_row'/'array_col']``.
         bin_um : float
@@ -1474,14 +1474,14 @@ class Analysis(object):
           was remembered) AND the store already holds a blur ``vf_normalized``:
           voxels are sampled from the tissue image and *looked up* in that field
           (no KDE). Delegates to
-          :func:`cellman.spatial._count.select_vectors_from_image`.
+          :func:`ssaft._count.select_vectors_from_image`.
         * **transcript** — otherwise: voxels are sampled from the H&E tissue mask
           and KDE is computed at each (the original path below).
 
 
         If ``auto_gpu`` is True (default) and a usable CUDA device is
         detected (``torch + triton + cuda.is_available()``), the underlying
-        ``cellman.spatial.utils.kde_at_points`` is transparently routed to the Triton
+        ``ssaft.utils.kde_at_points`` is transparently routed to the Triton
         GPU kernel for the duration of this call. Otherwise the original
         C++/OpenMP CPU implementation is used. The user therefore does
         not need to wrap the call in ``with gpu_kde(...): ...``.
@@ -1902,8 +1902,8 @@ class Analysis(object):
             the CPU KDE producer with the (GPU) classifier.
         map_kwargs : dict, optional
             Extra kwargs forwarded to the count mapper
-            (:func:`cellman.spatial._count.map_corr` /
-            :func:`cellman.spatial._gnb.map_gnb`).
+            (:func:`ssaft._count.map_corr` /
+            :func:`ssaft._gnb.map_gnb`).
         gpu_device : str, default ``'cuda'``
             CUDA device used by the GPU path.
         force_cpu : bool, default False

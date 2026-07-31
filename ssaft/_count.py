@@ -1,4 +1,4 @@
-"""Count-data vector-field backend for cellman.spatial.
+"""Count-data vector-field backend for ssaft.
 
 For count platforms the KDE-equivalent vector field is built by **rasterizing bin
 counts onto a grid and GPU Gaussian-blurring** it (:func:`compute_vf_blur`),
