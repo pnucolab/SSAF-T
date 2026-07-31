@@ -13,7 +13,7 @@ submodule: one specialized agent per organism and organ mines PubMed into a know
 cell-type marker genes and infers cell identity from the sampled mRNA signals.
 
 <p align="center">
-  <img src="ssaft.png" alt="SSAF-T overview" width="900">
+  <img src="SSAF-T.png" alt="SSAF-T overview" width="900">
 </p>
 
 ---
