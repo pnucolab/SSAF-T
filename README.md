@@ -80,12 +80,13 @@ printf '\n[sandbox_workspace_write]\nnetwork_access = true\n' >> .codex/config.t
 
 Full documentation is in preparation and will be published on Read the Docs.
 
-Until then, `notebooks/` holds one worked example per data modality:
+Until then, `notebooks/` holds one worked example per data modality. Each notebook starts with the commands
+that download its public dataset into `notebooks/data/`, and writes its results to `notebooks/outputs/`:
 
-| notebook | modality |
-|---|---|
-| [`notebooks/visiumhd_small_intestine.ipynb`](notebooks/visiumhd_small_intestine.ipynb) | array-based spatial transcriptomics |
-| [`notebooks/xenium_kidney.ipynb`](notebooks/xenium_kidney.ipynb) | imaging-based spatial transcriptomics |
+| notebook | modality | map |
+|---|---|---|
+| [`notebooks/tutorial_visiumhd_small_intestine.ipynb`](notebooks/tutorial_visiumhd_small_intestine.ipynb) | array-based spatial transcriptomics (Visium HD, mouse small intestine) | 2D |
+| [`notebooks/tutorial_xenium_kidney_3d.ipynb`](notebooks/tutorial_xenium_kidney_3d.ipynb) | imaging-based spatial transcriptomics (Xenium, mouse kidney) | 3D |
 
 For scRNA-seq — where no spatial mapping is involved and CeLLMan is used on its own — see
 [`CeLLMan/notebooks/TS_lung.ipynb`](CeLLMan/notebooks/TS_lung.ipynb).

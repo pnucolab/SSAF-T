@@ -54,45 +54,6 @@ def aggregate_to_grid(adata: ad.AnnData, bin_um: float,
     return out
 
 
-def read_square_bin_gem(gem_path: str, bin_size: int = 1) -> ad.AnnData:
-    """Read a Stereo-seq bin1 GEM (gzipped TSV: ``geneID x y MIDCounts``) into a
-    square-bin AnnData. Coordinates are rebased to origin (empty margin removed).
-
-    ``bin_size`` is in DNB units (1 DNB = 0.5 µm); ``uns['bin_size_um']`` is set
-    accordingly. ``obsm['spatial']`` is stored as integer (col, row) bin indices;
-    physical µm = index × ``bin_size_um``.
-
-    :param gem_path: Path to the gzipped GEM TSV file.
-    :type gem_path: str
-    :param bin_size: Square-bin size in DNB units (1 DNB = 0.5 µm).
-    :type bin_size: int
-    """
-    import pandas as pd
-
-    df = pd.read_csv(gem_path, sep="\t",
-                     dtype={"x": np.int32, "y": np.int32, "MIDCounts": np.int32})
-    gcol = "geneID" if "geneID" in df.columns else df.columns[0]
-    ccol = "MIDCounts" if "MIDCounts" in df.columns else df.columns[-1]
-    gidx, names = pd.factorize(df[gcol], sort=True)
-    names = np.asarray(names)
-    x = df["x"].to_numpy().astype(np.int32, copy=False)
-    y = df["y"].to_numpy().astype(np.int32, copy=False)
-    x = x - x.min(); y = y - y.min()
-    nbx = int(x.max() // bin_size) + 1
-    bid = (y // bin_size).astype(np.int64) * nbx + (x // bin_size)
-    uniq, inv = np.unique(bid, return_inverse=True)
-
-    M = csr_matrix((df[ccol].to_numpy().astype(np.float32), (inv, gidx)),
-                   shape=(len(uniq), len(names)))
-    a = ad.AnnData(X=M)
-    a.var_names = names
-    a.obs["array_col"] = (uniq % nbx).astype(np.int64)
-    a.obs["array_row"] = (uniq // nbx).astype(np.int64)
-    a.obsm["spatial"] = np.column_stack([uniq % nbx, uniq // nbx]).astype(np.float32) * bin_size
-    a.uns["bin_size_um"] = bin_size * 0.5
-    return a
-
-
 def fit_affine_lstsq(array_col, array_row, px_col, px_row) -> np.ndarray:
     """Least-squares affine ``(col, row, 1) -> (px_x, px_y)``, return inverse (2,3).
 

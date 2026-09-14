@@ -65,11 +65,13 @@ py.install_sources([
   'ssaft/_dataset.py',
   'ssaft/_kde_gpu.py',
   'ssaft/_mapping_gpu.py',
+  'ssaft/_marker_corr.py',
   # count-based (blur) backend
   'ssaft/_griddataset.py',
   'ssaft/_panel.py',
   'ssaft/_count.py',
   'ssaft/_gnb.py',
+  'ssaft/_lda.py',
   'ssaft/_mapping_inputs.py',
 ], subdir: 'ssaft')
 
@@ -79,3 +81,8 @@ py.install_sources([
   'ssaft/_io/_grid.py',
   'ssaft/_io/_loaders.py',
 ], subdir: 'ssaft/_io')
+
+# command-line helpers the tutorials call by path (Path(ssaft.__file__).parent / 'scripts')
+py.install_sources([
+  'ssaft/scripts/slice_spatialdata.py',
+], subdir: 'ssaft/scripts')

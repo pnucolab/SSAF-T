@@ -69,7 +69,66 @@ def _qualitative_pool(n):
     return out
 
 
-def celltype_colors(n_celltypes, cmap=None):
+def _uns_color_map(adata, column):
+    """``{label: hex}`` from ``uns[f'{column}_colors']``, or ``None``.
+
+    scanpy stores that list index-aligned with ``obs[column].cat.categories``, so the
+    mapping is by NAME. Reading it positionally is the bug this exists to prevent: the
+    store orders celltypes by id (grouping order) while the categorical orders them
+    alphabetically, so the two lists hold the same colours against different celltypes.
+    """
+    key = f'{column}_colors'
+    cols = adata.uns.get(key, None)
+    if cols is None:
+        return None
+    col = adata.obs[column]
+    cats = list(col.cat.categories) if hasattr(col, 'cat') else None
+    if cats is None or len(cats) != len(cols):
+        print(f'[map_celltypes] uns[{key!r}] has {len(cols)} colours for '
+              f'{len(cats) if cats else "?"} categories — ignoring it')
+        return None
+    from matplotlib.colors import to_hex, to_rgba
+    return {str(c): to_hex(to_rgba(x)) for c, x in zip(cats, cols)}
+
+
+def _colors_from_names(n, name_colors, names, fresh_for=None):
+    """Reuse the annotation's colour per celltype NAME; mint new ones for the rest.
+
+    ``fresh_for[i]`` forces a new colour even when the name matches — that is what
+    ``Unknown`` needs: the annotation calls every unassignable cell ``Unknown`` and
+    gives it ONE colour, but the store splits it per source cluster into
+    ``unknown1..N``. Handing all of them that one colour would make them
+    indistinguishable on the map, so they get fresh, mutually distinct colours instead.
+
+    New colours are drawn from the qualitative pool skipping anything the annotation
+    already used, so a minted colour never collides with a real celltype's.
+    """
+    names = list(names or [])
+    if len(names) != n:
+        raise ValueError(f'{len(names)} names for {n} celltypes')
+    fresh_for = list(fresh_for or [False] * n)
+    taken = {c.lower() for c in name_colors.values()}
+    spare = [c for c in _qualitative_pool(n + len(taken) + 8)
+             if c.lower() not in taken]
+    out, minted, unmatched = [], 0, []
+    for i, nm in enumerate(names):
+        if not fresh_for[i] and nm in name_colors:
+            out.append(name_colors[nm])
+            continue
+        if not fresh_for[i]:
+            unmatched.append(nm)
+        c = spare[minted] if minted < len(spare) else _qualitative_pool(minted + 1)[minted]
+        taken.add(c.lower())
+        out.append(c)
+        minted += 1
+    print(f'[map_celltypes] palette from the h5ad: {n - minted}/{n} celltypes matched '
+          f'by name, {minted} given new colours'
+          + (f' (unmatched: {unmatched[:5]})' if unmatched else ''))
+    return out
+
+
+def celltype_colors(n_celltypes, cmap=None, *, name_colors=None, names=None,
+                    fresh_for=None):
     """``n_celltypes`` hex colours, index-aligned with the celltype ids.
 
     The palette is fixed HERE, once, against the number of classes the mapping
@@ -84,10 +143,23 @@ def celltype_colors(n_celltypes, cmap=None):
     :param cmap: ``None`` (default) picks a QUALITATIVE palette sized to the
         class count (see :func:`_qualitative_pool`). Pass a matplotlib colormap
         name to sample it continuously instead (e.g. ``'jet'``) — legible only
-        for a handful of classes.
+        for a handful of classes. An explicit ``cmap`` overrides ``name_colors``.
     :type cmap: str or matplotlib.colors.Colormap or None
+    :param name_colors: ``{label: hex}`` carried by the annotation (its
+        ``uns[f'{column}_colors']``). When given with ``cmap=None``, every celltype
+        whose NAME appears there keeps the colour it had in the annotation, so the
+        celltype map and an ``sc.pl.spatial`` of the h5ad agree cell type by cell
+        type instead of merely drawing from the same list.
+    :type name_colors: dict or None
+    :param names: celltype names in id order; required with ``name_colors``.
+    :type names: list[str] or None
+    :param fresh_for: per-celltype flags forcing a newly minted colour even when the
+        name matches — used for the ``unknown1..N`` split of a single ``Unknown``.
+    :type fresh_for: list[bool] or None
     """
     n = int(n_celltypes)
+    if cmap is None and name_colors:
+        return _colors_from_names(n, name_colors, names, fresh_for)
     if cmap is None:
         return _qualitative_pool(n)[:n]
     import matplotlib.pyplot as plt
@@ -212,6 +284,8 @@ def build_centroids_from_h5ad(z, h5ad_path, *, column='cellman_annotation',
         raise ValueError(f'h5ad rows ({adata.n_obs}) != normalized_vectors rows ({n_total}); '
                          'the annotated h5ad must be row-aligned with the store')
     obs = adata.obs.copy()
+    # the annotation's own palette, if it carries one. Read BEFORE closing the file.
+    h5ad_colors = _uns_color_map(adata, column)
     adata.file.close()
     if column not in obs.columns:
         raise ValueError(f'column {column!r} not in obs (have: {list(obs.columns)})')
@@ -251,7 +325,8 @@ def build_centroids_from_h5ad(z, h5ad_path, *, column='cellman_annotation',
         z[name] = arr
 
     names = [u['label'] for u in units]
-    colors = celltype_colors(len(names), cmap=cmap)
+    colors = celltype_colors(len(names), cmap=cmap, name_colors=h5ad_colors,
+                             names=names, fresh_for=[u['is_unknown'] for u in units])
     overwrite('cluster_labels', labels)
     overwrite('centroids', centroids)
     overwrite('celltype_names', np.asarray(names))

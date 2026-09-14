@@ -7,6 +7,7 @@ Usage:
         --output-dir  dataset/<DATASET>/spatialdata_crops
 """
 import argparse
+import json
 import numpy as np
 import os
 import sys
@@ -17,6 +18,12 @@ import spatialdata as sd
 from spatialdata import get_extent, bounding_box_query
 from spatialdata.models import Image2DModel, Image3DModel, Labels2DModel, Labels3DModel, PointsModel
 from spatialdata.transformations import Affine, Identity, get_transformation
+
+#: Where the transcripts' ``z`` waits while the tile is cut out. ``bounding_box_query`` scans
+#: a points frame's columns for axis names, and a column called ``z`` against a 2D
+#: transformation is an unsupported case, so the depth is carried under a name that is
+#: not an axis and renamed back before the tile is written.
+Z_STASH = '_z_depth'
 
 
 def parse_args():
@@ -47,11 +54,10 @@ def parse_args():
         help="SpatialData coordinate system to use (default: 'global').",
     )
     p.add_argument(
-        '--image-key', default=None,
-        help='Staining / morphology image key to keep (e.g. H&E or polyT). '
-             'If set, all other image elements are dropped from each tile. '
-             'Useful when only the staining image is needed downstream '
-             '(e.g. Analysis.downsample_vector).',
+        '--image-key', nargs='+', default=None,
+        help='Image keys to keep (e.g. the 2D staining image and, for '
+             'downsample_vector(z=3), the 3D z-stack element: --image-key morphology_mip '
+             'morphology_zstack). If set, all other image elements are dropped from each tile.',
     )
     p.add_argument(
         '--keep-points', nargs='*', default=None,
@@ -68,6 +74,12 @@ def parse_args():
     p.add_argument(
         '--drop-tables', action='store_true',
         help='Drop all tables elements from each tile.',
+    )
+    p.add_argument(
+        '--drop-z', action='store_true',
+        help="Drop the transcripts' z column from each tile, as earlier versions did. "
+             'By default z is kept, which Analysis.downsample_vector(z=3, chunked=True) '
+             'needs.',
     )
     return p.parse_args()
 
@@ -164,8 +176,13 @@ def strip_points_meta_transform(cropped_sdata):
         pdf = p.compute()
         pdf.attrs = {}
         pdf = pdf.reset_index(drop=True)
+        coords = {'x': 'x', 'y': 'y'}
+        if Z_STASH in pdf.columns:
+            # the depth set aside for the crop (see normalize_points_indices) goes back
+            pdf = pdf.rename(columns={Z_STASH: 'z'})
+            coords['z'] = 'z'
 
-        kw = {'coordinates': {'x': 'x', 'y': 'y'}, 'transformations': tx}
+        kw = {'coordinates': coords, 'transformations': tx}
         if feature_key is not None and feature_key in pdf.columns:
             kw['feature_key'] = feature_key
         cropped_sdata.points[k] = PointsModel.parse(pdf, **kw)
@@ -200,13 +217,15 @@ def slim_cropped(cropped, image_key=None, keep_points=None,
         for k in list(cropped.tables.keys()):
             del cropped.tables[k]
     if image_key is not None:
-        if image_key not in cropped.images:
+        keep_images = {image_key} if isinstance(image_key, str) else set(image_key)
+        missing = sorted(keep_images - set(cropped.images.keys()))
+        if missing:
             raise KeyError(
-                f"--image-key '{image_key}' not found after crop. "
+                f"--image-key {missing} not found after crop. "
                 f"Available images: {list(cropped.images.keys())}"
             )
         for k in list(cropped.images.keys()):
-            if k != image_key:
+            if k not in keep_images:
                 del cropped.images[k]
     if keep_points is not None:
         keep_set = set(keep_points)
@@ -229,7 +248,7 @@ def has_biological_data(cropped):
     return False
 
 
-def normalize_points_indices(sdata):
+def normalize_points_indices(sdata, keep_z=True):
     """Rewrite every points dask DataFrame with a clean global RangeIndex.
 
     Two problems we need to fix up-front, before `get_extent` or
@@ -249,11 +268,15 @@ def normalize_points_indices(sdata):
        is 2D. `PointsModel.parse` reports "Column z will be ignored", but the
        column survives, and `get_axes_names(DaskDataFrame)` later scans
        columns and reports 3D — `bounding_box_query` then trips case 3
-       (data_dim=3, transform_dim=2, unsupported). Dropping `z` aligns the
-       data dimensionality with the transformation.
+       (data_dim=3, transform_dim=2, unsupported). The crop itself needs only
+       x/y, so `z` is set aside under ``Z_STASH`` — a name no axis scan picks
+       up — and :func:`strip_points_meta_transform` puts it back on each tile.
+       Earlier versions dropped it, which left every tile 2D and made
+       ``Analysis.downsample_vector(z=3, chunked=True)`` impossible.
+       ``keep_z=False`` (``--drop-z``) still drops it.
 
     We materialize the dataframe to pandas once (Merscope transcripts is
-    typically a few hundred MB — fits in RAM), drop `z`, reset_index, clear
+    typically a few hundred MB — fits in RAM), set `z` aside, reset_index, clear
     stale attrs, and re-parse through PointsModel. Computing also forces the
     `gene` categorical to known categories, silencing the perf warning that
     PointsModel.parse otherwise emits on a partially-known categorical.
@@ -282,9 +305,9 @@ def normalize_points_indices(sdata):
         feature_key = sdata_attrs.get('feature_key')
 
         pdf = p.compute()
-        drop_cols = [c for c in ('z',) if c in pdf.columns]
-        if drop_cols:
-            pdf = pdf.drop(columns=drop_cols)
+        if 'z' in pdf.columns:
+            pdf = (pdf.rename(columns={'z': Z_STASH}) if keep_z
+                   else pdf.drop(columns=['z']))
         pdf = pdf.reset_index(drop=True)
         pdf.attrs = {}
 
@@ -319,7 +342,8 @@ def main():
     print(f'  shapes : {list(sdata.shapes.keys())}')
     print(f'  tables : {list(sdata.tables.keys())}')
 
-    normalize_points_indices(sdata)
+    normalize_points_indices(sdata, keep_z=not args.drop_z)
+    print(f"  points z   : {'dropped' if args.drop_z else 'kept'}")
 
     try:
         extent = get_extent(sdata, coordinate_system=COORDINATE_SYSTEM)
@@ -408,6 +432,14 @@ def main():
                       f'tables={list(written.tables.keys())}, transcripts={npts}, cells={ncells})', flush=True)
             except Exception as e:
                 print(f'  -> saved but failed to verify: {e}', flush=True)
+
+            side = dict(source=os.path.abspath(SDATA_PATH), row=row, col=col,
+                        coordinate_system=COORDINATE_SYSTEM,
+                        bbox=dict(x=[float(x0), float(x1)], y=[float(y0), float(y1)]),
+                        points_z_kept=not args.drop_z,
+                        images=list(cropped.images.keys()))
+            with open(out_path + '.json', 'w') as fh:
+                json.dump(side, fh, indent=1)
 
             saved += 1
             saved_files.append(os.path.basename(out_path))

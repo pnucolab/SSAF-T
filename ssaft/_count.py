@@ -35,6 +35,27 @@ def _gaussian_kernel_1d(sigma_bin, device, prune_coefficient=4.3):
     return g.view(1, 1, 1, -1), g.view(1, 1, -1, 1), radius
 
 
+def _epanechnikov_kernel_2d(sigma_bin, device):
+    """Dense radial Epanechnikov ``1 - (r/H)^2`` on the bin raster, sum-normalized.
+
+    ``sigma_bin`` is the gaussian-equivalent sigma in bins; the support is
+    ``H = sigma_bin * sqrt(6)`` (2D variance matching, :func:`epanechnikov_support`).
+    Returned as a single ``(1, 1, 2r+1, 2r+1)`` kernel because the Epanechnikov is
+    radial and therefore NOT separable -- the gaussian's two 1D passes do not apply.
+    That costs more taps ((2r+1)^2 vs 2(2r+1)) but the radius is 2.4 sigma instead of
+    4.3 sigma, so at the default sigma_bin=1 it is 7x7=49 taps against 2x11=22, one
+    cuDNN launch instead of two.
+    """
+    import torch
+    H = float(sigma_bin) * float(np.sqrt(6.0))
+    radius = int(np.ceil(H))
+    k = torch.arange(-radius, radius + 1, dtype=torch.float32, device=device)
+    r2 = k.view(-1, 1) ** 2 + k.view(1, -1) ** 2
+    w = torch.clamp(1.0 - r2 / (H * H), min=0.0)
+    w /= w.sum()
+    return w.view(1, 1, 2 * radius + 1, 2 * radius + 1), radius
+
+
 def _iter_spatial_chunks(n_R, chunk_h, radius):
     for r0 in range(0, n_R, chunk_h):
         r1 = min(r0 + chunk_h, n_R)
@@ -57,7 +78,10 @@ def _rasterize_blur_tile_gpu(Xt, Rt, Ct, rp0, rp1, cp0, cp1, n_G,
     and ``cp0/cp1`` accordingly), so the truncated separable Gaussian is EXACT for
     the interior output rows/cols the caller keeps — the halo rows/cols absorb the
     zero-padded edge effect and are discarded. Bounds GPU memory to
-    ``n_G × (band_h + 2r) × (band_w + 2r)`` regardless of the full raster size."""
+    ``n_G × (band_h + 2r) × (band_w + 2r)`` regardless of the full raster size.
+
+    With ``ky_g=None`` the kernel is treated as a RADIAL 2D one (Epanechnikov) and
+    applied in a single dense conv; the halo logic is unchanged."""
     import torch
     import torch.nn.functional as F
     h = rp1 - rp0
@@ -73,8 +97,11 @@ def _rasterize_blur_tile_gpu(Xt, Rt, Ct, rp0, rp1, cp0, cp1, n_G,
         v = torch.as_tensor(sub.data, device=device, dtype=dtype)
         raster.index_put_((g, r, c), v, accumulate=True)
     t = raster.unsqueeze(0)
-    t = F.conv2d(t, ky_g, padding=(radius, 0), groups=n_G)
-    t = F.conv2d(t, kx_g, padding=(0, radius), groups=n_G)
+    if ky_g is None:            # radial (Epanechnikov): not separable, one dense pass
+        t = F.conv2d(t, kx_g, padding=(radius, radius), groups=n_G)
+    else:
+        t = F.conv2d(t, ky_g, padding=(radius, 0), groups=n_G)
+        t = F.conv2d(t, kx_g, padding=(0, radius), groups=n_G)
     return t.squeeze(0)
 
 
@@ -127,15 +154,147 @@ def _tensorstore_array(group_dir, name, shape, chunks):
     return ts.open(spec, create=True, delete_existing=True).result()
 
 
+def _store_group_dir(zg):
+    """Local directory holding ``zg``'s arrays, or None for a non-directory store."""
+    root = getattr(getattr(zg, "store", None), "root", None)
+    if root is None:
+        return None
+    return os.path.join(str(root), zg.path) if zg.path else str(root)
+
+
+def _tensorstore_open_read(group_dir, name):
+    """Open an existing array for READING through tensorstore, or None.
+
+    The writer already routes through tensorstore; the readers did not, and on a big
+    count field that is where the whole mapping run goes. zarr-python decodes chunk by
+    chunk on one thread (~0.3-0.8 GiB/s on this store); tensorstore's C++ pipeline
+    decodes them in parallel (~1.7 GiB/s) and hands back an identical array. Returns
+    None -- caller falls back to zarr-python -- when tensorstore is missing, the store
+    is not a local directory, or ``CELLMAN_NO_TENSORSTORE`` is set.
+    """
+    if group_dir is None or os.environ.get("CELLMAN_NO_TENSORSTORE"):
+        return None
+    try:
+        import tensorstore as ts
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        return ts.open({"driver": "zarr3",
+                        "kvstore": {"driver": "file",
+                                    "path": os.path.join(group_dir, name)}},
+                       open=True, create=False).result()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def iter_field_bands(zg, row_bands, *, name="vf_normalized", prefetch=True):
+    """Yield ``(r0, r1, block)`` for each requested row band of a 3D count field.
+
+    ``row_bands`` is the list of ``(r0, r1)`` the caller actually wants, so bands with
+    no signal are never touched. The NEXT band's read is started before the current one
+    is handed over, which hides the read behind the caller's GPU work -- the two are on
+    different engines, and the read is otherwise ~60% of a mapping run.
+
+    ``block`` is ``(n_G, r1 - r0, n_C)`` float32, exactly what ``zg[name][:, r0:r1, :]``
+    returns; only how it got there changes.
+    """
+    A = _tensorstore_open_read(_store_group_dir(zg), name)
+    z = zg[name]
+    if A is not None:
+        def start(b):
+            r0, r1 = b
+            return A[:, r0:r1, :].read()          # future; the C++ pool does the work
+        def finish(f):
+            return np.asarray(f.result())
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        pool = ThreadPoolExecutor(1)              # zarr-python releases the GIL in zstd
+        def start(b):
+            r0, r1 = b
+            return pool.submit(lambda: np.asarray(z[:, r0:r1, :]))
+        def finish(f):
+            return f.result()
+    bands = list(row_bands)
+    if not bands:
+        return
+    try:
+        pending = start(bands[0])
+        for i, (r0, r1) in enumerate(bands):
+            nxt = start(bands[i + 1]) if (prefetch and i + 1 < len(bands)) else None
+            block = finish(pending)
+            pending = nxt
+            yield r0, r1, block
+            del block
+    finally:
+        if A is None:
+            pool.shutdown(wait=False)
+
+
+def band_rows_for_budget(n_G, n_C, chunk_h, *, budget_bytes, align=32):
+    """Rows per band that keep ONE band under ``budget_bytes`` on the device.
+
+    A band is uploaded whole, so its size -- not the number of signal voxels -- is what
+    decides whether the run fits in VRAM. Rounded down to a multiple of the store's row
+    chunk so a band still reads whole chunks, and never below one.
+    """
+    per_row = int(n_G) * int(n_C) * 4
+    fit = max(1, int(budget_bytes) // max(per_row, 1))
+    fit = min(int(chunk_h), fit)
+    return max(align, (fit // align) * align) if fit >= align else fit
+
+
 def _tensorstore_vf(group_dir, n_G, out_R, out_C, sh, sw):
     """Thin wrapper naming the 3D count ``vf_normalized`` shape and chunking."""
     return _tensorstore_array(group_dir, "vf_normalized",
                               (n_G, out_R, out_C), (n_G, sh, sw))
 
 
+def epanechnikov_support(bandwidth, ndim):
+    """Gaussian bandwidth -> Epanechnikov support radius, matched on VARIANCE.
+
+    The spherical Epanechnikov ``K(r) ∝ 1 - (r/H)^2`` on the ball of radius ``H`` has
+    per-axis variance ``H^2 / (ndim + 4)``; a gaussian of bandwidth ``h`` has ``h^2``.
+    Equating them gives
+
+        H = h * sqrt(ndim + 4)          (2.236 h in 1D, 2.449 h in 2D, 2.646 h in 3D)
+
+    which is the standard moment-matched conversion and, in 1D, within 1% of the
+    canonical-bandwidth (AMISE-equivalent) ratio 2.214. Because the Epanechnikov
+    reaches zero at ``H``, its truncation radius is ``H`` itself -- 6.61 µm against the
+    gaussian's ``4.3 h`` = 10.75 µm at the default bandwidth. The cost of a KDE goes as
+    the cube of the reach, so the same kernel width comes out about 3x cheaper.
+    """
+    return float(bandwidth) * float(np.sqrt(int(ndim) + 4))
+
+
+def kernel_peak(scale, ndim, kernel='gaussian'):
+    """Peak of ONE molecule's kernel = ``1 / V_eff``, the pipeline's ``expression_threshold``.
+
+    ``scale`` is the kernel's OWN scale in the units ``vf_norm`` is measured in
+    (gaussian sigma, or the Epanechnikov support radius ``H`` -- convert with
+    :func:`epanechnikov_support`, never pass the gaussian bandwidth here).
+
+        gaussian       1 / (sqrt(2*pi) * sigma) ** ndim
+        epanechnikov   3/(4H) [1D]   2/(pi H^2) [2D]   15/(8 pi H^3) [3D]
+
+    Everything downstream is anchored on this one number: ``norm_threshold`` is
+    2x it (a voxel holding less than two molecules' worth of evidence), and the
+    LDA count reconstruction multiplies the density back up by ``V_eff = 1/peak``.
+    Both come out wrong -- silently, by a factor of ~2 at the default bandwidth --
+    if the gaussian formula is applied to an Epanechnikov field.
+    """
+    scale = float(scale); ndim = int(ndim)
+    if str(kernel).lower().startswith('epa'):
+        return float(1.0 / {1: (4.0 / 3.0) * scale,
+                            2: (np.pi / 2.0) * scale ** 2,
+                            3: (8.0 * np.pi / 15.0) * scale ** 3}[ndim])
+    return float(1.0 / (np.sqrt(2 * np.pi) * scale) ** ndim)
+
+
 def compute_vf_blur(analysis, bin_adata, *, sigma_bin: float = 1.0,
                     chunk_h: int = 64, chunk_w: int = 512, bin_size_um: float = 2.0,
                     sampling_distance: float = None, prune_coefficient: float = 4.3,
+                    kernel: str = "epanechnikov",
                     size_after_normalization: float = 10.0,
                     store_chunk=32,
                     device: str = "cuda") -> None:
@@ -179,8 +338,17 @@ def compute_vf_blur(analysis, bin_adata, *, sigma_bin: float = 1.0,
     :type bin_size_um: float
     :param sampling_distance: output vector-field grid spacing in microns; defaults to ``bin_size_um``.
     :type sampling_distance: float
-    :param prune_coefficient: kernel truncation radius in units of sigma.
+    :param prune_coefficient: kernel truncation radius in units of sigma (gaussian only).
     :type prune_coefficient: float
+    :param kernel: ``'epanechnikov'`` (default) or ``'gaussian'``. ``sigma_bin`` keeps
+        the same meaning for both -- the Epanechnikov support is derived from it by
+        variance matching, ``H = sigma_bin * sqrt(6)`` bins -- so the two produce
+        near-identical fields. Not separable, so it runs as one dense conv, whose cost
+        grows with the SQUARE of the radius while the gaussian's separable pair grows
+        linearly. Below ``sigma_bin`` about 6 the Epanechnikov's smaller radius still
+        wins (~0.8x at 1-4); above it the gaussian pulls ahead (2.3x at 16). On a
+        wide blur, pass ``kernel='gaussian'``.
+    :type kernel: str
     :param size_after_normalization: L1 scale applied before ``log1p``.
     :type size_after_normalization: float
     :param store_chunk: on-disk spatial chunk (int square side, ``(h, w)`` tuple, or ``None`` to match the compute tile).
@@ -205,7 +373,16 @@ def compute_vf_blur(analysis, bin_adata, *, sigma_bin: float = 1.0,
     bw_um = float(sigma_bin * bin_size_um)
     out_R = (n_R + stride - 1) // stride
     out_C = (n_C + stride - 1) // stride
-    kx, ky, radius = _gaussian_kernel_1d(sigma_bin, device, prune_coefficient)
+    _epa = str(kernel).lower().startswith('epa')
+    if _epa:
+        kx, radius = _epanechnikov_kernel_2d(sigma_bin, device)
+        ky = None
+    elif str(kernel).lower().startswith('gauss'):
+        kx, ky, radius = _gaussian_kernel_1d(sigma_bin, device, prune_coefficient)
+    else:
+        raise ValueError(f"unknown kernel {kernel!r}; use 'gaussian' or 'epanechnikov'")
+    # the field's own smoothing scale, in the units vf_norm lives in (bins -> µm)
+    kde_scale_bin = (epanechnikov_support(sigma_bin, 2) if _epa else float(sigma_bin))
     blur_dtype = torch.float32
     chunk_w = max(1, int(chunk_w))
     row_order = np.argsort(R, kind="stable")
@@ -239,7 +416,7 @@ def compute_vf_blur(analysis, bin_adata, *, sigma_bin: float = 1.0,
     coord_bnd = np.array([0.0, 0.0, 0.0, out_C * sd_um, out_R * sd_um, 0.0], dtype="f8")
     zg["genes"] = np.asarray(list(bin_adata.var_names))
     zg["kde_computed"] = np.zeros(n_G, dtype=bool)
-    zg["vf_params"] = np.array([sd_um, bw_um], dtype="f8")
+    zg["vf_params"] = np.array([sd_um, kde_scale_bin * float(bin_size_um)], dtype="f8")
     zg["coordinate_offset"] = np.zeros(3, "f8")
     zg["coordinate_bounds"] = coord_bnd
     zg["original_coordinate_bounds"] = coord_bnd.copy()
@@ -248,6 +425,7 @@ def compute_vf_blur(analysis, bin_adata, *, sigma_bin: float = 1.0,
     zg.attrs["sampling_distance"] = sd_um
     zg.attrs["stride"] = int(stride)
     zg.attrs["prune_coefficient"] = float(prune_coefficient)
+    zg.attrs["kde_kernel"] = 'epanechnikov' if _epa else 'gaussian'
     zg.attrs["size_after_normalization"] = float(size_after_normalization)
     zg.attrs["backend"] = "blur"
 
@@ -258,8 +436,23 @@ def compute_vf_blur(analysis, bin_adata, *, sigma_bin: float = 1.0,
     ds.sampling_distance = sd_um
     ds.shape = (out_C, out_R, 1)
 
-    kx_g = kx.to(blur_dtype).expand(n_G, 1, 1, -1).contiguous()
-    ky_g = ky.to(blur_dtype).expand(n_G, 1, -1, 1).contiguous()
+    # Same SSAM quantity the transcript backend sets, in THIS backend's units.
+    # The blur is a discrete convolution on the bin raster with a kernel that sums
+    # to 1 over bins, so vf_norm is molecules per bin^2, not per µm^2 (verified:
+    # summing vf_norm over the field reproduces the panel's total counts to 4
+    # significant figures). One molecule's peak is therefore
+    # 1 / (sqrt(2*pi) * sigma_bin)^2 with sigma in BINS -- a factor
+    # bin_size_um^2 above the µm-space value the transcript formula gives (4x at
+    # 2 µm bins). Setting it here keeps ``ds.norm_threshold`` meaning the same
+    # thing on both backends; the mappers derive it independently via
+    # :func:`analytic_vf_norm_threshold`, so the two always agree.
+    ds.ndim = 2
+    ds.bandwidth = kde_scale_bin * float(bin_size_um)
+    ds.expression_threshold = kernel_peak(kde_scale_bin, 2, kernel)
+    ds.norm_threshold = ds.expression_threshold * 2
+
+    kx_g = kx.to(blur_dtype).expand(n_G, 1, *kx.shape[2:]).contiguous()
+    ky_g = None if ky is None else ky.to(blur_dtype).expand(n_G, 1, -1, 1).contiguous()
     _cuda = str(device).startswith("cuda")
 
     o_starts = list(range(0, out_R, chunk_h))
@@ -318,7 +511,8 @@ def compute_vf_blur(analysis, bin_adata, *, sigma_bin: float = 1.0,
     if analysis.verbose:
         print(f"[compute_vf] blur raster {(n_R, n_C)}@{bin_size_um}µm → vf {(n_G, out_R, out_C)}@{sd_um}µm "
               f"(stride {stride}, compute tile {chunk_h}×{chunk_w}, store chunk {sh_store}×{sw_store}, "
-              f"radius {radius}, bandwidth {bw_um}µm, fp32)")
+              f"radius {radius}, {kernel} scale {kde_scale_bin * bin_size_um:.4g}µm "
+              f"(= bandwidth {bw_um}µm), fp32)")
 
 
 def _image_gray(image, revert):
@@ -498,30 +692,133 @@ def select_vectors_from_image(analysis, grid, *, bin_size_um: float,
     return nv
 
 
-def _write_maps(zg, ds, M, Rc, sd, *, overwrite=True, set_ds_attrs=True):
+#: mapping method -> the zarr/dataset name its per-voxel score is stored under.
+#: ``corr`` yields a Pearson correlation (filtered by ``min_r``), ``gnb`` a
+#: top-class posterior probability (filtered by ``min_p``).
+SCORE_KEYS = {"corr": "max_correlations", "gnb": "max_probabilities",
+              "lda": "max_probabilities"}
+
+
+def score_key_for(method):
+    """``'corr'|'gnb'|'lda'`` -> the score volume name that method writes.
+
+    ``gnb`` and ``lda`` share ``max_probabilities``: both produce a posterior, so both
+    are thresholded with ``min_p``. Which of the two wrote the live map is recorded
+    separately in ``zg.attrs['mapping_method']``.
+    """
+    try:
+        return SCORE_KEYS[method]
+    except KeyError:
+        raise ValueError(f"unknown mapping method {method!r} "
+                         "(expected 'corr', 'gnb' or 'lda')")
+
+
+def _other_score_key(score_key):
+    """The score volume name NOT written by the method that writes ``score_key``."""
+    return ("max_probabilities" if score_key == "max_correlations"
+            else "max_correlations")
+
+
+def _write_maps(zg, ds, M, Rc, sd, *, overwrite=True, set_ds_attrs=True,
+                score_key="max_correlations", method=None):
+    """Write the label raster + its per-voxel score under ``score_key``.
+
+    ``score_key`` names the metric actually produced: ``max_correlations`` for the
+    centroid correlation mapper, ``max_probabilities`` for the GaussianNB posterior.
+    Both volumes may coexist — re-running one method no longer throws away the other
+    method's result. ``zg.attrs['mapping_method']`` records which one is live, and
+    ``filter_celltypemaps`` reads it to pick its threshold (``min_p`` vs ``min_r``).
+    """
     cm_3d = M.T[:, :, None].astype(np.int32)
     mc_3d = Rc.T[:, :, None].astype(np.float32)
     vx, vy, vz = cm_3d.shape
     if overwrite:
-        for nm in ("celltype_maps", "max_correlations"):
+        for nm in ("celltype_maps", score_key):
             if nm in zg:
                 del zg[nm]
+    # 'gnb' and 'lda' share the posterior volume, so score_key alone cannot name the
+    # method; a caller that is neither corr nor gnb must say so explicitly.
+    zg.attrs['mapping_method'] = method or (
+        'gnb' if score_key == 'max_probabilities' else 'corr')
     zg["celltype_maps"] = cm_3d
-    zg["max_correlations"] = mc_3d
+    zg[score_key] = mc_3d
     if set_ds_attrs:
-        import dask.array as da
         ds.shape = (vx, vy, vz)
         ds.x_scale = 1.0
         ds.y_scale = 1.0
-        ds.max_probabilities = None
         ds.original_coordinate_bounds = [[0.0, vx * sd], [0.0, vy * sd], [0.0, 0.0]]
         ds.celltype_maps = cm_3d
-        ds.max_correlations = mc_3d
+        setattr(ds, score_key, mc_3d)
+        # the other method's volume stays on disk; reload it so both are addressable
+        _other = _other_score_key(score_key)
+        setattr(ds, _other, zg[_other][:] if _other in zg else None)
     return cm_3d, mc_3d
 
 
+def analytic_vf_norm_threshold(zg, mult: float = 2.0) -> float:
+    """SSAM's ``vf_norm`` floor: ``mult`` x the KDE peak of a single molecule.
+
+    This is the threshold every other part of ssaft uses
+    (``Analysis.dataset.norm_threshold = expression_threshold * 2``); the mappers
+    must use it too. It is an absolute quantity — it says "this voxel holds less
+    than two molecules' worth of evidence" — so it means the same thing on every
+    dataset, unlike a percentile, which always discards a fixed *share* of the
+    tissue no matter how good the signal is.
+
+    Units follow the field the backend actually stored, so sigma must be given in
+    the same units as ``vf_norm``'s support:
+
+    * count backend (Visium HD / Stereo-seq): ``vf_norm`` is per bin^2 and the
+      blur is ``sigma_bin`` **bins** -> ``mult / (sqrt(2*pi) * sigma_bin)^2``
+    * transcript backend: ``vf_norm`` is per µm^ndim and the blur is the
+      bandwidth in **µm** -> ``mult / (sqrt(2*pi) * bandwidth)^ndim``
+
+    ``attrs['kde_kernel'] == 'epanechnikov'`` swaps in that kernel's peak
+    (:func:`kernel_peak`) instead; the stored scale is already its support radius.
+
+    Mixing the two is a factor of ``bin_size_um^ndim`` (4x at 2 µm bins in 2D).
+
+    Returns ``0.0`` when the store records neither, i.e. keep every voxel the
+    field reached — never a percentile, which would silently cut real signal.
+    """
+    a = dict(zg.attrs)
+    kern = a.get('kde_kernel', 'gaussian')
+    sigma_bin = a.get('sigma_bin')
+    if sigma_bin:
+        scale = epanechnikov_support(sigma_bin, 2) \
+            if str(kern).lower().startswith('epa') else float(sigma_bin)
+        return float(mult * kernel_peak(scale, 2, kern))
+    bandwidth = a.get('bandwidth', a.get('bandwidth_um'))
+    if bandwidth is None and 'vf_params' in zg:
+        vp = np.asarray(zg['vf_params'][:]).ravel()
+        bandwidth = float(vp[1]) if vp.size > 1 else None
+    if bandwidth:
+        # vf_params[1] / attrs['bandwidth'] store the kernel's OWN scale (H for the
+        # Epanechnikov), so no conversion here -- only the peak formula changes.
+        ndim = int(a.get('ndim', 2))
+        return float(mult * kernel_peak(bandwidth, ndim, kern))
+    return 0.0
+
+
+def resolve_vf_norm_threshold(zg, vf_norm_threshold=None, mult: float = 2.0) -> float:
+    """Threshold a mapper should use: explicit value, else the analytic one.
+
+    Deliberately does NOT fall back to ``attrs['select_vf_norm_threshold']``.
+    That key records the cut ``downsample_vector`` used to *pick training
+    voxels* — with ``vf_norm_percentile`` it is a percentile of the field, which
+    is the right call for sampling (take the denser part of the tissue to learn
+    from) and the wrong one for mapping (label every voxel that carries signal).
+    Reusing it made the map inherit a 25% cut of the tissue that no caller asked
+    for.
+    """
+    if vf_norm_threshold is not None:
+        return float(vf_norm_threshold)
+    return analytic_vf_norm_threshold(zg, mult=mult)
+
+
 def map_corr(analysis, centroids=None, *, vf_norm_threshold=None, chunk_h=128,
-             device="cuda", overwrite=True):
+             device="cuda", overwrite=True, gene_indices=None, marker_index_sets=None,
+             gpu_target_bytes=int(4e9), sub_batch=None):
     """Map the blur field to celltypes by centroid Pearson correlation (no KDE).
 
     Reads ``vf_normalized`` chunk-by-chunk, mean-centers + L2-normalizes each
@@ -540,6 +837,15 @@ def map_corr(analysis, centroids=None, *, vf_norm_threshold=None, chunk_h=128,
     :type device: str
     :param overwrite: replace any existing ``celltype_maps`` / ``max_correlations``.
     :type overwrite: bool
+    :param gene_indices: positions into the store's gene axis to keep; ``None`` = all.
+        Set by ``map_celltypes(marker_genes_path=...)`` to the union of the marker
+        panel, so the correlation stops spending its variance on genes no celltype
+        was called on.
+    :type gene_indices: list[int] or None
+    :param marker_index_sets: per-celltype gene positions *within* ``gene_indices``
+        (see :func:`ssaft._marker_corr.marker_index_sets`). When given, each celltype
+        is correlated only on its own markers instead of the shared axis.
+    :type marker_index_sets: list or None
     """
     import torch
     zg = analysis.dataset.zarr_group
@@ -556,43 +862,66 @@ def map_corr(analysis, centroids=None, *, vf_norm_threshold=None, chunk_h=128,
     centroids = np.asarray(centroids, dtype=np.float32)
     if centroids.shape[1] != n_G:
         raise ValueError(f"centroids gene dim {centroids.shape[1]} != vf {n_G}")
+    if gene_indices is not None:
+        gene_indices = np.asarray(sorted(gene_indices), dtype=np.int64)
+        centroids = centroids[:, gene_indices]
 
-    if vf_norm_threshold is None:
-        vf_norm_threshold = zg.attrs.get("select_vf_norm_threshold", None)
-        if vf_norm_threshold is None:
-            nz = norm[norm > 0]
-            vf_norm_threshold = float(np.percentile(nz, 25)) if nz.size else 0.0
-    vf_norm_threshold = float(vf_norm_threshold)
+    vf_norm_threshold = resolve_vf_norm_threshold(zg, vf_norm_threshold)
 
     c = torch.as_tensor(centroids, dtype=torch.float32, device=device)
-    c = c - c.mean(dim=1, keepdim=True)
-    c = c / torch.clamp(torch.linalg.norm(c, dim=1, keepdim=True), min=1e-12)
+    if marker_index_sets is None:      # one shared axis -> pre-normalize once
+        c = c - c.mean(dim=1, keepdim=True)
+        c = c / torch.clamp(torch.linalg.norm(c, dim=1, keepdim=True), min=1e-12)
 
     M = np.full((n_R, n_C), -1, dtype=np.int32)
     Rc = np.full((n_R, n_C), -1.0, dtype=np.float32)
-    it = range(0, n_R, chunk_h)
+
+    # Same shape of fix as map_lda: the band is read through tensorstore with the next
+    # one prefetched, uploaded exactly as it sits on disk (gene-major), and the
+    # transpose + signal gather happen on the device. The host used to do both, and on
+    # a wide gene axis that cost more than everything else put together.
+    chunk_h = band_rows_for_budget(n_G, n_C, chunk_h, budget_bytes=gpu_target_bytes)
+    if sub_batch is None:
+        sub_batch = max(4096, int(gpu_target_bytes // 16) // max(n_G, 1))
+    gi_t = (torch.as_tensor(np.asarray(gene_indices), device=device)
+            if gene_indices is not None else None)
+    bands = [(a, min(a + chunk_h, n_R)) for a in range(0, n_R, chunk_h)]
+    bands = [(a, b) for a, b in bands if (norm[a:b] > vf_norm_threshold).any()]
+    it = iter_field_bands(zg, bands)
     if analysis.verbose:
-        it = tqdm(list(it), desc="map_celltypes (corr)")
-    for r0 in it:
-        r1 = min(r0 + chunk_h, n_R)
+        it = tqdm(it, total=len(bands), desc="map_celltypes (corr)")
+    for r0, r1, raw in it:
         h = r1 - r0
-        sig = norm[r0:r1] > vf_norm_threshold
-        if not sig.any():
-            continue
-        block = np.asarray(vf_z[:, r0:r1, :]).reshape(n_G, h * n_C).T
-        sig_flat = sig.reshape(-1)
-        d = torch.as_tensor(block[sig_flat], device=device)
-        d = d - d.mean(dim=1, keepdim=True)
-        d = d / torch.clamp(torch.linalg.norm(d, dim=1, keepdim=True), min=1e-12)
-        corr = d @ c.T
-        best_corr, best_idx = corr.max(dim=1)
+        sig_flat = (norm[r0:r1] > vf_norm_threshold).reshape(-1)
         pos = np.where(sig_flat)[0]
+        Bt = torch.as_tensor(raw.reshape(n_G, h * n_C), device=device)
+        pos_t = torch.as_tensor(pos, device=device)
+        bi = np.empty(pos.size, np.int32); bc = np.empty(pos.size, np.float32)
+        for a in range(0, pos.size, sub_batch):
+            b = min(pos.size, a + sub_batch)
+            W = Bt.index_select(1, pos_t[a:b])
+            if gi_t is not None:
+                W = W.index_select(0, gi_t)
+            d = W.T.contiguous()
+            del W
+            if marker_index_sets is not None:
+                from ._marker_corr import masked_pearson_max_torch
+                best_idx, best_corr = masked_pearson_max_torch(d, c, marker_index_sets)
+            else:
+                d = d - d.mean(dim=1, keepdim=True)
+                d = d / torch.clamp(torch.linalg.norm(d, dim=1, keepdim=True), min=1e-12)
+                best_corr, best_idx = (d @ c.T).max(dim=1)
+            bi[a:b] = best_idx.cpu().numpy().astype(np.int32)
+            bc[a:b] = best_corr.cpu().numpy().astype(np.float32)
+            del d, best_corr, best_idx
         m_flat = M[r0:r1].reshape(-1); rc_flat = Rc[r0:r1].reshape(-1)
-        m_flat[pos] = best_idx.cpu().numpy().astype(np.int32)
-        rc_flat[pos] = best_corr.cpu().numpy().astype(np.float32)
+        m_flat[pos] = bi
+        rc_flat[pos] = bc
         M[r0:r1] = m_flat.reshape(h, n_C); Rc[r0:r1] = rc_flat.reshape(h, n_C)
-        del block, d, corr, best_corr, best_idx
+        del Bt, pos_t, raw
         torch.cuda.empty_cache()
     if analysis.verbose:
-        print(f"[map_corr] assigned {int((M >= 0).sum())} voxels (thr={vf_norm_threshold:.4g})")
+        _sig = int((norm > vf_norm_threshold).sum()); _tot = int((norm > 0).sum())
+        print(f"[map_corr] assigned {int((M >= 0).sum())} voxels "
+              f"(vf_norm>{vf_norm_threshold:.4g} keeps {_sig}/{_tot} = {_sig/max(_tot,1):.1%} of the field)")
     return _write_maps(zg, ds, M, Rc, sd, overwrite=overwrite)

@@ -4,18 +4,18 @@ Loaders return a :class:`spatialdata.SpatialData` with ``tables['table']`` (the
 count matrix, region-less, + ``uns['cellman']`` metadata) and ``images['staining']``
 (the morphology image with an ``px → µm`` Affine transform). The count backend
 (:meth:`Analysis.compute_vf` etc.) adapts it via
-:meth:`ssaft.GridDataset.from_sdata`. Transcript platforms
+:meth:`ssaft.GridDataset.from_sdata`. Stereo-seq is not covered here: SAW output is read by ``spatialdata_io``, and the
+MOSTA bin1-GEM reader ships with its notebook (``notebooks/stereoseq_mosta.py``).
+Transcript platforms
 (Xenium/MERSCOPE/CosMx) flow through their own SpatialData (points + images); the
-final cell-type map is written back into either as ``labels['cellman_celltype_map']``
-+ ``images['cellman_celltype_map_rgb']`` + ``tables['cellman_celltype']``.
+final cell-type map is written back into either as ``labels['ssaft_celltype_map']``
++ ``images['ssaft_celltype_map_rgb']`` + ``tables['ssaft_downsampled_vectors']``.
 """
 
-from ._grid import aggregate_to_grid, fit_affine_lstsq, read_square_bin_gem
-from ._loaders import load_stereoseq, load_strata, load_visiumhd
+from ._grid import aggregate_to_grid, fit_affine_lstsq
+from ._loaders import load_strata, load_visiumhd
 
 LOADERS = {
-    "stereoseq": load_stereoseq,
-    "stomics": load_stereoseq,
     "visiumhd": load_visiumhd,
     "visium_hd": load_visiumhd,
     "strata": load_strata,
@@ -41,6 +41,6 @@ def load(platform: str, *args, **kwargs):
 
 
 __all__ = [
-    "aggregate_to_grid", "read_square_bin_gem", "fit_affine_lstsq",
-    "load_stereoseq", "load_visiumhd", "load_strata", "load", "LOADERS",
+    "aggregate_to_grid", "fit_affine_lstsq",
+    "load_visiumhd", "load_strata", "load", "LOADERS",
 ]

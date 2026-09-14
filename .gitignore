@@ -31,3 +31,6 @@ data/
 
 # OS
 .DS_Store
+
+# tutorial outputs (symlinked out of the repo when executed)
+notebooks/outputs

@@ -45,7 +45,7 @@ if _HAS_TRITON:
         N, n_genes, W, H, Rp,
         x_min, y_min,
         inv_sd, two_h2, inv_norm, Rw2,
-        BLOCK_T: tl.constexpr,
+        BLOCK_T: tl.constexpr, EPA: tl.constexpr,
     ):
         pid = tl.program_id(0)
         if pid >= N:
@@ -77,7 +77,11 @@ if _HAS_TRITON:
                             dy = ty - qy
                             r2 = dx * dx + dy * dy
                             keep = mask & (r2 <= Rw2) & (tg >= 0) & (tg < n_genes)
-                            w = tl.exp(-r2 / two_h2) * inv_norm
+                            if EPA:
+                                # 1 - (r/H)^2 on the ball, zero outside; Rw2 = H^2
+                                w = (1.0 - r2 / Rw2) * inv_norm
+                            else:
+                                w = tl.exp(-r2 / two_h2) * inv_norm
                             tl.atomic_add(out_row + tg,
                                           tl.cast(w, tl.float32),
                                           mask=keep)
@@ -91,7 +95,7 @@ if _HAS_TRITON:
         N, n_genes, W, H, D, Rp,
         x_min, y_min, z_min,
         inv_sd, two_h2, inv_norm, Rw2,
-        BLOCK_T: tl.constexpr,
+        BLOCK_T: tl.constexpr, EPA: tl.constexpr,
     ):
         pid = tl.program_id(0)
         if pid >= N:
@@ -131,7 +135,10 @@ if _HAS_TRITON:
                                     dz = tz - qz
                                     r2 = dx * dx + dy * dy + dz * dz
                                     keep = mask & (r2 <= Rw2) & (tg >= 0) & (tg < n_genes)
-                                    w = tl.exp(-r2 / two_h2) * inv_norm
+                                    if EPA:
+                                        w = (1.0 - r2 / Rw2) * inv_norm
+                                    else:
+                                        w = tl.exp(-r2 / two_h2) * inv_norm
                                     tl.atomic_add(out_row + tg,
                                                   tl.cast(w, tl.float32),
                                                   mask=keep)
@@ -186,7 +193,7 @@ def kde_at_points_gpu(
     gene_indices, n_genes,
     sampling_distance, bandwidth, prune_coefficient,
     dim, ncores=None,
-    device='cuda',
+    device='cuda', kernel='epanechnikov',
 ):
     """
     GPU equivalent of ``ssaft.utils.kde_at_points`` (2D and 3D).
@@ -214,7 +221,9 @@ def kde_at_points_gpu(
     :type sampling_distance: float
     :param bandwidth: Gaussian KDE bandwidth.
     :type bandwidth: float
-    :param prune_coefficient: kernel truncation radius in units of bandwidth.
+    :param prune_coefficient: kernel truncation radius in units of bandwidth
+        (gaussian only -- the Epanechnikov's radius is its own support).
+    :param kernel: ``'epanechnikov'`` (default) or ``'gaussian'``.
     :type prune_coefficient: float
     :param dim: spatial dimensionality (2 or 3).
     :type dim: int
@@ -229,10 +238,23 @@ def kde_at_points_gpu(
         raise NotImplementedError(
             f"kde_at_points_gpu supports dim=2 or 3, got dim={dim}.")
 
-    Rw = bandwidth * prune_coefficient
+    # ``bandwidth`` is gaussian-equivalent for both kernels; the Epanechnikov's own
+    # scale is the support radius it reaches zero at, and prune_coefficient does not
+    # apply to it (see ssaft._count.epanechnikov_support).
+    epa = str(kernel).lower().startswith('epa')
+    if epa:
+        from ._count import epanechnikov_support
+        Rw = epanechnikov_support(bandwidth, dim)
+        norm = {1: (4.0 / 3.0) * Rw,
+                2: (math.pi / 2.0) * Rw ** 2,
+                3: (8.0 * math.pi / 15.0) * Rw ** 3}[int(dim)]
+    elif str(kernel).lower().startswith('gauss'):
+        Rw = bandwidth * prune_coefficient
+        norm = (2.0 * math.pi * bandwidth * bandwidth) ** (0.5 * dim)
+    else:
+        raise ValueError(f"unknown kernel {kernel!r}; use 'gaussian' or 'epanechnikov'")
     Rw2 = Rw * Rw
     two_h2 = 2.0 * bandwidth * bandwidth
-    norm = (2.0 * math.pi * bandwidth * bandwidth) ** (0.5 * dim)
     inv_norm = 1.0 / norm
     inv_sd = 1.0 / sampling_distance
     Rp = int(math.floor(Rw / sampling_distance + 1e-12))
@@ -270,7 +292,7 @@ def kde_at_points_gpu(
                 N, n_genes, W, H, Rp,
                 x_min, y_min,
                 inv_sd, two_h2, inv_norm, Rw2,
-                BLOCK_T=32,
+                BLOCK_T=32, EPA=1 if epa else 0,
             )
     else:
         lz_g = torch.as_tensor(loc_z, dtype=torch.float64, device=device).contiguous()
@@ -300,7 +322,7 @@ def kde_at_points_gpu(
                 N, n_genes, W, H, D, Rp,
                 x_min, y_min, z_min,
                 inv_sd, two_h2, inv_norm, Rw2,
-                BLOCK_T=32,
+                BLOCK_T=32, EPA=1 if epa else 0,
             )
     return out.cpu().numpy()
 

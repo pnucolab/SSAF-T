@@ -42,19 +42,27 @@ def _kde_setup_celllist(loc_x_t, loc_y_t, loc_z_t, gi_t,
                         chunk_q_xmin, chunk_q_ymin, chunk_q_zmin,
                         chunk_q_xmax, chunk_q_ymax, chunk_q_zmax,
                         sampling_distance, bandwidth, prune_coefficient,
-                        dim):
+                        dim, kernel='epanechnikov'):
     """Build a cell-list spanning the chunk's query bbox + transcripts.
 
     Returns a state dict consumed by :func:`_kde_run_subchunk`, or
     ``None`` when there are no transcripts (caller treats the result
     as all-zero KDE).
+
+    :param kernel: ``'epanechnikov'`` (default) or ``'gaussian'``. The gaussian has
+        no compact support and is truncated at ``bandwidth * prune_coefficient``;
+        the Epanechnikov reaches zero on its own at ``H = bandwidth``, so
+        ``prune_coefficient`` is ignored for it and the reach is ``bandwidth``.
+        Pass the CONVERTED bandwidth for the Epanechnikov -- see
+        :func:`ssaft._count.epanechnikov_support`.
     """
     if not _HAS_TRITON:
         raise ImportError("_kde_setup_celllist requires torch + triton.")
     if loc_x_t.shape[0] == 0:
         return None
 
-    Rw = bandwidth * prune_coefficient
+    epa = str(kernel).lower().startswith('epa')
+    Rw = bandwidth if epa else bandwidth * prune_coefficient
     inv_sd = 1.0 / sampling_distance
 
     x_min = float(min(loc_x_t.min().item(), chunk_q_xmin)) - Rw - sampling_distance
@@ -69,6 +77,7 @@ def _kde_setup_celllist(loc_x_t, loc_y_t, loc_z_t, gi_t,
         'sampling_distance': float(sampling_distance),
         'bandwidth': float(bandwidth),
         'prune_coefficient': float(prune_coefficient),
+        'epa': bool(epa),
         'x_min': x_min, 'y_min': y_min, 'W': W, 'H': H,
     }
 
@@ -109,10 +118,19 @@ def _kde_run_subchunk(state, qx, qy, qz, n_genes, device):
     bw = state['bandwidth']
     pc = state['prune_coefficient']
     sd = state['sampling_distance']
-    Rw = bw * pc
+    epa = bool(state.get('epa', False))
+    dim = state['dim']
+    Rw = bw if epa else bw * pc
     Rw2 = Rw * Rw
     two_h2 = 2.0 * bw * bw
-    norm_const = (2.0 * math.pi * bw * bw) ** (0.5 * state['dim'])
+    if epa:
+        # unit-mass Epanechnikov on the ball of radius H = bw:
+        #   1D 3/(4H)  ·  2D 2/(pi H^2)  ·  3D 15/(8 pi H^3)
+        norm_const = {1: (4.0 / 3.0) * bw,
+                      2: (math.pi / 2.0) * bw ** 2,
+                      3: (8.0 * math.pi / 15.0) * bw ** 3}[int(dim)]
+    else:
+        norm_const = (2.0 * math.pi * bw * bw) ** (0.5 * dim)
     inv_norm = 1.0 / norm_const
     inv_sd = 1.0 / sd
     Rp = int(math.floor(Rw / sd + 1e-12))
@@ -128,7 +146,7 @@ def _kde_run_subchunk(state, qx, qy, qz, n_genes, device):
                 N, n_genes, state['W'], state['H'], Rp,
                 state['x_min'], state['y_min'],
                 inv_sd, two_h2, inv_norm, Rw2,
-                BLOCK_T=32,
+                BLOCK_T=32, EPA=1 if epa else 0,
             )
     else:
         qz_g = torch.as_tensor(qz, dtype=torch.float64, device=device).contiguous()
@@ -140,7 +158,7 @@ def _kde_run_subchunk(state, qx, qy, qz, n_genes, device):
                 N, n_genes, state['W'], state['H'], state['D'], Rp,
                 state['x_min'], state['y_min'], state['z_min'],
                 inv_sd, two_h2, inv_norm, Rw2,
-                BLOCK_T=32,
+                BLOCK_T=32, EPA=1 if epa else 0,
             )
     return out
 

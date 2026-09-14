@@ -10,6 +10,10 @@ cross-platform coordinate contract.
 Only the raw read, the image source, the affine convention, and the species differ
 between platforms; everything downstream (panel → compute_vf → downsample → cluster
 → map) is shared and consumes the lightweight :meth:`GridDataset.from_sdata` view.
+
+Stereo-seq is intentionally absent: SAW deliveries (GEF / ``*.tissue.gef``) are read
+by ``spatialdata_io``, and the one-off MOSTA bin1-GEM + ssDNA reader lives beside the
+notebook that uses it (``notebooks/stereoseq_mosta.py``), not in this package.
 """
 
 from __future__ import annotations
@@ -22,161 +26,7 @@ import numpy as np
 import tifffile
 
 from .._griddataset import GridDataset
-from ._grid import fit_affine_lstsq, read_square_bin_gem
-
-
-_STEREOSEQ_ORIENTS = {
-    "identity": (False, False, False), "fliplr": (False, True, False),
-    "flipud":   (False, False, True),  "rot180": (False, True, True),
-    "transpose": (True, False, False), "rot90":  (True, False, True),
-    "rot270":    (True, True, False),  "transpose_flip": (True, True, True),
-}
-
-
-def _register_ssdna_to_lattice(a, img, bin_um, *, reg_um=20.0, ssdna_ds=32,
-                               orientation=None):
-    """Robust ssDNA→lattice registration for Stereo-seq.
-
-    Fixes three fragilities of the old bbox+mirror heuristic:
-      * tissue bbox via **Otsu + largest connected component** (not ``img > 0``),
-        so out-of-tissue speckle no longer inflates the bbox / scale;
-      * the axis convention is **auto-detected** over all 8 dihedral orientations
-        (transpose × 4 mirrors), not a hardcoded transpose + 4-mirror search;
-      * orientation is chosen by correlating the **brain crop** intensity, robust
-        to the bright chip frame and to near-symmetric sections.
-
-    Maps the ssDNA brain bounding box onto the GEM brain bounding box (pure
-    scale + translation, plus the chosen dihedral) → ``affine_px_to_um``. Pass
-    ``orientation`` (a key of ``_STEREOSEQ_ORIENTS``) to force one.
-    """
-    from scipy import ndimage as ndi
-    from skimage.filters import threshold_otsu
-
-    def largest_blob(mask):
-        lbl, n = ndi.label(mask)
-        if n == 0:
-            return mask
-        cnt = np.bincount(lbl.ravel()); cnt[0] = 0
-        return ndi.binary_fill_holes(lbl == cnt.argmax())
-
-    C = a.obs["array_col"].to_numpy(); R = a.obs["array_row"].to_numpy()
-    w = np.asarray(a.X.sum(1)).ravel().astype(np.float64)
-    c_min, r_min = int(C.min()), int(R.min())
-    reg_bins = max(1, int(round(reg_um / bin_um)))
-    cc = (C - c_min) // reg_bins; rr = (R - r_min) // reg_bins
-    D = np.zeros((int(rr.max()) + 1, int(cc.max()) + 1), np.float64)
-    np.add.at(D, (rr, cc), w)
-    gmask = largest_blob(D > threshold_otsu(D[D > 0]))
-    gys, gxs = np.where(gmask)
-    gcol0 = c_min + int(gxs.min()) * reg_bins; gcol1 = c_min + int(gxs.max()) * reg_bins
-    grow0 = r_min + int(gys.min()) * reg_bins; grow1 = r_min + int(gys.max()) * reg_bins
-    Dc = D[gys.min():gys.max() + 1, gxs.min():gxs.max() + 1]
-    Dz = (Dc - Dc.mean()) / (Dc.std() + 1e-9)
-    gh, gw = Dc.shape
-
-    DS = int(ssdna_ds)
-    sm = img[::DS, ::DS].astype(np.float64)
-    smask = largest_blob(ndi.binary_dilation(sm > threshold_otsu(sm[sm > 0]), iterations=2))
-    sysr, sxsr = np.where(smask)
-    ipx0 = int(sxsr.min()) * DS; ipx1 = int(sxsr.max()) * DS
-    ipy0 = int(sysr.min()) * DS; ipy1 = int(sysr.max()) * DS
-    Sc = sm[sysr.min():sysr.max() + 1, sxsr.min():sxsr.max() + 1]
-    Sh, Sw = Sc.shape
-
-    def score(transpose, fu, fv):
-        vg, ug = np.mgrid[0:gh, 0:gw].astype(np.float64)
-        ug /= max(gw - 1, 1); vg /= max(gh - 1, 1)
-        if transpose:
-            uu, vv = vg, ug
-        else:
-            uu, vv = ug, vg
-        us = (1 - uu) if fu else uu
-        vs = (1 - vv) if fv else vv
-        warp = Sc[np.clip((vs * (Sh - 1)).astype(int), 0, Sh - 1),
-                  np.clip((us * (Sw - 1)).astype(int), 0, Sw - 1)]
-        wz = (warp - warp.mean()) / (warp.std() + 1e-9)
-        return float((Dz * wz).mean())
-
-    if orientation is not None and orientation in _STEREOSEQ_ORIENTS:
-        best_name = orientation
-    else:
-        best_name = max(_STEREOSEQ_ORIENTS, key=lambda k: score(*_STEREOSEQ_ORIENTS[k]))
-    transpose, fu, fv = _STEREOSEQ_ORIENTS[best_name]
-
-    px_c, px_r, col, row = [], [], [], []
-    for u in (0, 1):
-        for v in (0, 1):
-            px_c.append(ipx0 + u * (ipx1 - ipx0)); px_r.append(ipy0 + v * (ipy1 - ipy0))
-            uu = (1 - u) if fu else u; vv = (1 - v) if fv else v
-            if transpose:
-                uu, vv = vv, uu
-            col.append(gcol0 + uu * (gcol1 - gcol0)); row.append(grow0 + vv * (grow1 - grow0))
-    inv = fit_affine_lstsq(col, row, px_c, px_r)
-    affine_px_to_um = inv * bin_um
-    det = abs(affine_px_to_um[0, 0] * affine_px_to_um[1, 1]
-              - affine_px_to_um[0, 1] * affine_px_to_um[1, 0])
-    um_per_px = float(np.sqrt(det)) if det > 0 else bin_um
-    return affine_px_to_um, um_per_px, best_name
-
-
-def load_stereoseq(gem_path: str | Path, ssdna_tif: str | Path, *,
-                   species: str = "mouse", organ: str = "whole_brain",
-                   bin_size: int = 1, flip_downsample: int = 32,
-                   orientation: Optional[str] = None,
-                   affine_px_to_um=None) -> GridDataset:
-    """Load a Stereo-seq bin1 GEM + ssDNA image.
-
-    The GEM is read to a square-bin AnnData (native 0.5 µm DNB units) and
-    ``obsm['spatial']`` is converted to µm. The ssDNA-to-lattice affine is
-    resolved robustly by :func:`_register_ssdna_to_lattice` (Otsu brain bounding
-    boxes on both the GEM count density and the ssDNA, then the dihedral
-    orientation whose brain crop best correlates over all 8 candidates).
-
-    :param gem_path: Path to the Stereo-seq bin1 GEM (gzipped TSV) file.
-    :type gem_path: str or pathlib.Path
-    :param ssdna_tif: Path to the ssDNA morphology TIFF image.
-    :type ssdna_tif: str or pathlib.Path
-    :param species: Species name used for marker-panel lookup.
-    :type species: str
-    :param organ: Cell-Ontology module name for the gene panel.
-    :type organ: str
-    :param bin_size: Square-bin size in DNB units (1 DNB = 0.5 µm).
-    :type bin_size: int
-    :param flip_downsample: ssDNA downsample factor used during registration.
-    :type flip_downsample: int
-    :param orientation: Force a dihedral orientation (key of
-        ``_STEREOSEQ_ORIENTS``: ``'identity'``, ``'fliplr'``, ``'flipud'``,
-        ``'rot180'``, ``'transpose'``, ``'rot90'``, ``'rot270'``,
-        ``'transpose_flip'``). Default ``None`` auto-detects.
-    :type orientation: str, optional
-    :param affine_px_to_um: Fully bypass registration and use this ``(2, 3)``
-        pixel-to-µm affine directly.
-    :type affine_px_to_um: numpy.ndarray, optional
-    """
-    a = read_square_bin_gem(str(gem_path), bin_size=bin_size)
-    bin_um = float(a.uns["bin_size_um"])
-    a.obsm["spatial"] = a.obsm["spatial"].astype(np.float64) * bin_um
-
-    img = tifffile.imread(str(ssdna_tif))
-    if img.ndim == 3:
-        img = img[0]
-
-    if affine_px_to_um is not None:
-        affine_px_to_um = np.asarray(affine_px_to_um, float)
-        det = abs(affine_px_to_um[0, 0] * affine_px_to_um[1, 1]
-                  - affine_px_to_um[0, 1] * affine_px_to_um[1, 0])
-        um_per_px = float(np.sqrt(det)) if det > 0 else bin_um
-        orient_name = "manual"
-    else:
-        affine_px_to_um, um_per_px, orient_name = _register_ssdna_to_lattice(
-            a, img, bin_um, ssdna_ds=flip_downsample, orientation=orientation)
-
-    return GridDataset(
-        raw=a, image=img, um_per_px=um_per_px, species=species, organ=organ,
-        platform="stereoseq", affine_px_to_um=affine_px_to_um,
-        he_revert=False,
-        meta={"bin_size_um": bin_um, "orientation": orient_name},
-    ).to_spatialdata(copy=False)
+from ._grid import fit_affine_lstsq
 
 
 def load_visiumhd(path: str | Path, *, species: str = "mouse",

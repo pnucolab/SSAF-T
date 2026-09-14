@@ -314,16 +314,31 @@ class Dataset(object):
             return (orig_x, orig_y, grid_z)
 
     def _get_plot_extent(self):
-        """Compute the extent used for matplotlib imshow."""
-        if not hasattr(self, 'original_coordinate_bounds'):
-            return None
+        """Compute the extent used for matplotlib imshow.
 
-        x_bounds, y_bounds, z_bounds = self.original_coordinate_bounds
-        return [x_bounds[0], x_bounds[1], y_bounds[0], y_bounds[1]]
+        ``original_coordinate_bounds`` is written in two layouts by different
+        producers: the SSAM path stores nested ``[[x0,x1],[y0,y1],[z0,z1]]``
+        while the GridDataset 'blur' count path stores a flat
+        ``[minx,miny,minz, maxx,maxy,maxz]``. Handle both.
+        """
+        if not hasattr(self, 'original_coordinate_bounds') or self.original_coordinate_bounds is None:
+            return None
+        b = np.asarray(self.original_coordinate_bounds, dtype=float)
+        if b.ndim == 2 and b.shape[0] >= 2:               # nested [[x0,x1],[y0,y1],...]
+            return [b[0, 0], b[0, 1], b[1, 0], b[1, 1]]
+        b = b.ravel()
+        if b.size == 6:                                    # flat [minx,miny,minz, maxx,maxy,maxz]
+            return [b[0], b[3], b[1], b[4]]
+        if b.size == 4:                                    # flat [minx,maxx,miny,maxy]
+            return [b[0], b[1], b[2], b[3]]
+        return None
 
     def _plot_celltypes_map(self, data, background="black", centroid_indices=[], colors=None, cmap='jet', rotate=0, min_r=0.6, set_alpha=False, z=None, use_original_coords=True):
+        data = np.asarray(data)
+        if data.ndim == 2:                       # 2D map (no z axis) -> add a singleton z plane
+            data = data[..., None]
         if z is None:
-            z = int(self.shape[2] / 2)
+            z = int(data.shape[2] / 2)           # z from the MAP's own shape, not self.shape (vf_norm may be 2D)
         num_ctmaps = np.max(data) + 1
 
         if len(centroid_indices) == 0:
@@ -356,12 +371,14 @@ class Dataset(object):
 
 
         extent = self._get_plot_extent()
-        extent[0] *= self.x_scale
-        extent[1] *= self.x_scale
-        extent[2], extent[3] = extent[3], extent[2]
-        extent[2] *= self.y_scale
-        extent[3] *= self.y_scale
-
+        if extent is not None:
+            xs = self.x_scale if self.x_scale is not None else 1.0   # store may not carry a scale (GridDataset load)
+            ys = self.y_scale if self.y_scale is not None else 1.0
+            extent[0] *= xs
+            extent[1] *= xs
+            extent[2], extent[3] = extent[3], extent[2]
+            extent[2] *= ys
+            extent[3] *= ys
 
         plt.gca().set_facecolor(background)
         plt.imshow(sctmap, interpolation='nearest', extent=extent)
@@ -499,9 +516,9 @@ class Dataset(object):
         return
 
     def write_celltype_map(self, sdata=None, *, colors=None, cmap='jet',
-                           background="black", z=None, min_r=0.6, set_alpha=False,
-                           labels_key="cellman_celltype_map",
-                           image_key="cellman_celltype_map_rgb"):
+                           background="white", z=None, min_r=0.6, set_alpha=False,
+                           labels_key="ssaft_celltype_map",
+                           image_key="ssaft_celltype_map_rgb"):
         """Write the filtered cell-type map into ``sdata`` as two aligned rasters.
 
         Normally reached through :meth:`Analysis.filter_celltypemaps`, which passes
@@ -519,7 +536,7 @@ class Dataset(object):
         overlays the input table / points / staining image exactly.
 
         No annotating table is written: the celltype names live once, in the
-        ``cellman_downsampled`` table that :meth:`Analysis.map_celltypes` attaches,
+        ``ssaft_downsampled_vectors`` table that :meth:`Analysis.map_celltypes` attaches,
         whose categorical is index-aligned with these pixel values (``names[pixel
         - 1]``). Re-filtering therefore only ever replaces rasters.
 
@@ -535,7 +552,11 @@ class Dataset(object):
         :type colors: list or None
         :param cmap: Colormap used for the clusters when ``colors`` is not given.
         :type cmap: str or matplotlib.colors.Colormap
-        :param background: Background colour for empty / Unknown voxels.
+        :param background: Colour the filtered-out voxels are composited onto.
+            Defaults to ``"white"``: the RGB image carries no alpha channel, so
+            whatever is behind a background voxel becomes part of the picture, and
+            a figure is read on a white page. ``"black"`` restores the old look.
+            Anything ``matplotlib.colors.to_rgba`` accepts works.
         :type background: str or list(float)
         :param z: Z index to slice a 3D cell-type map. Defaults to the middle slice.
         :type z: int or None
@@ -557,9 +578,11 @@ class Dataset(object):
             raise ValueError("no SpatialData given; pass sdata= or run compute_vf "
                              "with a SpatialData input so it is remembered")
 
-        data = self.filtered_celltype_maps
+        data = np.asarray(self.filtered_celltype_maps)
+        if data.ndim == 2:                       # 2D map (no z axis) -> add a singleton z plane
+            data = data[..., None]
         if z is None:
-            z = int(self.shape[2] / 2)
+            z = int(data.shape[2] / 2)           # z from the MAP's own shape, not self.shape (vf_norm may be 2D)
         lab2d = np.asarray(data[..., z].T)
         n_present = int(lab2d.max()) + 1 if (lab2d.size and lab2d.max() >= 0) else 0
 
@@ -582,7 +605,13 @@ class Dataset(object):
             a = np.asarray(_score[..., z].T, dtype=float); a[a < 0] = 0
             if a.max() > 0:
                 rgba[..., 3] = min_r + a / (a.max() / (1.0 - min_r))
-        rgb = (rgba[..., :3] * rgba[..., 3:4] * 255).astype(np.uint8)
+        # Composite over `background` instead of premultiplying alpha, which is the
+        # same thing only when the background is black. Filtered-out voxels have
+        # alpha 0 and so come out as the background colour exactly; with
+        # set_alpha=True a weak call fades toward it rather than toward black.
+        bg = np.asarray(to_rgba(background), dtype=float)[:3]
+        rgb = rgba[..., :3] * rgba[..., 3:4] + bg * (1.0 - rgba[..., 3:4])
+        rgb = (np.clip(rgb, 0.0, 1.0) * 255).astype(np.uint8)
         cyx = np.moveaxis(rgb, -1, 0)
 
         zg = self.zarr_group
@@ -638,7 +667,7 @@ class Dataset(object):
     def _save_celltype_map_to_spatialdata(self, data, background="black",
                                           centroid_indices=[], colors=None, cmap='jet',
                                           rotate=0, min_r=0.6, set_alpha=False, z=None,
-                                          image_name="cellman_celltype_map"):
+                                          image_name="ssaft_celltype_map"):
         """``plot_celltypes_map(save_to_spatialdata=True)`` routes here, which
         delegates to :meth:`write_celltype_map` (labels + RGB image + annotating table)."""
         try:
