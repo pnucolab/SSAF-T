@@ -16,7 +16,7 @@ import dask.array as da
 
 try:
     import xarray as xr
-    from spatialdata.models import Image2DModel, Labels2DModel, TableModel
+    from spatialdata.models import Image2DModel, Labels2DModel, Labels3DModel, TableModel
     from spatialdata.transformations import Affine
     from spatialdata.transformations.operations import get_transformation, set_transformation
     _SPATIALDATA_AVAILABLE = True
@@ -527,13 +527,20 @@ class Dataset(object):
         * ``labels[labels_key]`` — integer raster; pixel value = ``celltype id +
           1`` (0 = background / filtered out). This is the idiomatic categorical
           (Labels2DModel) representation of the segmentation-free cell-type map.
-        * ``images[image_key]`` — an RGB rendering for quick visual inspection.
-          (SpatialData keys are globally unique across element types, so the RGB
-          image cannot share the labels' key; it takes the ``…_rgb`` suffix.)
+          A map with more than one z layer is written whole, as a ``(z, y, x)``
+          Labels3DModel whose z axis is the map's µm z (``coordinate_offset[2] +
+          k * sampling_distance``).
+        * ``images[image_key]`` — an RGB rendering for quick visual inspection, of
+          layer ``z`` on a 3D map. (SpatialData keys are globally unique across
+          element types, so the RGB image cannot share the labels' key; it takes the
+          ``…_rgb`` suffix.)
 
-        Both carry the SAME ``Scale(sampling_distance) + Translation(origin)``
-        affine into the shared ``'global'`` µm coordinate system, so the map
-        overlays the input table / points / staining image exactly.
+        Both carry the SAME xy affine: ``Scale(sampling_distance) + Translation(origin)``
+        takes a pixel to the map's µm frame, and that frame is carried into
+        ``'global'`` by :meth:`_map_to_global_affine` -- the transcripts element's own
+        transformation when there is one (Xenium, MERSCOPE: µm -> image pixels), the
+        identity otherwise (count platforms, whose tables are already in ``'global'``
+        µm). The map therefore overlays the input table / points / staining image.
 
         No annotating table is written: the celltype names live once, in the
         ``ssaft_downsampled_vectors`` table that :meth:`Analysis.map_celltypes` attaches,
@@ -558,7 +565,8 @@ class Dataset(object):
             a figure is read on a white page. ``"black"`` restores the old look.
             Anything ``matplotlib.colors.to_rgba`` accepts works.
         :type background: str or list(float)
-        :param z: Z index to slice a 3D cell-type map. Defaults to the middle slice.
+        :param z: 3D map: the layer rendered to ``images[image_key]``. Defaults to the
+            middle one, ``int(n_layers / 2)``. The labels keep every layer.
         :type z: int or None
         :param min_r: Minimum correlation used when ``set_alpha`` scales opacity.
         :type min_r: float
@@ -581,12 +589,16 @@ class Dataset(object):
         data = np.asarray(self.filtered_celltype_maps)
         if data.ndim == 2:                       # 2D map (no z axis) -> add a singleton z plane
             data = data[..., None]
+        three_d = data.shape[2] > 1
         if z is None:
             z = int(data.shape[2] / 2)           # z from the MAP's own shape, not self.shape (vf_norm may be 2D)
         lab2d = np.asarray(data[..., z].T)
-        n_present = int(lab2d.max()) + 1 if (lab2d.size and lab2d.max() >= 0) else 0
+        n_present = int(data.max()) + 1 if (data.size and data.max() >= 0) else 0
 
-        labels_arr = (lab2d + 1).astype(np.int32)
+        if three_d:                              # (x, y, z) -> (z, y, x), every layer
+            labels_arr = np.ascontiguousarray(data.transpose(2, 1, 0), dtype=np.int32) + 1
+        else:
+            labels_arr = (lab2d + 1).astype(np.int32)
 
         # K counts every class the mapping can emit, not just the ones that won a
         # voxel here: `colors` is indexed BY CELLTYPE ID, so sizing the lookup by
@@ -618,22 +630,62 @@ class Dataset(object):
         sd_um = float(zg.attrs.get("sampling_distance",
                       (zg["vf_params"][0] if "vf_params" in zg else 1.0)))
         ox, oy = self._celltype_map_origin(sdata)
-        xs = float(getattr(self, "x_scale", 1.0) or 1.0)
-        ys = float(getattr(self, "y_scale", 1.0) or 1.0)
-        mat = np.array([[sd_um * xs, 0.0, ox], [0.0, sd_um * ys, oy], [0.0, 0.0, 1.0]])
+        A = self._map_to_global_affine(sdata)
+        if np.allclose(A, np.eye(3)):
+            xs = float(getattr(self, "x_scale", 1.0) or 1.0)
+            ys = float(getattr(self, "y_scale", 1.0) or 1.0)
+        else:
+            xs = ys = 1.0            # the points element's transformation already carries the scale
+        mat = A @ np.array([[sd_um * xs, 0.0, ox], [0.0, sd_um * ys, oy], [0.0, 0.0, 1.0]])
         tf = Affine(mat, input_axes=("x", "y"), output_axes=("x", "y"))
 
         for key, store in ((labels_key, sdata.labels), (image_key, sdata.images)):
             if key in store:
                 del store[key]
-        sdata.labels[labels_key] = Labels2DModel.parse(
-            labels_arr, dims=("y", "x"), transformations={"global": tf})
+        if three_d:
+            off = getattr(self, "coordinate_offset", None)
+            if off is None and "coordinate_offset" in zg:
+                off = zg["coordinate_offset"][:]
+            oz = float(off[2]) if off is not None and len(off) > 2 else 0.0
+            # rows/columns in (z, y, x) order; z stays in the map's µm, xy as the 2D affine
+            m4 = np.array([[sd_um, 0.0, 0.0, oz],
+                           [0.0, mat[1, 1], mat[1, 0], mat[1, 2]],
+                           [0.0, mat[0, 1], mat[0, 0], mat[0, 2]],
+                           [0.0, 0.0, 0.0, 1.0]])
+            sdata.labels[labels_key] = Labels3DModel.parse(
+                labels_arr, dims=("z", "y", "x"),
+                chunks=(labels_arr.shape[0], 1024, 1024),
+                transformations={"global": Affine(m4, input_axes=("z", "y", "x"),
+                                                  output_axes=("z", "y", "x"))})
+        else:
+            sdata.labels[labels_key] = Labels2DModel.parse(
+                labels_arr, dims=("y", "x"), transformations={"global": tf})
         sdata.images[image_key] = Image2DModel.parse(
             cyx, dims=("c", "y", "x"), transformations={"global": tf})
-        print(f"[write_celltype_map] labels['{labels_key}'] {labels_arr.shape} "
-              f"+ images['{image_key}'] ({K} celltypes) "
-              f"@ {sd_um}µm/px, origin=({ox:.1f},{oy:.1f})")
+        print(f"[write_celltype_map] labels['{labels_key}'] {labels_arr.shape}"
+              + (" (z, y, x)" if three_d else "")
+              + f" + images['{image_key}'] " + (f"layer z={z} " if three_d else "")
+              + f"({K} celltypes) @ {sd_um}µm/px, origin=({ox:.1f},{oy:.1f})")
         return sdata
+
+    @staticmethod
+    def _map_to_global_affine(sdata):
+        """``(3, 3)`` affine from the cell-type map's µm frame to ``'global'``.
+
+        The transcript backend builds the map in the INTRINSIC coordinates of the points
+        element it read, so that element's own transformation is what carries the map into
+        ``'global'`` (µm -> mosaic/morphology pixels on Xenium and MERSCOPE). Count
+        platforms have no points element and their tables are already in ``'global'`` µm,
+        so the map needs no further transformation there.
+        """
+        from spatialdata.transformations import get_transformation
+        points = getattr(sdata, "points", None) or {}
+        if not len(points):
+            return np.eye(3)
+        t = get_transformation(points[next(iter(points))], "global")
+        if t is None:
+            return np.eye(3)
+        return np.asarray(t.to_affine_matrix(input_axes=("x", "y"), output_axes=("x", "y")), dtype=float)
 
     def _celltype_map_origin(self, sdata):
         """World-µm origin ``(x0, y0)`` of the vf grid: count platforms store it in

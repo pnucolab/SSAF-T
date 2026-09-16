@@ -106,6 +106,59 @@ def _nest_rings(g):
     return out[0] if len(out) == 1 else MultiPolygon(out)
 
 
+def _watershed3d_tile(slab, seeds_xyz, seeds_ct, seeds_id, x0, x1, y0, y1, pad):
+    """One padded xy tile of the 3D celltype-constrained watershed; returns ``(core, x0, y0)``.
+
+    ``slab`` is the ``(x, y, z)`` cell-type map. Each seed is one voxel ``(x, y, z)`` of its
+    celltype; for each celltype the flood is the watershed of the Euclidean distance to that
+    celltype's seeds, confined to that celltype's voxels. A tile keeps only its core; ``pad``
+    exceeds a cell, so a voxel is decided by the same seeds in whichever tile it is computed.
+    """
+    from skimage.segmentation import watershed
+    X, Y, _ = slab.shape
+    px0, px1, py0, py1 = max(0, x0 - pad), min(X, x1 + pad), max(0, y0 - pad), min(Y, y1 + pad)
+    sub = np.asarray(slab[px0:px1, py0:py1, :])
+    lab = np.zeros(sub.shape, np.int32)
+    sel = ((seeds_xyz[:, 0] >= px0) & (seeds_xyz[:, 0] < px1)
+           & (seeds_xyz[:, 1] >= py0) & (seeds_xyz[:, 1] < py1))
+    if sel.any():
+        sx, sy, sz = seeds_xyz[sel, 0] - px0, seeds_xyz[sel, 1] - py0, seeds_xyz[sel, 2]
+        sct, sid = seeds_ct[sel], seeds_id[sel]
+        for c in np.unique(sct):
+            m = sct == c
+            mk = np.zeros(sub.shape, np.int32)
+            mk[sx[m], sy[m], sz[m]] = sid[m]
+            mask = sub == c
+            if not mask.any():
+                continue
+            lab_c = watershed(ndimage.distance_transform_edt(mk == 0), mk, mask=mask)
+            hit = lab_c > 0
+            lab[hit] = lab_c[hit]
+    cx0, cy0 = x0 - px0, y0 - py0
+    return lab[cx0:cx0 + (x1 - x0), cy0:cy0 + (y1 - y0), :], x0, y0
+
+
+def _plane_polygons(lab_xy, sd_um, ox, oy, simplify=None):
+    """``[(label, polygon)]`` of one ``(x, y)`` label plane, in the map's µm frame.
+
+    Traced along voxel boundaries by :func:`spatialdata.to_polygons` (one chunk, so no seams),
+    shell/hole nesting restored by :func:`_nest_rings`.
+    """
+    import geopandas as gpd
+    from spatialdata import to_polygons
+    from spatialdata.models import Labels2DModel
+    lab = np.ascontiguousarray(np.asarray(lab_xy).T)
+    if not lab.any():
+        return []
+    poly = to_polygons(Labels2DModel.parse(lab, chunks=lab.shape))
+    gs = gpd.GeoSeries([_nest_rings(g) for g in poly.geometry]).affine_transform(
+        [sd_um, 0, 0, sd_um, ox, oy])
+    if simplify:
+        gs = gs.simplify(simplify)
+    return [(int(lb), g) for lb, g in zip(poly.index.to_numpy(), gs.to_numpy())
+            if g is not None and not g.is_empty]
+
+
 def _binary_fill_holes_fast(mask):
     """``scipy.ndimage.binary_fill_holes`` with an optional CuPy backend.
 
@@ -332,6 +385,7 @@ class Analysis(object):
     #: shape of a count table, so nothing would raise).
     _OWN_ELEMENTS = frozenset({
         'ssaft_cells', 'ssaft_downsampled_vectors', 'ssaft_cell_boundaries',
+        'ssaft_cell_boundaries_2d', 'ssaft_cell_boundaries_3d', 'ssaft_cell_labels_3d',
         'ssaft_celltype_map', 'ssaft_celltype_map_rgb',
     })
 
@@ -2886,8 +2940,10 @@ class Analysis(object):
         rel = (xy[:, :2] - off[:2][None, :]) / float(sampling_distance)
         on_lattice = bool(np.allclose(rel, np.rint(rel), atol=1e-6))
         if spans_z:
-            self._m('map_celltypes: anchors span z, so the prior is 3D and evaluated '
-                    'with the KD-tree (the gridded prior is a 2D convolution)')
+            self._m('map_celltypes: anchors span z, so the prior is 3D: a nearest-k_max '
+                    'lookup, on the GPU when the anchors sit on the voxel lattice and a '
+                    'CUDA device is used, else the KD-tree (the gridded prior is a 2D '
+                    'convolution)')
             return AnchorPrior(xy, lab, n_classes, d_max=d_max, nu=nu, k_max=k_max,
                                sampling_distance=float(sampling_distance))
         if want and on_lattice:
@@ -3713,9 +3769,11 @@ class Analysis(object):
         * ``labels[labels_key]`` — the categorical raster; pixel value =
           ``celltype id + 1`` (0 = background / filtered out). Labels, not an
           image: that is what makes the raster addressable as categories
-          (``aggregate``, label picking, region queries).
+          (``aggregate``, label picking, region queries). A 3D map is written with
+          every layer, ``(z, y, x)``.
         * ``images[image_key]`` — an RGB rendering in the palette fixed at
-          ``map_celltypes`` time, for quick visual inspection.
+          ``map_celltypes`` time, for quick visual inspection; on a 3D map, of
+          layer ``z``.
 
         No table is written here — the celltype NAMES live once, in
         ``tables['ssaft_downsampled_vectors']`` from :meth:`map_celltypes`, whose
@@ -3822,8 +3880,8 @@ class Analysis(object):
         :type filter_params: dict
         :param output_mask: If given, the cell type maps will be filtered using the output mask.
         :type output_mask: np.ndarray(bool)
-        :param z: Z index to slice a 3D map when writing the rasters; defaults to
-            the middle slice.
+        :param z: 3D map: the layer rendered to ``images[image_key]``; defaults to
+            the middle one, ``int(n_layers / 2)``. ``labels[labels_key]`` keeps every layer.
         :type z: int or None
         :param background: Colour the filtered-out voxels take in
             ``images[image_key]``. Defaults to ``"white"`` — the RGB element has no
@@ -4083,6 +4141,7 @@ class Analysis(object):
         actually lands on the map wins. Pass ``frame='intrinsic'`` / ``'global'``
         to skip the check and force one.
         """
+        self._nuclei_global_affine = None
         if not isinstance(nuclei, str):
             xy = np.asarray(nuclei, dtype=float)
             if xy.ndim != 2 or xy.shape[1] < 2:
@@ -4103,12 +4162,15 @@ class Analysis(object):
         from spatialdata.transformations import get_transformation
         t = get_transformation(el, "global")
         if t is None:
+            self._nuclei_global_affine = np.eye(3)
             return xy
-        A = t.to_affine_matrix(input_axes=("x", "y"), output_axes=("x", "y"))
+        A = np.asarray(t.to_affine_matrix(input_axes=("x", "y"), output_axes=("x", "y")), dtype=float)
         xy_global = (A[:2, :2] @ xy.T).T + A[:2, 2]
         if frame == "intrinsic":
+            self._nuclei_global_affine = A
             return xy
         if frame == "global":
+            self._nuclei_global_affine = np.eye(3)
             return xy_global
 
         # The two backends write these bounds in different layouts: the transcript
@@ -4118,6 +4180,7 @@ class Analysis(object):
         b = (np.asarray(zg["original_coordinate_bounds"][:], dtype=float)
              if zg is not None and "original_coordinate_bounds" in zg else None)
         if b is None:
+            self._nuclei_global_affine = A
             return xy                                   # nothing to score against
         if b.ndim == 2 and b.shape[0] >= 2:
             (x0, x1), (y0, y1) = b[0][:2], b[1][:2]
@@ -4126,6 +4189,7 @@ class Analysis(object):
         elif b.ndim == 1 and b.size == 4:
             x0, y0, x1, y1 = b
         else:
+            self._nuclei_global_affine = A
             return xy
 
         def hit(v):
@@ -4133,6 +4197,7 @@ class Analysis(object):
                           (v[:, 1] >= y0) & (v[:, 1] <= y1)).mean())
         h_int, h_glob = hit(xy), hit(xy_global)
         pick, frac = (xy, h_int) if h_int >= h_glob else (xy_global, h_glob)
+        self._nuclei_global_affine = A if pick is xy else np.eye(3)
         self._m(f"segment_cells: markers read in "
                 f"{'intrinsic' if pick is xy else 'global'} frame "
                 f"({frac:.1%} inside the map; other frame {min(h_int, h_glob):.1%})")
@@ -4301,10 +4366,21 @@ class Analysis(object):
                 f"{int(X.sum()):,} counts (bin pitch {pitch} vs map {sd_um:.2f}µm/px)")
         return X, list(map(str, tab.var_names)), int(X.sum())
 
+    def _cells_global_affine(self, sdata):
+        """``(3, 3)`` affine carrying the cell-type map's µm frame into ``'global'``.
+
+        The frame the nuclei were read in decides (:meth:`_nuclei_to_um` records it); for an
+        array of markers, which carries no frame, the map's own (:meth:`Dataset._map_to_global_affine`).
+        """
+        A = getattr(self, "_nuclei_global_affine", None)
+        return np.asarray(A, dtype=float) if A is not None else self.dataset._map_to_global_affine(sdata)
+
     def segment_cells(self, sdata=None, nuclei=None, *, z=None,
                       simplify=None, min_area_um2=5.0, transcripts=None, bins=None,
-                      shapes_key="ssaft_cell_boundaries", table_key="ssaft_cells",
-                      column="cellman_annotation", nuclei_frame=None):
+                      shapes_key="ssaft_cell_boundaries_2d",
+                      shapes_3d_key="ssaft_cell_boundaries_3d",
+                      labels_3d_key="ssaft_cell_labels_3d", table_key="ssaft_cells",
+                      column="cellman_annotation", nuclei_frame=None, tile=1024, pad_um=64.0):
         """Cut the cell-type map into single cells by a celltype-constrained watershed.
 
         The segmentation-free map says *what* each voxel is but not *which cell* it
@@ -4323,95 +4399,317 @@ class Analysis(object):
                 dist   = distance_transform_edt(markers_c == 0)
                 labels = watershed(dist, markers_c, mask=mask_c)
 
-        Markers of different types never compete (different masks), so a heterotypic
-        wall lands exactly on the map boundary. Markers of the same type flood from
-        their own voxel, so their fronts meet where the distances are equal.
-
         A nucleus sitting on background (``-1``, i.e. filtered out by
-        :meth:`filter_celltypemaps`) is **ignored** — the map claims no cell there.
-        Every marker that is used yields exactly one cell, so cell count == markers
-        used, less whatever ``min_area_um2`` drops.
+        :meth:`filter_celltypemaps`) is ignored; every other nucleus yields one cell.
 
-        The watershed labels are turned into polygons by
-        :func:`spatialdata.to_polygons`, which traces the voxel BOUNDARY (marching
-        squares at the 0.5 level). That matters at map resolution: a cell here is a
-        handful of voxels, and a contour drawn through the boundary voxels' centres
-        instead would inset every cell by half a voxel — dropping a 3x3-voxel cell
-        to 4/9 of its area and losing 1-2 voxel cells entirely, since they have too
-        few points to close a ring.
+        **2D** (``n_dims == 2``, or ``z`` given): one plane of the map, ``z`` or the middle
+        one. Markers are the nucleus centroids, a marker's cell type the map's label under
+        it. Writes ``shapes[shapes_key]`` and ``tables[table_key]`` annotating it.
 
-        Polygons are written to ``shapes[shapes_key]`` in the shared ``'global'`` µm
-        coordinate system, with an annotating ``tables[table_key]`` carrying the
-        cell-type name per cell, so::
+        **3D** (the store's ``n_dims == 3`` and ``z`` not given): the watershed runs in 3D over
+        every layer of the map. Which voxels are tissue is :meth:`filter_celltypemaps`' decision,
+        not the segmentation's, so no layers are picked here.
 
-            sdata.pl.render_shapes('ssaft_cell_boundaries', color='cellman_annotation',
-                                   table_name='ssaft_cells').pl.show()
+        * *markers* -- a marker only says where the water is poured: each nucleus centroid is one
+          seed voxel on the map's middle layer ``int(n_layers / 2)``, and its cell type is the
+          map's label there (a nucleus on background there is ignored).
+        * *flood* -- per cell type, the 3D watershed of the Euclidean distance to the seeds,
+          confined to that cell type's voxels, computed in xy tiles of ``tile`` voxels with
+          ``pad_um`` of overlap (each tile keeps its core) on ``ncores`` processes.
 
-        The celltype categorical is pinned to the celltype ID order and the palette
-        travels with it in ``uns[f'{column}_colors']``, so that render comes out in
-        the SAME colours as ``images['ssaft_celltype_map_rgb']``. Left to pandas the
-        categories would be alphabetical while the palette is in ID order, and every
-        cell type would silently get another type's colour.
+        It writes
 
-        ``tables[table_key]`` is a full cell x gene AnnData: ``X`` holds the raw counts
-        that fell inside each cell — molecules on a points platform, summed bin
-        vectors on an array platform (see ``bins``) — ``var_names`` the genes,
-        ``obsm['spatial']`` the cell centroids, and ``obs`` the cell type, area and id.
+        * ``labels[labels_3d_key]`` -- the ``(z, y, x)`` cell labels (0 = no cell), value =
+          ``label_id``;
+        * ``shapes[shapes_3d_key]`` -- every cell's outline on every layer, one row per
+          (cell, layer), with ``cell_id``, ``z_index`` and ``z_um``;
+        * ``shapes[shapes_key]`` -- the outlines on the map's middle layer ``int(n_layers / 2)``,
+          the seed layer and the layer of ``images['ssaft_celltype_map_rgb']``;
+        * ``tables[table_key]`` annotating the 3D labels (``instance_key='label_id'``): one
+          row per cell, transcripts counted by the 3D voxel they fall in (z clamped into the
+          layers), ``obs`` with the cell type, ``volume_um3``, ``n_z``,
+          ``max_plane_area_um2`` and ``area_um2`` (middle layer), ``obsm['spatial']`` the
+          voxel centroid in µm (x, y, z).
 
-        works directly.
+        ``min_area_um2`` drops a 3D cell whose largest layer is below it.
 
-        :param sdata: SpatialData to read the nuclei from and write the cells into.
-            Defaults to the one remembered from ``compute_vf`` / ``map_celltypes``.
-        :type sdata: spatialdata.SpatialData or None
-        :param nuclei: Marker positions. Either an ``(N, 2)`` array of µm coordinates,
-            or the key of a shapes element (polygon centroids are used, e.g. Xenium
-            ``'nucleus_boundaries'``) or a points element with ``x`` / ``y`` columns.
-        :type nuclei: numpy.ndarray or str
-        :param z: Z index of the cell-type map to segment. Defaults to the middle
-            slice — the same default :meth:`Dataset.write_celltype_map` uses. Nuclei
-            are 2D on every platform we load, so this is a 2D segmentation.
-        :type z: int or None
-        :param simplify: Douglas-Peucker tolerance in µm applied to each polygon.
-            The raster contours are pixel staircases; ``1.0`` roughly halves the
-            vertex count. ``None`` keeps them exact.
-        :type simplify: float or None
-        :param min_area_um2: Drop cells smaller than this. ``0`` keeps all.
-            Defaults to ``5.0``: a marker landing on a one-voxel island of its own
-            cell type — the map's heterotypic wall closing right around it, or a
-            same-type neighbour one voxel away claiming the rest — still yields a
-            cell, and at a 1 µm/px map that cell is 0.5 µm² of tissue. At typical
-            transcript densities (~1.4 molecules/µm²) a quarter of such fragments
-            catch no molecule at all and land in the table as empty rows.
-        :type min_area_um2: float
-        :param transcripts: Key of the points element to count into the cell x gene
-            matrix. Defaults to the first points element of ``sdata``.
-        :type transcripts: str or None
-        :param bins: Binned counts to aggregate when there are no molecule
-            coordinates (Visium HD / Stereo-seq / StrataMap). An AnnData with
-            ``obsm['spatial']`` in µm, a :class:`GridDataset`, or a table key of
-            ``sdata``. Only consulted when no points element is available; ``None``
-            falls back to the GridDataset ``compute_vf`` was run on, then to one
-            rebuilt from ``sdata``. Each bin is assigned whole to the cell its
-            centre lands in and its count vector is added to that cell's row.
-        :type bins: anndata.AnnData or GridDataset or str or None
-        :param shapes_key: Key of the shapes element (cell boundaries) written into
-            ``sdata``. Must differ from ``table_key``: SpatialData keys are unique
-            across element types.
-        :type shapes_key: str
-        :param table_key: Key of the annotating cell x gene table written into ``sdata``.
-        :type table_key: str
-        :param column: ``obs`` column holding the cell-type name. Matches the column
-            :meth:`map_celltypes` writes, so the same palette applies.
-        :type column: str
-        :returns: The SpatialData with ``shapes[shapes_key]`` (boundaries) and
-            ``tables[table_key]`` (cell x gene counts) added.
-        :rtype: spatialdata.SpatialData
+        Polygons trace voxel BOUNDARIES (:func:`spatialdata.to_polygons`): a contour through
+        boundary voxel centres would inset every cell by half a voxel and lose 1-2 voxel
+        cells. Geometry is in the map's µm frame (so areas are µm²); the elements carry the
+        transformation of the frame the nuclei were read in, so they overlay the image, the
+        nuclei and the transcripts in ``'global'``. The cell-type categorical is pinned to the
+        celltype id order and the palette travels in ``uns[f'{column}_colors']``, so a render
+        comes out in the colours of ``images['ssaft_celltype_map_rgb']``::
+
+            sdata.pl.render_labels('ssaft_cell_labels_3d', color='cellman_annotation',
+                                   table_name='ssaft_cells').pl.show()        # 3D
+            sdata.pl.render_shapes('ssaft_cell_boundaries_2d', color='cellman_annotation',
+                                   table_name='ssaft_cells').pl.show()        # 2D
+
+        :param sdata: SpatialData to read the nuclei from and write the cells into. Defaults to
+            the one remembered from ``compute_vf`` / ``map_celltypes``.
+        :param nuclei: Marker positions: an ``(N, 2)`` array in the map's µm frame, or the key
+            of a shapes element (polygon centroids, e.g. Xenium ``'nucleus_boundaries'``) or a
+            points element with ``x`` / ``y`` columns.
+        :param z: 2D only: the map layer to segment. Giving it on a 3D store segments that one
+            layer in 2D.
+        :param simplify: Douglas-Peucker tolerance in µm for the polygons (``None`` = exact).
+        :param min_area_um2: Drop cells smaller than this (2D: the polygon; 3D: its largest
+            layer). ``0`` keeps all.
+        :param transcripts: Key of the points element to count; defaults to the only one.
+        :param bins: 2D count platforms: the bin table to aggregate when there are no points.
+        :param shapes_key: Outlines on the segmented 2D plane / the 3D middle layer.
+        :param shapes_3d_key: 3D only: per-layer outlines.
+        :param labels_3d_key: 3D only: the 3D label raster.
+        :param table_key: The cell x gene table.
+        :param column: ``obs`` column for the cell type (as :meth:`map_celltypes` writes).
+        :param nuclei_frame: ``'intrinsic'`` / ``'global'`` to force the frame the nuclei are
+            read in (default: the one that lands on the map).
+        :param tile: 3D only: xy tile size, voxels.
+        :param pad_um: 3D only: tile overlap, µm.
+        :returns: The SpatialData with the elements added.
         """
+        if nuclei is None:
+            raise ValueError("nuclei= is required (array of µm coords, or a "
+                             "shapes/points element key)")
+        sdata = sdata if sdata is not None else getattr(
+            self.dataset, '_original_input_data', None)
+        if sdata is None:
+            raise ValueError("no SpatialData given; pass sdata= or run compute_vf "
+                             "with a SpatialData input so it is remembered")
+        fm = getattr(self.dataset, 'filtered_celltype_maps', None)
+        if fm is None:
+            raise ValueError("no filtered cell-type map; run filter_celltypemaps first")
+        three_d = (getattr(self, 'n_dims', None) == 3 and z is None
+                   and np.ndim(fm) == 3 and np.shape(fm)[2] > 1)
+        if three_d:
+            return self._segment_cells_3d(
+                sdata, nuclei, simplify=simplify, min_area_um2=min_area_um2,
+                transcripts=transcripts, shapes_key=shapes_key, shapes_3d_key=shapes_3d_key,
+                labels_3d_key=labels_3d_key, table_key=table_key, column=column,
+                nuclei_frame=nuclei_frame, tile=tile, pad_um=pad_um)
+        return self._segment_cells_2d(
+            sdata, nuclei, z=z, simplify=simplify, min_area_um2=min_area_um2,
+            transcripts=transcripts, bins=bins, shapes_key=shapes_key, table_key=table_key,
+            column=column, nuclei_frame=nuclei_frame)
+
+    def _segment_cells_3d(self, sdata, nuclei, *, simplify, min_area_um2, transcripts,
+                          shapes_key, shapes_3d_key, labels_3d_key, table_key, column,
+                          nuclei_frame, tile, pad_um):
+        """The 3D path of :meth:`segment_cells`."""
+        import geopandas as gpd
+        from joblib import Parallel, delayed
+        from scipy.sparse import csr_matrix
+        from spatialdata.models import Labels3DModel, ShapesModel, TableModel
+        from spatialdata.transformations import Affine
+
+        data = np.asarray(self.dataset.filtered_celltype_maps)          # (x, y, z)
+        X, Y, Zall = data.shape
+        zg = self.dataset.zarr_group
+        sd_um = float(zg.attrs.get("sampling_distance",
+                      (zg["vf_params"][0] if "vf_params" in zg else 1.0)))
+        ox, oy = (float(v) for v in self.dataset._celltype_map_origin(sdata))
+        off = (np.asarray(zg["coordinate_offset"][:], dtype=float)
+               if "coordinate_offset" in zg else np.zeros(3))
+        oz = float(off[2]) if off.size > 2 else 0.0
+        tx_key = self._pick_element(getattr(sdata, 'points', {}), transcripts,
+                                    kind='points', param='transcripts', required=False)
+
+        # ---- every layer of the map: which voxels are tissue is the filter's decision
+        z0, z1 = 0, Zall - 1
+        slab = np.ascontiguousarray(data)
+        del data
+        Z = Zall
+        z_mid = Zall // 2                  # the seed layer, the one write_celltype_map renders
+        names, ct_colors = self._celltype_names_colors()
+        K = len(names)
+
+        # ---- markers: where the water is poured -- each nucleus centroid, one voxel on the middle layer
+        xy_um = self._nuclei_to_um(sdata, nuclei, frame=nuclei_frame)
+        vx = np.rint((xy_um[:, 0] - ox) / sd_um).astype(np.int64)
+        vy = np.rint((xy_um[:, 1] - oy) / sd_um).astype(np.int64)
+        inside = (vx >= 0) & (vx < X) & (vy >= 0) & (vy < Y)
+        cts = np.full(len(vx), -1, dtype=np.int32)
+        cts[inside] = slab[vx[inside], vy[inside], z_mid]
+        use = inside & (cts >= 0) & (cts < K)
+        if not use.any():
+            raise ValueError("no nucleus falls on a labelled voxel of the cell-type map's middle layer — "
+                             "check that nuclei and the map share a coordinate system")
+        seeds_xyz = np.c_[vx[use], vy[use], np.full(int(use.sum()), z_mid, dtype=np.int64)]
+        seeds_ct = cts[use]
+        seeds_id = np.arange(1, int(use.sum()) + 1, dtype=np.int32)
+
+        # ---- 3D watershed in xy tiles
+        pad = int(np.ceil(float(pad_um) / sd_um))
+        tile = int(tile)
+        jobs = [(x0, min(X, x0 + tile), y0, min(Y, y0 + tile))
+                for x0 in range(0, X, tile) for y0 in range(0, Y, tile)]
+        labels = np.zeros((X, Y, Z), dtype=np.int32)
+        for core, x0, y0 in Parallel(n_jobs=max(1, min(int(self.ncores), len(jobs))))(
+                delayed(_watershed3d_tile)(slab, seeds_xyz, seeds_ct, seeds_id, *j, pad) for j in jobs):
+            labels[x0:x0 + core.shape[0], y0:y0 + core.shape[1], :] = core
+        del slab
+
+        # ---- per-cell size, planes and centroid; drop cells whose largest layer is too small
+        n_lab = int(seeds_id.max()) + 1
+        vol = np.zeros(n_lab, np.int64)
+        cover = np.zeros(n_lab, np.int64)
+        n_z = np.zeros(n_lab, np.int16)
+        sx, sy, sz = np.zeros(n_lab), np.zeros(n_lab), np.zeros(n_lab)
+        xi = np.broadcast_to(np.arange(X, dtype=np.float64)[:, None], (X, Y)).ravel()
+        yi = np.broadcast_to(np.arange(Y, dtype=np.float64)[None, :], (X, Y)).ravel()
+        for k in range(Z):
+            L = labels[:, :, k].ravel()
+            c = np.bincount(L, minlength=n_lab)
+            vol += c
+            cover = np.maximum(cover, c)
+            n_z += (c > 0)
+            sx += np.bincount(L, weights=xi, minlength=n_lab)
+            sy += np.bincount(L, weights=yi, minlength=n_lab)
+            sz += c * k
+        keep = (cover > 0) & (cover * sd_um ** 2 >= (min_area_um2 or 0))
+        keep[0] = False
+        drop_small = int(((cover > 0) & ~keep)[1:].sum())
+        if drop_small:
+            labels[~keep[labels] & (labels > 0)] = 0
+        present = np.flatnonzero(keep)
+        den = np.maximum(vol, 1)
+        cen = np.c_[ox + sx / den * sd_um, oy + sy / den * sd_um, oz + (z0 + sz / den) * sd_um]
+
+        # ---- outlines on every layer, and the middle one
+        planes = Parallel(n_jobs=max(1, min(int(self.ncores), Z)))(
+            delayed(_plane_polygons)(labels[:, :, k], sd_um, ox, oy, simplify) for k in range(Z))
+        k_mid = z_mid - z0
+        recs, area_mid = [], np.full(n_lab, np.nan)
+        for k, polys in enumerate(planes):
+            for lb, g in polys:
+                if lb < n_lab and keep[lb]:
+                    recs.append((lb, z0 + k, g))
+                    if k == k_mid:
+                        area_mid[lb] = g.area
+        gdf3 = gpd.GeoDataFrame(
+            {"cell_id": [f"cell_{r[0]}" for r in recs],
+             "z_index": np.array([r[1] for r in recs], dtype=np.int32),
+             "z_um": np.array([oz + r[1] * sd_um for r in recs], dtype=np.float32)},
+            geometry=[r[2] for r in recs],
+            index=pd.Index([f"cell_{r[0]}_z{r[1]}" for r in recs], name="plane_cell_id"))
+        mid = [r for r in recs if r[1] == z0 + k_mid]
+        gdf2 = gpd.GeoDataFrame(geometry=[r[2] for r in mid],
+                                index=pd.Index([f"cell_{r[0]}" for r in mid], name="cell_id"))
+
+        # ---- cell x gene counts by 3D voxel
+        Xc, var_names, n_in = self._count_transcripts_per_cell_3d(
+            sdata, labels, present, sd_um, ox, oy, oz, z0, transcripts=tx_key)
+
+        ctid = np.full(n_lab, -1, dtype=np.int32)
+        ctid[seeds_id] = seeds_ct
+        idx = pd.Index([f"cell_{i}" for i in present])
+        obs = pd.DataFrame({
+            column: pd.Categorical.from_codes(ctid[present], categories=list(names)),
+            "celltype_id": ctid[present],
+            "label_id": present.astype(np.int32),
+            "cell_id": idx.to_numpy(),
+            "volume_um3": (vol[present] * sd_um ** 3).astype(np.float32),
+            "n_z": n_z[present],
+            "max_plane_area_um2": (cover[present] * sd_um ** 2).astype(np.float32),
+            "area_um2": area_mid[present].astype(np.float32),
+            "region": pd.Categorical([labels_3d_key] * len(present)),
+        }, index=idx)
+        if Xc is None:
+            Xc, var_names = csr_matrix((len(present), 0), dtype=np.float32), []
+        adata = ad.AnnData(X=Xc, obs=obs, var=pd.DataFrame(index=pd.Index(var_names, name=None)))
+        adata.obsm['spatial'] = cen[present].astype(np.float32)
+        adata.uns[f'{column}_colors'] = list(ct_colors)
+        adata.uns['cellman_celltype_names'] = list(names)
+        adata.uns['segment_cells'] = dict(
+            n_dims=3, z_layers=[int(z0), int(z1)], seed_layer=int(z_mid),
+            z_um=[float(oz + z0 * sd_um), float(oz + z1 * sd_um)],
+            middle_layer=int(z0 + k_mid), middle_z_um=float(oz + (z0 + k_mid) * sd_um),
+            obsm_spatial="voxel centroid, µm (x, y, z)", area_um2="area on the middle layer")
+
+        # ---- elements, in the frame the nuclei were read in
+        A = self._cells_global_affine(sdata)
+        a, b, c = A[0]
+        d, e, f = A[1]
+        M4 = np.array([[sd_um, 0.0, 0.0, oz + z0 * sd_um],
+                       [0.0, e * sd_um, d * sd_um, d * ox + e * oy + f],
+                       [0.0, b * sd_um, a * sd_um, a * ox + b * oy + c],
+                       [0.0, 0.0, 0.0, 1.0]])
+        tf_xy = Affine(A, input_axes=("x", "y"), output_axes=("x", "y"))
+        for key, store in ((shapes_key, sdata.shapes), (shapes_3d_key, sdata.shapes),
+                           (table_key, sdata.tables), (labels_3d_key, sdata.labels)):
+            if key in store:
+                del store[key]
+        sdata.labels[labels_3d_key] = Labels3DModel.parse(
+            np.ascontiguousarray(labels.transpose(2, 1, 0)), dims=("z", "y", "x"),
+            chunks=(Z, 1024, 1024),
+            transformations={"global": Affine(M4, input_axes=("z", "y", "x"),
+                                              output_axes=("z", "y", "x"))})
+        sdata.shapes[shapes_3d_key] = ShapesModel.parse(gdf3, transformations={"global": tf_xy})
+        sdata.shapes[shapes_key] = ShapesModel.parse(gdf2, transformations={"global": tf_xy})
+        sdata.tables[table_key] = TableModel.parse(
+            adata, region=labels_3d_key, region_key="region", instance_key="label_id")
+
+        n_bg = int((inside & (cts < 0)).sum())
+        print(f"[segment_cells] labels['{labels_3d_key}'] {len(present)} cells in 3D from "
+              f"{int(use.sum())}/{len(vx)} nuclei ({n_bg} on background on the seed layer ignored, "
+              f"{int((~inside).sum())} outside map"
+              + (f", {drop_small} below {min_area_um2}µm² on every layer" if drop_small else "")
+              + f") @ all {Z} layers, seeds on layer {z_mid}, {sd_um}µm/voxel")
+        print(f"[segment_cells] shapes['{shapes_3d_key}'] {len(gdf3)} outlines on {Z} layers; "
+              f"shapes['{shapes_key}'] {len(gdf2)} on the middle layer z={z0 + k_mid}")
+        print(f"[segment_cells] tables['{table_key}'] {adata.shape} ({n_in:,} transcripts assigned, "
+              f"median volume {float(np.median(obs['volume_um3'])):.0f}µm³)")
+        return sdata
+
+    def _count_transcripts_per_cell_3d(self, sdata, labels, lab_of_cell, sd_um, ox, oy, oz, z0,
+                                       transcripts=None):
+        """:meth:`_count_transcripts_per_cell` on an ``(x, y, z)`` label volume.
+
+        A transcript is counted in the cell of the voxel it falls in; its z is clamped into the
+        segmented layers, so a molecule just above or below them joins its column's cell."""
+        from scipy.sparse import coo_matrix
+        if transcripts is None:
+            return None, [], 0
+        self._m(f"segment_cells: counting points['{transcripts}'] in 3D")
+        pts = sdata.points[transcripts]
+        gene_col = next((c for c in ('gene', 'gene_symbol', 'feature_name', 'target')
+                         if c in pts.columns), None)
+        if gene_col is None:
+            raise ValueError(f"gene column not found in points['{transcripts}']: {list(pts.columns)}")
+        cols = ['x', 'y', 'z', gene_col] + (['is_gene'] if 'is_gene' in pts.columns else [])
+        pts = pts[cols]
+        if hasattr(pts, 'compute'):
+            pts = pts.compute()
+        if 'is_gene' in pts.columns:
+            pts = pts[pts['is_gene'] == True]                      # noqa: E712
+        X, Y, Z = labels.shape
+        vx = np.rint((pts['x'].to_numpy(dtype=np.float64) - ox) / sd_um).astype(np.int64)
+        vy = np.rint((pts['y'].to_numpy(dtype=np.float64) - oy) / sd_um).astype(np.int64)
+        vz = np.clip(np.rint((pts['z'].to_numpy(dtype=np.float64) - oz) / sd_um).astype(np.int64) - z0,
+                     0, Z - 1)
+        ok = (vx >= 0) & (vx < X) & (vy >= 0) & (vy < Y)
+        lab = np.zeros(len(vx), dtype=np.int64)
+        lab[ok] = labels[vx[ok], vy[ok], vz[ok]]
+        n_lab = int(max(labels.max(), lab_of_cell.max() if len(lab_of_cell) else 0)) + 1
+        row_of_lab = np.full(n_lab, -1, dtype=np.int64)
+        row_of_lab[lab_of_cell] = np.arange(len(lab_of_cell))
+        rows = np.where(lab > 0, row_of_lab[np.clip(lab, 0, None)], -1)
+        hit = rows >= 0
+        genes = pts[gene_col].astype(str).to_numpy()[hit]
+        var_names, gcols = np.unique(genes, return_inverse=True)
+        Xm = coo_matrix((np.ones(hit.sum(), dtype=np.float32), (rows[hit], gcols)),
+                        shape=(len(lab_of_cell), len(var_names))).tocsr()
+        return Xm, list(var_names), int(hit.sum())
+
+    def _segment_cells_2d(self, sdata, nuclei, *, z, simplify, min_area_um2, transcripts, bins,
+                          shapes_key, table_key, column, nuclei_frame):
+        """One plane of the cell-type map cut into cells; the 2D path of :meth:`segment_cells`."""
         import geopandas as gpd
         from skimage.segmentation import watershed
         from spatialdata import to_polygons
         from spatialdata.models import Labels2DModel, ShapesModel, TableModel
-        from spatialdata.transformations import Identity
+        from spatialdata.transformations import Affine
 
         if nuclei is None:
             raise ValueError("nuclei= is required (array of µm coords, or a "
@@ -4521,13 +4819,13 @@ class Analysis(object):
         for key, store in ((shapes_key, sdata.shapes), (table_key, sdata.tables)):
             if key in store:
                 del store[key]
-        # These polygons come off the cell-type map grid, which is µm in the 'global'
-        # coordinate system — the same space _nuclei_to_um put the markers in. They
-        # are therefore ALREADY global and take Identity. Inheriting the seeding
-        # element's transformation instead would apply its pixel->µm affine a second
-        # time, shrinking the cells into a corner of the tissue.
+        # The polygons are in the cell-type map's µm frame, the frame _nuclei_to_um read
+        # the markers in. That frame's own transformation places them in 'global': the
+        # nuclei element's (µm -> image pixels on Xenium / MERSCOPE) when the markers were
+        # read intrinsically, the identity when they were read in 'global' (Visium HD).
         sdata.shapes[shapes_key] = ShapesModel.parse(
-            gdf, transformations={"global": Identity()})
+            gdf, transformations={"global": Affine(self._cells_global_affine(sdata),
+                                                   input_axes=("x", "y"), output_axes=("x", "y"))})
         adata = ad.AnnData(X=X, obs=obs,
                            var=pd.DataFrame(index=pd.Index(var_names, name=None)))
         adata.obsm['spatial'] = np.c_[cen.x.to_numpy(), cen.y.to_numpy()].astype(np.float32)
