@@ -89,6 +89,106 @@ static double gauss_kernel(double x, double y, double z) {
     return exp(-0.5 * (x*x + y*y + z*z));
 }
 
+/* ===================================================================
+ * KDE kernels for kde_at_points / accumulate_gene_vector.
+ *
+ * Ids follow ssaft._count.KDE_KERNELS. ``bandwidth`` is the gaussian-equivalent
+ * sigma for every kernel; each kernel's own scale is matched to it on per-axis
+ * variance in ``dim`` dimensions, and ``prune_coefficient`` truncates only the
+ * infinite-support ones (the exponential where it falls to the gaussian's
+ * relative height at prune_coefficient sigma). The same constants live in
+ * ssaft._count.kernel_scale / kernel_reach / kernel_norm.
+ * =================================================================== */
+enum { KDE_GAUSSIAN = 0, KDE_TOPHAT = 1, KDE_EPANECHNIKOV = 2,
+       KDE_EXPONENTIAL = 3, KDE_LINEAR = 4, KDE_COSINE = 5 };
+
+struct KdeKernel {
+    int id;
+    int extra_cell;    /* 1 for the compact kernels: see kde_search_cells */
+    double reach;      /* truncation radius (world units) */
+    double inv_scale;  /* 1 / the kernel's own scale */
+    double two_h2;     /* gaussian only: 2 * sigma^2 */
+    double inv_norm;   /* 1 / integral of the profile */
+};
+
+/* Fills ``k``; returns false (with a Python ValueError set) for a bad id. */
+static bool kde_kernel_setup(int id, double bandwidth, double prune_coefficient, int dim,
+                             KdeKernel &k) {
+    const double d = (double)dim;
+    /* unit-ball volume in 2D / 3D (dim is checked by the callers) */
+    const double ball = (dim == 2) ? M_PI : 4.0 * M_PI / 3.0;
+    /* cosine cos(pi u / 2): per-axis variance on the unit ball, E[u^2] / d */
+    const double cos_var = (dim == 2) ? 0.16011499323400114 : 0.13852109021822434;
+    double s;
+    k.id = id;
+    k.two_h2 = 2.0 * bandwidth * bandwidth;
+    switch (id) {
+    case KDE_GAUSSIAN:
+        s = bandwidth;
+        k.reach = bandwidth * prune_coefficient;
+        k.inv_norm = 1.0 / pow(2.0 * M_PI * bandwidth * bandwidth, 0.5 * d);
+        break;
+    case KDE_TOPHAT:
+        s = bandwidth * sqrt(d + 2.0);
+        k.reach = s;
+        k.inv_norm = 1.0 / (ball * pow(s, d));
+        break;
+    case KDE_EPANECHNIKOV:
+        s = bandwidth * sqrt(d + 4.0);
+        k.reach = s;
+        k.inv_norm = 1.0 / (ball * pow(s, d) * 2.0 / (d + 2.0));
+        break;
+    case KDE_EXPONENTIAL:
+        s = bandwidth / sqrt(d + 1.0);
+        k.reach = s * prune_coefficient * prune_coefficient / 2.0;
+        k.inv_norm = 1.0 / (((dim == 2) ? 2.0 * M_PI : 8.0 * M_PI) * pow(s, d));
+        break;
+    case KDE_LINEAR:
+        s = bandwidth * sqrt((d + 2.0) * (d + 3.0) / (d + 1.0));
+        k.reach = s;
+        k.inv_norm = 1.0 / (ball * pow(s, d) / (d + 1.0));
+        break;
+    case KDE_COSINE:
+        s = bandwidth / sqrt(cos_var);
+        k.reach = s;
+        k.inv_norm = 1.0 / (((dim == 2) ? 4.0 - 8.0 / M_PI
+                                         : 8.0 - 64.0 / (M_PI * M_PI)) * pow(s, d));
+        break;
+    default:
+        PyErr_Format(PyExc_ValueError,
+                     "kernel id %d out of range; 0..5 = gaussian, tophat, epanechnikov, "
+                     "exponential, linear, cosine", id);
+        return false;
+    }
+    k.inv_scale = 1.0 / s;
+    k.extra_cell = (id == KDE_GAUSSIAN || id == KDE_EXPONENTIAL) ? 0 : 1;
+    return true;
+}
+
+/* Neighbour search radius in grid cells. Query and molecule are each binned by
+ * floor(), so a molecule within ``reach`` can sit floor(reach / sd) + 1 cells
+ * away. The gaussian and exponential keep the historical floor(reach / sd): what
+ * that misses is their tail below ~1e-4 of the peak, and the gaussian's results
+ * stay what they have always been. A compact kernel still carries real weight
+ * at its edge (all of it for the tophat), so it gets the extra cell. */
+static inline npy_intp kde_search_cells(const KdeKernel &k, double sampling_distance) {
+    return (npy_intp)floor(k.reach / sampling_distance + 1e-12) + k.extra_cell;
+}
+
+/* Weight of one molecule at squared distance r2 (the caller has already
+ * dropped r2 > reach^2). The gaussian line is the expression this file has
+ * always used, so its results are unchanged bit for bit. */
+static inline double kde_weight(const KdeKernel &k, double r2) {
+    switch (k.id) {
+    case KDE_GAUSSIAN:     return exp(-r2 / k.two_h2) * k.inv_norm;
+    case KDE_TOPHAT:       return k.inv_norm;
+    case KDE_EPANECHNIKOV: return (1.0 - r2 * k.inv_scale * k.inv_scale) * k.inv_norm;
+    case KDE_EXPONENTIAL:  return exp(-sqrt(r2) * k.inv_scale) * k.inv_norm;
+    case KDE_LINEAR:       return (1.0 - sqrt(r2) * k.inv_scale) * k.inv_norm;
+    default:               return cos(0.5 * M_PI * sqrt(r2) * k.inv_scale) * k.inv_norm;
+    }
+}
+
 void kde(std::unordered_map<pos3d, double> &arr, double *xx, double *yy, double *zz, int *shape, int npts, double bandwidth, double prune_coeff, int ncores) {
     int maxdist;
     if (prune_coeff > 0) {
@@ -1122,21 +1222,22 @@ static PyObject *accumulate_gene_vector(PyObject *self, PyObject *args, PyObject
     int ncores = omp_get_max_threads();
     /* global start index of the chunk (in pixels). Default 0 -> same as the full vf */
     int x0_chunk = 0, y0_chunk = 0, z0_chunk = 0;
+    int kernel_id = KDE_GAUSSIAN;
 
     static const char *kwlist[] = {
         "vf_temp", "loc_x", "loc_y", "loc_z",
         "sampling_distance", "bandwidth", "prune_coefficient",
-        "gidx", "dim", "ncores", "x0", "y0", "z0", NULL
+        "gidx", "dim", "ncores", "x0", "y0", "z0", "kernel", NULL
     };
 
-    /* format: 9 required + 4 optional (ncores, x0, y0, z0) */
+    /* format: 9 required + 5 optional (ncores, x0, y0, z0, kernel) */
     if (!PyArg_ParseTupleAndKeywords(
-            args, kwargs, "OOOOdddii|iiii",
+            args, kwargs, "OOOOdddii|iiiii",
             (char**)kwlist,
             &arg_vf, &arg_lx, &arg_ly, &arg_lz,
             &sampling_distance, &bandwidth, &prune_coefficient,
             &gidx, &dim,
-            &ncores, &x0_chunk, &y0_chunk, &z0_chunk))
+            &ncores, &x0_chunk, &y0_chunk, &z0_chunk, &kernel_id))
     {
         return NULL;
     }
@@ -1193,13 +1294,15 @@ static PyObject *accumulate_gene_vector(PyObject *self, PyObject *args, PyObject
     const double *ly = (const double*)PyArray_DATA(arr_ly);
     const double *lz = (const double*)PyArray_DATA(arr_lz);
 
-    const double dimd     = (double)dim;
-    const double norm     = pow(2.0 * M_PI * bandwidth * bandwidth, 0.5 * dimd);
-    const double inv_norm = 1.0 / norm;
-
-    const double Rw = bandwidth * prune_coefficient;
-    const npy_intp Rp = (npy_intp)floor(Rw / sampling_distance + 1e-12);
-    const double two_h2 = 2.0 * bandwidth * bandwidth;
+    KdeKernel kern;
+    if (!kde_kernel_setup(kernel_id, bandwidth, prune_coefficient, dim, kern)) {
+        Py_DECREF(arr_lx); Py_DECREF(arr_ly); Py_DECREF(arr_lz);
+        PyArray_ResolveWritebackIfCopy(arr_vf);
+        Py_DECREF(arr_vf);
+        return NULL;
+    }
+    const double Rw = kern.reach;
+    const npy_intp Rp = kde_search_cells(kern, sampling_distance);
 
     float *base = (float*)PyArray_DATA(arr_vf);
 
@@ -1260,7 +1363,7 @@ static PyObject *accumulate_gene_vector(PyObject *self, PyObject *args, PyObject
                     const double r2   = dxw2 + dyw * dyw;
                     if (r2 > Rw * Rw) continue;
 
-                    const double w  = exp(-r2 / two_h2) * inv_norm;
+                    const double w  = kde_weight(kern, r2);
                     const float  wf = (float)w;
 
                     const npy_intp yi = yg - gy0;  /* local index */
@@ -1301,7 +1404,7 @@ static PyObject *accumulate_gene_vector(PyObject *self, PyObject *args, PyObject
                         const double r2  = dxy2 + bzw * bzw;
                         if (r2 > Rw * Rw) continue;
 
-                        const double w  = exp(-r2 / two_h2) * inv_norm;
+                        const double w  = kde_weight(kern, r2);
                         const float  wf = (float)w;
 
                         const npy_intp zi = zg - gz0;  /* local index */
@@ -1336,7 +1439,7 @@ static PyObject *accumulate_gene_vector(PyObject *self, PyObject *args, PyObject
  *
  * This is the "gather" counterpart of accumulate_gene_vector (scatter).
  * For each query point, it finds all transcripts within the pruning
- * radius and accumulates Gaussian weights, producing a raw KDE vector
+ * radius and accumulates kernel weights, producing a raw KDE vector
  * per query point.  The result is mathematically identical to reading
  * the value from a full grid computed by accumulate_gene_vector, but
  * only for the requested positions (sparse evaluation).
@@ -1356,6 +1459,8 @@ static PyObject *accumulate_gene_vector(PyObject *self, PyObject *args, PyObject
  *       prune_coefficient,  # double
  *       dim,                # int  (2 or 3)
  *       ncores=auto,        # int  (optional)
+ *       kernel=0,           # int  (optional) id in ssaft._count.KDE_KERNELS;
+ *                           #      bandwidth stays the gaussian-equivalent sigma
  *   ) -> ndarray float32 (N, n_genes)
  *
  * The function bins transcripts into a grid (cell size = sampling_distance)
@@ -1370,23 +1475,24 @@ static PyObject *kde_at_points(PyObject *self, PyObject *args, PyObject *kwargs)
     int n_genes, dim;
     double sampling_distance, bandwidth, prune_coefficient;
     int ncores = omp_get_max_threads();
+    int kernel_id = KDE_GAUSSIAN;
 
     static const char *kwlist[] = {
         "query_x", "query_y", "query_z",
         "loc_x", "loc_y", "loc_z",
         "gene_indices", "n_genes",
         "sampling_distance", "bandwidth", "prune_coefficient",
-        "dim", "ncores", NULL
+        "dim", "ncores", "kernel", NULL
     };
 
     if (!PyArg_ParseTupleAndKeywords(
-            args, kwargs, "OOOOOOOidddi|i",
+            args, kwargs, "OOOOOOOidddi|ii",
             (char**)kwlist,
             &arg_qx, &arg_qy, &arg_qz,
             &arg_lx, &arg_ly, &arg_lz,
             &arg_gi, &n_genes,
             &sampling_distance, &bandwidth, &prune_coefficient,
-            &dim, &ncores))
+            &dim, &ncores, &kernel_id))
     {
         return NULL;
     }
@@ -1423,6 +1529,9 @@ static PyObject *kde_at_points(PyObject *self, PyObject *args, PyObject *kwargs)
     }
 
     {
+        KdeKernel kern;
+        if (!kde_kernel_setup(kernel_id, bandwidth, prune_coefficient, dim, kern)) goto fail;
+
         const double *qx = (const double*)PyArray_DATA(arr_qx);
         const double *qy = (const double*)PyArray_DATA(arr_qy);
         const double *qz = (const double*)PyArray_DATA(arr_qz);
@@ -1431,13 +1540,9 @@ static PyObject *kde_at_points(PyObject *self, PyObject *args, PyObject *kwargs)
         const double *lz = (const double*)PyArray_DATA(arr_lz);
         const int    *gi = (const int*)PyArray_DATA(arr_gi);
 
-        const double dimd     = (double)dim;
-        const double norm     = pow(2.0 * M_PI * bandwidth * bandwidth, 0.5 * dimd);
-        const double inv_norm = 1.0 / norm;
-        const double Rw       = bandwidth * prune_coefficient;
+        const double Rw       = kern.reach;
         const double Rw2      = Rw * Rw;
-        const npy_intp Rp     = (npy_intp)floor(Rw / sampling_distance + 1e-12);
-        const double two_h2   = 2.0 * bandwidth * bandwidth;
+        const npy_intp Rp     = kde_search_cells(kern, sampling_distance);
         const double inv_sd   = 1.0 / sampling_distance;
 
         /* --- Allocate output array (N, n_genes), zero-initialized --- */
@@ -1515,7 +1620,7 @@ static PyObject *kde_at_points(PyObject *self, PyObject *args, PyObject *kwargs)
 
                         if (r2 > Rw2) continue;
 
-                        const double w  = exp(-r2 / two_h2) * inv_norm;
+                        const double w  = kde_weight(kern, r2);
                         const int    g  = gi[t];
                         if (g >= 0 && g < n_genes) {
                             row[g] += (float)w;

@@ -630,7 +630,7 @@ class Dataset(object):
         sd_um = float(zg.attrs.get("sampling_distance",
                       (zg["vf_params"][0] if "vf_params" in zg else 1.0)))
         ox, oy = self._celltype_map_origin(sdata)
-        A = self._map_to_global_affine(sdata)
+        cs, A = self._map_frame(sdata)
         if np.allclose(A, np.eye(3)):
             xs = float(getattr(self, "x_scale", 1.0) or 1.0)
             ys = float(getattr(self, "y_scale", 1.0) or 1.0)
@@ -655,18 +655,38 @@ class Dataset(object):
             sdata.labels[labels_key] = Labels3DModel.parse(
                 labels_arr, dims=("z", "y", "x"),
                 chunks=(labels_arr.shape[0], 1024, 1024),
-                transformations={"global": Affine(m4, input_axes=("z", "y", "x"),
+                transformations={cs: Affine(m4, input_axes=("z", "y", "x"),
                                                   output_axes=("z", "y", "x"))})
         else:
             sdata.labels[labels_key] = Labels2DModel.parse(
-                labels_arr, dims=("y", "x"), transformations={"global": tf})
+                labels_arr, dims=("y", "x"), transformations={cs: tf})
         sdata.images[image_key] = Image2DModel.parse(
-            cyx, dims=("c", "y", "x"), transformations={"global": tf})
+            cyx, dims=("c", "y", "x"), transformations={cs: tf})
         print(f"[write_celltype_map] labels['{labels_key}'] {labels_arr.shape}"
               + (" (z, y, x)" if three_d else "")
               + f" + images['{image_key}'] " + (f"layer z={z} " if three_d else "")
               + f"({K} celltypes) @ {sd_um}µm/px, origin=({ox:.1f},{oy:.1f})")
         return sdata
+
+    def _count_frame(self):
+        """The reader frame ``compute_vf`` recorded for spatialdata_io count input, or ``None``."""
+        zg = getattr(self, "zarr_group", None)
+        if zg is None:
+            return None
+        f = zg.attrs.get("count_frame")
+        return dict(f) if f else None
+
+    def _map_frame(self, sdata):
+        """``(coordinate_system, (3, 3) affine)`` carrying the map's µm frame into ``sdata``.
+
+        Count input read straight from ``spatialdata_io`` has no ``'global'`` µm frame, so
+        the map goes back into the reader's own coordinate system (recorded by
+        ``compute_vf``); everything else is written into ``'global'`` as before.
+        """
+        f = self._count_frame()
+        if f is not None:
+            return f["coordinate_system"], np.asarray(f["um_to_cs"], dtype=float)
+        return "global", self._map_to_global_affine(sdata)
 
     @staticmethod
     def _map_to_global_affine(sdata):
@@ -698,6 +718,9 @@ class Dataset(object):
                     o = cm["origin"]; return float(o[0]), float(o[1])
         except Exception:  # noqa: BLE001
             pass
+        f = self._count_frame()
+        if f is not None and "origin" in f:
+            return float(f["origin"][0]), float(f["origin"][1])
         off = getattr(self, "coordinate_offset", None)
         if off is not None and len(off) >= 2:
             return float(off[0]), float(off[1])

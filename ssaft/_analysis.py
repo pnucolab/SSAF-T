@@ -126,14 +126,21 @@ def _watershed3d_tile(slab, seeds_xyz, seeds_ct, seeds_id, x0, x1, y0, y1, pad):
         sct, sid = seeds_ct[sel], seeds_id[sel]
         for c in np.unique(sct):
             m = sct == c
-            mk = np.zeros(sub.shape, np.int32)
-            mk[sx[m], sy[m], sz[m]] = sid[m]
             mask = sub == c
             if not mask.any():
                 continue
-            lab_c = watershed(ndimage.distance_transform_edt(mk == 0), mk, mask=mask)
+            # the celltype's bounding box: every seed of c sits on a c voxel, so the distance to the
+            # nearest seed and the masked flood inside it are the same as on the whole tile (and the
+            # raster order the watershed breaks ties by is preserved); most of a tile, and most of
+            # its z range on a thin section, is not c
+            b = [np.flatnonzero(mask.any(axis=ax)) for ax in ((1, 2), (0, 2), (0, 1))]
+            (a0, a1), (b0, b1), (c0, c1) = ((v[0], v[-1] + 1) for v in b)
+            mk = np.zeros((a1 - a0, b1 - b0, c1 - c0), np.int32)
+            mk[sx[m] - a0, sy[m] - b0, sz[m] - c0] = sid[m]
+            box = (slice(a0, a1), slice(b0, b1), slice(c0, c1))
+            lab_c = watershed(ndimage.distance_transform_edt(mk == 0), mk, mask=mask[box])
             hit = lab_c > 0
-            lab[hit] = lab_c[hit]
+            lab[box][hit] = lab_c[hit]
     cx0, cy0 = x0 - px0, y0 - py0
     return lab[cx0:cx0 + (x1 - x0), cy0:cy0 + (y1 - y0), :], x0, y0
 
@@ -203,6 +210,8 @@ else:
 #: cannot support the cut, while the default quietly stands down.
 _UNSET = object()
 
+
+from ._count import remove_array as _remove_array
 
 class Analysis(object):
     """
@@ -371,8 +380,8 @@ class Analysis(object):
         self.dataset.bandwidth = self.dataset.zarr_group['vf_params'][1]
         self.dataset.shape = self.dataset.vf_norm.shape
         self.dataset.ndim = 2 if self.dataset.vf_norm.shape[-1] == 1 else 3
-        # vf_params[1] is the kernel's OWN scale (H for an Epanechnikov field), so only
-        # the peak formula depends on which kernel wrote it.
+        # vf_params[1] is the kernel's OWN scale (H for a compact kernel's field), so
+        # only the peak formula depends on which kernel wrote it.
         from ._count import kernel_peak
         self.dataset.kde_kernel = str(self.dataset.zarr_group.attrs.get('kde_kernel', 'gaussian'))
         self.dataset.expression_threshold = kernel_peak(
@@ -878,7 +887,7 @@ class Analysis(object):
             ('original_coordinate_bounds', np.array(self.dataset.original_coordinate_bounds)),
         ]:
             if name in self.dataset.zarr_group:
-                del self.dataset.zarr_group[name]
+                _remove_array(self.dataset.zarr_group, name)
             self.dataset.zarr_group[name] = value
 
         return vx, vy, vz
@@ -944,22 +953,23 @@ class Analysis(object):
     def _compute_normalized_vectors(self, query_voxels, meta, genes=None,
                                      bandwidth=2.5, sampling_distance=1.0,
                                      prune_coefficient=4.3, size_after_normalization=10,
-                                     log_transform=True, kernel='epanechnikov',
+                                     log_transform=True, kernel='gaussian',
                                      gpu_device='cuda'):
         """
         Compute L1-normalised (+ optional log1p) KDE vectors at arbitrary voxel positions.
 
-        Uses the C++ ``kde_at_points`` function (grid-cell hash map + OpenMP)
-        which produces results identical to ``accumulate_gene_vector`` at the
-        same coordinates.
+        Uses ``ssaft.utils.kde_at_points`` (grid-cell hash map + OpenMP), which
+        produces results identical to ``accumulate_gene_vector`` at the same
+        coordinates; inside :func:`ssaft._kde_gpu.gpu_kde` (``downsample_vector``'s
+        ``auto_gpu``) that name is the Triton cell-list kernel instead. Both take
+        every kernel in ``ssaft._count.KDE_KERNELS``.
 
-        ``kernel='epanechnikov'`` routes to the Triton cell-list kernel instead --
-        the compiled ``kde_at_points`` has no kernel switch. These vectors ARE the
-        dictionary the mapper later scores against (they are clustered, annotated
-        and summed into ``beta``), so building them with a different kernel from
-        the one ``map_celltypes`` uses would match a gaussian dictionary against an
-        Epanechnikov field. On this panel that moves 2 of every 10 top genes per
-        anchor, so it is a real mismatch, not a rounding difference.
+        These vectors ARE the dictionary the mapper later scores against (they are
+        clustered, annotated and summed into ``beta``), so ``kernel`` must be the
+        one ``map_celltypes`` uses: building them with another would match, say, a
+        gaussian dictionary against an Epanechnikov field. On this panel that moves
+        2 of every 10 top genes per anchor, so it is a real mismatch, not a
+        rounding difference.
 
         Parameters
         ----------
@@ -998,22 +1008,14 @@ class Analysis(object):
               if (is_3d and query_voxels.shape[1] > 2)
               else np.zeros(len(qx), dtype=np.float64))
 
-        _kern = str(kernel).lower()
-        if _kern.startswith('epa'):
-            kde_values = self._kde_at_points_epa(
-                qx, qy, qz, tx, ty, tz, gidx_arr, n_genes,
-                sampling_distance=float(sampling_distance),
-                bandwidth=float(bandwidth), dim=int(dim), gpu_device=gpu_device)
-        elif _kern.startswith('gauss'):
-            kde_values = kde_at_points(
-                qx, qy, qz,
-                tx.astype(np.float64), ty.astype(np.float64), tz.astype(np.float64),
-                gidx_arr, n_genes,
-                float(sampling_distance), float(bandwidth), float(prune_coefficient),
-                int(dim), int(self.ncores),
-            )
-        else:
-            raise ValueError(f"unknown kernel {kernel!r}; use 'gaussian' or 'epanechnikov'")
+        from ._count import kernel_code
+        kde_values = kde_at_points(
+            qx, qy, qz,
+            tx.astype(np.float64), ty.astype(np.float64), tz.astype(np.float64),
+            gidx_arr, n_genes,
+            float(sampling_distance), float(bandwidth), float(prune_coefficient),
+            int(dim), int(self.ncores), kernel=kernel_code(kernel),
+        )
 
         vf_norm = kde_values.sum(axis=1)
         normalized = np.zeros_like(kde_values)
@@ -1025,44 +1027,6 @@ class Analysis(object):
 
         return normalized, vf_norm, genes, coordinate_offset
 
-
-    def _kde_at_points_epa(self, qx, qy, qz, tx, ty, tz, gidx, n_genes, *,
-                           sampling_distance, bandwidth, dim, gpu_device='cuda'):
-        """``kde_at_points`` with the Epanechnikov kernel, on the GPU.
-
-        The compiled kernel is gaussian-only, so this goes through the same Triton
-        cell list ``map_celltypes`` uses — one implementation of the Epanechnikov for
-        both, which is the point of the exercise. ``bandwidth`` is the
-        gaussian-equivalent one; the support radius is derived for this ``dim``.
-        Queries are batched so an arbitrarily long anchor list cannot exhaust VRAM.
-        """
-        import torch
-        from ._count import epanechnikov_support
-        from ._mapping_gpu import _kde_setup_celllist, _kde_run_subchunk
-        if not torch.cuda.is_available():
-            raise RuntimeError(
-                "kernel='epanechnikov' needs CUDA here: the compiled kde_at_points "
-                "is gaussian-only, so there is no CPU implementation to fall back to. "
-                "It is now the DEFAULT -- pass kernel='gaussian' to run on the CPU.")
-        H = epanechnikov_support(bandwidth, dim)
-        dev = torch.device(gpu_device)
-        T = [torch.as_tensor(np.asarray(a, dtype=np.float64), device=dev)
-             for a in (tx, ty, tz)]
-        T.append(torch.as_tensor(np.asarray(gidx, dtype=np.int64), device=dev))
-        qx = np.asarray(qx, np.float64); qy = np.asarray(qy, np.float64)
-        qz = np.asarray(qz, np.float64)
-        state = _kde_setup_celllist(
-            *T, qx.min(), qy.min(), qz.min(), qx.max(), qy.max(), qz.max(),
-            float(sampling_distance), H, 1.0, int(dim), kernel='epanechnikov')
-        out = np.zeros((qx.size, n_genes), dtype=np.float32)
-        if state is None:
-            return out
-        batch = max(4096, int(4e8) // max(n_genes * 4, 1))
-        for a in range(0, qx.size, batch):
-            b = min(qx.size, a + batch)
-            out[a:b] = _kde_run_subchunk(state, qx[a:b], qy[a:b], qz[a:b],
-                                         n_genes, dev).cpu().numpy()
-        return out
 
     def _he_array_from_sdata(self, sdata, image_key='he'):
         """Extract an (H, W, 3) uint8 RGB ndarray from ``sdata.images[image_key]``.
@@ -1146,7 +1110,7 @@ class Analysis(object):
     def _he_array_axis_aligned(self, sdata, image_key='he',
                                element_name=None, sampling_distance=1.0,
                                target_um_per_px=None, pad=True,
-                               revert_image=True, arr=None):
+                               revert_image=True, arr=None, gray_u8=False):
         """Return an H&E ndarray axis-aligned in the global coordinate
         system **and cropped/padded so its pixel grid spans exactly the
         transcripts global bounding box**.
@@ -1194,7 +1158,10 @@ class Analysis(object):
             arr = self._he_array_from_sdata(sdata, image_key=image_key)
         else:
             want = self._sdata_image_hw(sdata, image_key)
-            arr = self._image_to_rgb_uint8(arr)
+            if not gray_u8:
+                arr = self._image_to_rgb_uint8(arr)
+            elif arr.ndim != 3 or arr.shape[-1] != 1 or arr.dtype != np.uint8:
+                raise ValueError(f"gray_u8=True expects an (H, W, 1) uint8 plane, got {arr.shape} {arr.dtype}")
             if tuple(arr.shape[:2]) != tuple(want):
                 raise ValueError(
                     f"image plane is {tuple(arr.shape[:2])} px but images[{image_key!r}] is "
@@ -1224,8 +1191,16 @@ class Analysis(object):
         tx_min = tx_max = ty_min = ty_max = None
         if points_key is not None:
             try:
-                ext = _get_extent(sdata.points[points_key],
-                                  coordinate_system='global')
+                # the extent is a full pass over the points; a 3D run asks for it twice per
+                # plane of every tile, so it is computed once per points element
+                # keyed on the SpatialData object itself (weakly: a tile's entry goes with it);
+                # sdata.points[key] hands back a new object on every access
+                import weakref
+                cache = self.__dict__.setdefault('_points_extent_cache', weakref.WeakKeyDictionary())
+                per = cache.setdefault(sdata, {})
+                if points_key not in per:
+                    per[points_key] = self._points_global_extent(sdata, points_key)
+                ext = per[points_key]
                 tx_min, tx_max = ext['x']
                 ty_min, ty_max = ext['y']
             except Exception:
@@ -1355,6 +1330,63 @@ class Analysis(object):
         return arr[:, :, :3]
 
     @staticmethod
+    def _points_global_extent(sdata, points_key):
+        """``{'x': (min, max), 'y': (min, max)}`` of a points element in ``'global'``.
+
+        spatialdata's ``get_extent`` transforms every point, which fails on a whole-section
+        element whose dask partitions repeat index labels ("cannot reindex on an axis with
+        duplicate labels") and is a full pass anyway. When the transformation is axis-aligned
+        (scale / translation / 90-degree rotation) the extent is the transformed bounding box
+        of the intrinsic min/max -- the same numbers from two column reductions.
+        """
+        from spatialdata import get_extent as _get_extent
+        from spatialdata.transformations import get_transformation as _get_tf
+        el = sdata.points[points_key]
+        M = np.asarray(_get_tf(el, to_coordinate_system='global').to_affine_matrix(
+            input_axes=('x', 'y'), output_axes=('x', 'y')), dtype=np.float64)
+        A = M[:2, :2]
+        if not (np.allclose(A[0, 1], 0) and np.allclose(A[1, 0], 0)) and \
+                not (np.allclose(A[0, 0], 0) and np.allclose(A[1, 1], 0)):
+            return _get_extent(el, coordinate_system='global')
+        import dask
+        lo_x, hi_x, lo_y, hi_y = dask.compute(el['x'].min(), el['x'].max(), el['y'].min(), el['y'].max())
+        c = np.array([[lo_x, lo_y], [hi_x, lo_y], [lo_x, hi_y], [hi_x, hi_y]], dtype=np.float64)
+        g = c @ A.T + M[:2, 2]
+        return {'x': (float(g[:, 0].min()), float(g[:, 0].max())),
+                'y': (float(g[:, 1].min()), float(g[:, 1].max()))}
+
+    @staticmethod
+    def _image_to_u8_plane(arr):
+        """A single-channel plane -> ``(H, W)`` uint8 exactly as :meth:`_image_to_rgb_uint8` makes
+        each of its three identical channels; ``None`` when the plane has several channels."""
+        arr = np.asarray(arr)
+        if arr.ndim == 3 and arr.shape[0] == 1:
+            arr = arr[0]
+        elif arr.ndim == 3 and arr.shape[-1] == 1:
+            arr = arr[..., 0]
+        if arr.ndim != 2:
+            return None
+        if arr.dtype != np.uint8:
+            if np.issubdtype(arr.dtype, np.floating) and arr.max() <= 1.0:
+                arr = arr.astype(np.float32) * 255.0
+            else:
+                hi = float(np.percentile(arr[::8, ::8], 99.9))
+                if hi <= 0.0:
+                    hi = float(arr.max())
+                arr = arr.astype(np.float32) * ((255.0 / hi) if hi > 255.0 else 1.0)
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+        return arr
+
+    def _plane_luts(self, revert_image, intensity):
+        """Per-value tables for a uint8 plane replicated to RGB: the float intensity the full path
+        computes (inverted as the mask test inverts it) and the uint8 image Otsu sees."""
+        v = np.arange(256, dtype=np.uint8)
+        rgb = np.stack([v, v, v], axis=-1).reshape(1, 256, 3)
+        gray = self._rgb_to_intensity(rgb, intensity=intensity)[0]          # same float64 ops
+        inv = (255.0 - gray) if revert_image else gray
+        return inv, inv.astype(np.uint8)
+
+    @staticmethod
     def _sdata_image_hw(sdata, image_key):
         """``(H, W)`` of ``sdata.images[image_key]`` at full resolution, without loading it."""
         if image_key not in sdata.images:
@@ -1365,7 +1397,10 @@ class Analysis(object):
     @staticmethod
     def _element_hw(node):
         """``(H, W)`` of one image element (2D or 3D, single- or multiscale) at full resolution."""
-        if not hasattr(node, 'values') or hasattr(node, 'children'):
+        # isinstance, not hasattr(node, 'values'): hasattr evaluates the property, and a
+        # DataArray's .values loads the whole image just to read its shape
+        from xarray import DataArray as _DataArray
+        if not isinstance(node, _DataArray):
             leaf = node[list(node.keys())[0]]
             var = leaf['image'] if hasattr(leaf, 'image') else leaf[list(leaf.data_vars)[0]]
         else:
@@ -1579,8 +1614,12 @@ class Analysis(object):
         tfs = {cs: (Sequence([z_tf, t]) if t is not None else z_tf) for cs, t in xy.items()}
         sf = scale_factors if scale_factors is not None else [2, 2, 2]
         sf = [f if isinstance(f, dict) else {'x': int(f), 'y': int(f), 'z': 1} for f in sf]
-        return Image3DModel.parse(arr[None], dims=('c', 'z', 'y', 'x'), scale_factors=sf,
-                                  chunks=(1, 1, chunk, chunk), transformations=tfs)
+        el = Image3DModel.parse(arr[None], dims=('c', 'z', 'y', 'x'), scale_factors=sf,
+                                chunks=(1, 1, chunk, chunk), transformations=tfs)
+        # where each plane lives, so a whole plane can be decoded straight from the file (in
+        # parallel) instead of through the rechunked multiscale graph -- ~10x faster on JPEG2000
+        el.attrs['ssaft_plane_sources'] = [pl['source'] for pl in planes]
+        return el
 
     @staticmethod
     def _sdata_image_planes(sdata, images):
@@ -1591,12 +1630,27 @@ class Analysis(object):
         built that way (see :meth:`zstack_image`). ``read()`` returns the full-resolution
         plane as ``(c, y, x)``.
 
-        :returns: list of ``{'index', 'z', 'read', 'source'}`` in plane order.
+        ``images`` may be a **list of keys**, one per stain: the planes of every element
+        are pooled into one list with a unique ``index`` (so each stain plane is
+        thresholded and sampled on its own — the anchors of all stains are then pooled),
+        and each entry carries its own ``image_key``. All the elements must share the
+        pixel grid (built with the same ``like=``); their z axes need not coincide.
+
+        :returns: list of ``{'index', 'z', 'read', 'source', 'image_key'}`` in plane order.
         """
         from spatialdata.transformations import get_transformation as _get_tf
+        if isinstance(images, (list, tuple)):
+            pooled = []
+            for key in images:
+                for pl in Analysis._sdata_image_planes(sdata, key):
+                    pl = dict(pl); pl['image_key'] = key
+                    pooled.append(pl)
+            for i, pl in enumerate(pooled):
+                pl['index'] = i          # unique across stains (plane_otsu key)
+            return pooled
         if not isinstance(images, str):
-            raise TypeError(f'images= is the key of a 3D image element in sdata.images, got '
-                            f'{type(images).__name__} {images!r}')
+            raise TypeError(f'images= is the key of a 3D image element in sdata.images '
+                            f'(or a list of keys), got {type(images).__name__} {images!r}')
         if images not in sdata.images:
             raise KeyError(f"sdata.images has no {images!r} (available: {list(sdata.images.keys())}). "
                            f"For z=3 add the z-stack as a 3D image element first, e.g. "
@@ -1618,9 +1672,23 @@ class Analysis(object):
         zc = (np.asarray(leaf.coords['z'].values, dtype=np.float64) if 'z' in leaf.coords
               else np.arange(leaf.sizes['z']) + 0.5)
         zs = M[2, 2] * zc + M[2, 3]
-        return [dict(index=k, z=float(zs[k]),
-                     read=(lambda k=k: np.asarray(leaf.isel(z=k).data)),
-                     source=f'images[{images!r}][z={k}]')
+        srcs = (getattr(node, 'attrs', None) or {}).get('ssaft_plane_sources')
+        if srcs is not None and len(srcs) == leaf.sizes['z']:
+            def _read(k):
+                import tifffile
+                path, _, zk = str(srcs[k]).partition('[Z=')
+                with tifffile.TiffFile(path) as tf:
+                    if zk:
+                        plane = tf.series[0].pages[int(zk.rstrip(']'))].asarray(maxworkers=16)
+                    else:
+                        plane = tf.series[0].asarray(maxworkers=16)
+                plane = np.asarray(plane)
+                return plane[None] if plane.ndim == 2 else plane
+        else:
+            def _read(k):
+                return np.asarray(leaf.isel(z=k).data)
+        return [dict(index=k, z=float(zs[k]), read=(lambda k=k: _read(k)),
+                     source=f'images[{images!r}][z={k}]', image_key=images)
                 for k in range(leaf.sizes['z'])]
 
     @staticmethod
@@ -1726,7 +1794,7 @@ class Analysis(object):
                         log_transform=True, n_samples=5, block_um=10,
                         seed=42, filter_is_gene=True, genes=None,
                         revert_image=True, intensity='luminance',
-                        kernel='epanechnikov', gpu_device='cuda',
+                        kernel='gaussian', gpu_device='cuda',
 ):
         """
         Mask → position selection → KDE → normalization for a single image/sdata.
@@ -1781,11 +1849,8 @@ class Analysis(object):
         # the anchor cut is "two molecules' worth of evidence", so it has to be this
         # kernel's own peak -- the gaussian formula would cut an Epanechnikov field
         # at the wrong density (a factor ~2 at the default bandwidth)
-        from ._count import epanechnikov_support, kernel_peak
-        _kern = str(kernel).lower()
-        _bw_kde = (epanechnikov_support(bandwidth, ndim)
-                   if _kern.startswith('epa') else float(bandwidth))
-        expression_threshold = kernel_peak(_bw_kde, ndim, _kern)
+        from ._count import kernel_scale, kernel_peak
+        expression_threshold = kernel_peak(kernel_scale(bandwidth, ndim, kernel), ndim, kernel)
         norm_threshold = expression_threshold * 2
 
         x_scale = y_scale = None
@@ -1905,7 +1970,7 @@ class Analysis(object):
                            prune_coefficient=4.3, size_after_normalization=10,
                            log_transform=True, n_samples=5, block_um=10, seed=42,
                            filter_is_gene=True, genes=None, revert_image=True,
-                           intensity='luminance', kernel='epanechnikov',
+                           intensity='luminance', kernel='gaussian',
                            gpu_device='cuda'):
         """3D counterpart of :meth:`_select_vectors`: one tissue mask per imaging plane.
 
@@ -1925,7 +1990,7 @@ class Analysis(object):
         ``sample_stats['per_plane']`` holds each plane's threshold, mask and counts.
         """
         from scipy.ndimage import zoom
-        from ._count import epanechnikov_support, kernel_peak
+        from ._count import kernel_scale, kernel_peak
 
         if getattr(self.dataset, 'shape', None) is None:
             self._prepare_grid(sdata, element_name=element_name, bandwidth=bandwidth,
@@ -1936,10 +2001,7 @@ class Analysis(object):
         vx, vy, vz = self.dataset.shape
         meta = self._parse_transcripts(sdata, sampling_distance=sampling_distance,
                                        filter_is_gene=filter_is_gene, n_dims=3)
-        _kern = str(kernel).lower()
-        _bw = (epanechnikov_support(bandwidth, 3) if _kern.startswith('epa')
-               else float(bandwidth))
-        norm_threshold = kernel_peak(_bw, 3, _kern) * 2
+        norm_threshold = kernel_peak(kernel_scale(bandwidth, 3, kernel), 3, kernel) * 2
 
         x_scale, y_scale = self._points_px_per_um(sdata)
         block_px = (block_um * x_scale) * (block_um * y_scale)
@@ -1975,28 +2037,60 @@ class Analysis(object):
                           f"outside the transcripts' z range", flush=True)
                 continue
             raw = pl['read']()
-            img = self._he_array_axis_aligned(
-                sdata, image_key=image_key, element_name=element_name,
-                sampling_distance=sampling_distance, revert_image=revert_image, arr=raw)
-            if plane_otsu is not None and int(pl['index']) in plane_otsu:
-                # one threshold per plane decided across all tiles (chunked=True)
-                thr = float(plane_otsu[int(pl['index'])])
-            elif otsu_threshold is None:
-                oimg = self._he_array_axis_aligned(
-                    sdata, image_key=image_key, element_name=element_name,
-                    sampling_distance=sampling_distance, pad=False,
-                    revert_image=revert_image, arr=raw)
-                thr, _ = self._otsu_thresholding([oimg], revert_image=revert_image,
-                                                 intensity=intensity, mult=otsu_mult)
-                del oimg
+            pl_key = pl.get('image_key', image_key)   # this stain's element (shared grid)
+            u8 = self._image_to_u8_plane(raw)
+            if u8 is not None:
+                # Single-channel plane (a DAPI stack): the RGB replication, the float intensity,
+                # Otsu's uint8 image and the mask test all depend on the pixel value alone, so
+                # they are tabulated over the 256 values and looked up -- the same numbers as
+                # the full-array path, without float64 copies of a multi-gigapixel plane.
+                del raw
+                inv_lut, inv_u8_lut = self._plane_luts(revert_image, intensity)
+                img = self._he_array_axis_aligned(
+                    sdata, image_key=pl_key, element_name=element_name,
+                    sampling_distance=sampling_distance, revert_image=revert_image,
+                    arr=u8[..., None], gray_u8=True)
+                if plane_otsu is not None and int(pl['index']) in plane_otsu:
+                    thr = float(plane_otsu[int(pl['index'])])
+                elif otsu_threshold is None:
+                    import cv2
+                    oimg = self._he_array_axis_aligned(
+                        sdata, image_key=pl_key, element_name=element_name,
+                        sampling_distance=sampling_distance, pad=False,
+                        revert_image=revert_image, arr=u8[..., None], gray_u8=True)
+                    val, _ = cv2.threshold(inv_u8_lut[oimg[..., 0]], 0, 255,
+                                           cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                    thr = float(val) * (float(otsu_mult) if otsu_mult is not None else 1.0)
+                    del oimg
+                else:
+                    thr = float(otsu_threshold)
+                del u8
+                mask_lut = (np.log1p(np.clip(inv_lut - thr, 0.0, None)) > 0).astype(np.uint8)
+                mask = mask_lut[img[..., 0]]
+                del img
             else:
-                thr = float(otsu_threshold)
-            del raw
-            gray = self._rgb_to_intensity(img, intensity=intensity)
-            del img
-            inv = (255.0 - gray) if revert_image else gray
-            mask = (np.log1p(np.clip(inv - thr, 0.0, None)) > 0).astype(np.uint8)
-            del gray, inv
+                img = self._he_array_axis_aligned(
+                    sdata, image_key=pl_key, element_name=element_name,
+                    sampling_distance=sampling_distance, revert_image=revert_image, arr=raw)
+                if plane_otsu is not None and int(pl['index']) in plane_otsu:
+                    # one threshold per plane decided across all tiles (chunked=True)
+                    thr = float(plane_otsu[int(pl['index'])])
+                elif otsu_threshold is None:
+                    oimg = self._he_array_axis_aligned(
+                        sdata, image_key=pl_key, element_name=element_name,
+                        sampling_distance=sampling_distance, pad=False,
+                        revert_image=revert_image, arr=raw)
+                    thr, _ = self._otsu_thresholding([oimg], revert_image=revert_image,
+                                                     intensity=intensity, mult=otsu_mult)
+                    del oimg
+                else:
+                    thr = float(otsu_threshold)
+                del raw
+                gray = self._rgb_to_intensity(img, intensity=intensity)
+                del img
+                inv = (255.0 - gray) if revert_image else gray
+                mask = (np.log1p(np.clip(inv - thr, 0.0, None)) > 0).astype(np.uint8)
+                del gray, inv
             n_mask = int(mask.sum())
             grid = zoom(mask, (vy / mask.shape[0], vx / mask.shape[1]), order=0) > 0
             del mask
@@ -2048,13 +2142,22 @@ class Analysis(object):
             empty = np.empty(0, dtype=np.int64)
             return (empty, empty, empty, np.empty((0, 0), dtype=np.float32),
                     np.empty(0, dtype=np.float64), genes or [], coordinate_offset, sample_stats)
-        return (np.concatenate(out_x), np.concatenate(out_y), np.concatenate(out_z),
-                np.concatenate(out_v, axis=0), np.concatenate(out_n), genes,
-                coordinate_offset, sample_stats)
+        cx = np.concatenate(out_x); cy = np.concatenate(out_y); cz = np.concatenate(out_z)
+        cv = np.concatenate(out_v, axis=0); cn = np.concatenate(out_n)
+        # With several stains each plane is sampled on its own, so two stains can land an
+        # anchor on the same voxel; the 3D KDE vector there is identical, so keep one per
+        # (x, y, z). No-op for a single stain (coords are already unique per plane).
+        _, uniq = np.unique(np.stack([cx, cy, cz], 1), axis=0, return_index=True)
+        if len(uniq) < len(cx):
+            uniq.sort()
+            sample_stats['pooled_before_dedup'] = int(len(cx))
+            sample_stats['kept_count'] = int(len(uniq))
+            cx, cy, cz, cv, cn = cx[uniq], cy[uniq], cz[uniq], cv[uniq], cn[uniq]
+        return (cx, cy, cz, cv, cn, genes, coordinate_offset, sample_stats)
 
     def compute_vf(self, grid, *, bin_um=2.0, sampling_distance=None, panel=None,
                    sigma_bin=None, bandwidth_um=None, prune_coefficient=4.3,
-                   kernel='epanechnikov',
+                   kernel='gaussian',
                    size_after_normalization=10.0, device='cuda', chunk_h=64,
                    chunk_w=512, store_chunk=32, mode='auto',
                    log_transform=True):
@@ -2092,23 +2195,25 @@ class Analysis(object):
             prune_coefficient * sigma_bin)`` bins (= ``prune_coefficient *
             bandwidth`` µm). Default 4.3 (radius ≈ cell diameter);
             lower (e.g. 3.0 ≈ 99.7% mass) truncates tighter and runs faster.
-            Gaussian only — the Epanechnikov's radius is its own support.
-        kernel : {'epanechnikov', 'gaussian'}, default 'epanechnikov'
-            KDE kernel. The bandwidth knob (``sigma_bin`` / ``bandwidth_um``) means
-            the same thing for both: the Epanechnikov's support is derived from it by
-            variance matching (``H = sigma * sqrt(ndim + 4)``), so the two give
-            near-identical fields, but the Epanechnikov reaches zero at ``H``
-            instead of being truncated at ``4.3 sigma`` and so touches far fewer
-            voxels. Applies to the count raster and to the transcript
-            shortcut alike; both run on the GPU.
+            Applies to the gaussian and (at the same relative height) the
+            exponential; the compact kernels stop at their own support.
+        kernel : {'gaussian', 'tophat', 'epanechnikov', 'exponential', 'linear', 'cosine'}, default 'gaussian'
+            KDE kernel (``ssaft._count.KDE_KERNELS``). The bandwidth knob
+            (``sigma_bin`` / ``bandwidth_um``) means the same thing for all of them:
+            each kernel's own scale is derived from it by variance matching
+            (:func:`ssaft._count.kernel_scale`, e.g. the Epanechnikov support
+            ``H = sigma * sqrt(ndim + 4)``), so they smooth over the same width. The
+            compact kernels (tophat, Epanechnikov, linear, cosine) reach zero at
+            their support instead of being truncated at ``4.3 sigma`` and so touch
+            far fewer voxels. Applies to the count raster and to the transcript
+            shortcut alike.
 
-            On the COUNT raster the default is not always the fast choice: the
+            On the COUNT raster a compact kernel is not always the fast choice: the
             gaussian is separable there, so its cost grows linearly with the radius
-            while the radial Epanechnikov's grows quadratically. Measured end to end,
-            the Epanechnikov wins below ``sigma_bin`` about 6 (~0.8x at 1-4) and loses
-            above it (2.3x at 16). Visium HD (``sigma_bin`` 1.25) is on the winning
-            side; a wide Stereo-seq blur is not — pass ``kernel='gaussian'`` there.
-            The transcript path has no such caveat: it is 3x faster either way.
+            while a radial kernel's grows quadratically. Measured end to end, the
+            Epanechnikov wins below ``sigma_bin`` about 6 (~0.8x at 1-4) and loses
+            above it (2.3x at 16). On the transcript path the compact kernels are
+            2-3x faster at any width.
         panel : list[str], optional
             Gene panel to restrict to before rasterization.
         chunk_h, chunk_w : int
@@ -2186,6 +2291,16 @@ class Analysis(object):
                         prune_coefficient=prune_coefficient, kernel=kernel,
                         size_after_normalization=size_after_normalization,
                         device=device)
+        # A grid read from spatialdata_io output lives in that reader's pixel frame, not in
+        # 'global' µm: record the frame so the map and the cells written later, in any
+        # process, go back into it (Dataset._map_frame).
+        zg = self.dataset.zarr_group
+        frame = (grid.meta or {}).get('frame') if isinstance(grid, GridDataset) else None
+        if frame is not None:
+            zg.attrs['count_frame'] = dict(frame, origin=[float(grid.origin[0]),
+                                                          float(grid.origin[1])])
+        elif 'count_frame' in zg.attrs:
+            del zg.attrs['count_frame']
         return bin_adata
 
     def downsample_vector(self, sdata=None, *, z, grid=None, images=None, auto_gpu=True,
@@ -2219,13 +2334,13 @@ class Analysis(object):
         C++/OpenMP CPU implementation is used. The user therefore does
         not need to wrap the call in ``with gpu_kde(...): ...``.
 
-        ``kernel='epanechnikov'`` (transcript mode) builds the anchors with that
-        kernel instead. It MUST match the ``kernel`` later given to
+        ``kernel`` (transcript mode; default ``'gaussian'``, any of
+        ``ssaft._count.KDE_KERNELS``) builds the anchors with that kernel, on the GPU
+        and the CPU alike. It MUST match the ``kernel`` later given to
         :meth:`map_celltypes`: these vectors are clustered, annotated and summed
-        into the mapper's dictionary, so mixing the two scores an Epanechnikov
-        field against a gaussian dictionary. GPU-only — the compiled point-KDE has
-        no kernel switch. The count mode ignores it: that field's kernel was fixed
-        by :meth:`compute_vf`.
+        into the mapper's dictionary, so mixing two kernels scores one kernel's
+        field against another's dictionary. The count mode ignores it: that field's
+        kernel was fixed by :meth:`compute_vf`.
 
         All other arguments are forwarded verbatim to
         :meth:`_downsample_vector_impl` (see its docstring).
@@ -2297,10 +2412,12 @@ class Analysis(object):
                 "A 2D image carries no depth, so it cannot say where along z the tissue is. Add "
                 "the z-stack first, e.g. sdata.images['morphology_zstack'] = "
                 "Analysis.zstack_image('.../morphology.ome.tif', like=sdata.images['morphology_focus'])")
-        if images is not None and not isinstance(images, str):
-            raise TypeError(f'images= is the key of an element in sdata.images, not '
-                            f'{type(images).__name__} {images!r}; add a z-stack file with '
-                            f'Analysis.zstack_image first')
+        if images is not None and not (isinstance(images, str) or
+                (isinstance(images, (list, tuple)) and images and
+                 all(isinstance(x, str) for x in images))):
+            raise TypeError(f'images= is the key of an element in sdata.images (or a list of '
+                            f'keys, one per stain), not {type(images).__name__} {images!r}; '
+                            f'add a z-stack file with Analysis.zstack_image first')
         if z == 2 and images is not None:
             raise ValueError('images= is only used with z=3; with z=2 the tissue mask comes '
                              'from sdata.images[image_key]')
@@ -2357,7 +2474,7 @@ class Analysis(object):
 
     def _downsample_vector_impl(self, sdata=None, element_name=None,
                          bandwidth=2.5, sampling_distance=1.0, prune_coefficient=4.3,
-                         kernel='epanechnikov', gpu_device='cuda',
+                         kernel='gaussian', gpu_device='cuda',
                          size_after_normalization=10, log_transform=True,
                          n_samples=5, block_um=10, seed=42,
                          filter_is_gene=True, genes=None,
@@ -2759,7 +2876,7 @@ class Analysis(object):
         for key in ('downsampled_vectors', 'normalized_vectors',
                     'downsampled_vf_norm', 'genes'):
             if key in self.dataset.zarr_group:
-                del self.dataset.zarr_group[key]
+                _remove_array(self.dataset.zarr_group, key)
 
         self.dataset.zarr_group['downsampled_vectors'] = np.stack([gx_he, gy_he, gz_he], axis=0)
         self.dataset.zarr_group['normalized_vectors'] = normalized_vectors
@@ -2778,7 +2895,7 @@ class Analysis(object):
             if value is None:
                 continue
             if key in self.dataset.zarr_group:
-                del self.dataset.zarr_group[key]
+                _remove_array(self.dataset.zarr_group, key)
             self.dataset.zarr_group[key] = np.array(value)
 
         return sample_stats
@@ -3034,7 +3151,7 @@ class Analysis(object):
                       method='lda', exclude_gene_indices=None, marker_genes_path=None,
                       show_unknown=None,
                       bandwidth=2.5, sampling_distance=1.0, prune_coefficient=4.3,
-                      kernel='epanechnikov',
+                      kernel='gaussian',
                       size_after_normalization=10, log_transform=True, overwrite=True,
                       gpu_device='cuda', force_cpu=False,
                       query_subchunk_size=None, gpu_target_bytes=int(1e9),
@@ -3183,18 +3300,23 @@ class Analysis(object):
         :type bandwidth: float
         :param sampling_distance: Vector-field grid spacing in µm.
         :type sampling_distance: float
-        :param prune_coefficient: Kernel truncation radius in bandwidth units.
-            Gaussian only -- the Epanechnikov's radius is its own support.
+        :param prune_coefficient: Kernel truncation radius in bandwidth units. The
+            gaussian's, and the exponential's at the same relative height; the
+            compact kernels stop at their own support.
         :type prune_coefficient: float
-        :param kernel: KDE kernel, ``'epanechnikov'`` (default) or ``'gaussian'``.
-            ``bandwidth`` keeps the SAME meaning for both: for the Epanechnikov the
-            support radius is derived from it by variance matching,
-            ``H = bandwidth * sqrt(ndim + 4)`` (6.61 µm at the default 2.5 in 3D), so
-            the two kernels have the same width and produce near-identical fields
-            (r = 0.99 on Xenium kidney). The Epanechnikov reaches zero at ``H``
-            instead of being truncated at ``4.3 * bandwidth`` = 10.75 µm, so it
-            touches ~3.4x fewer voxels per transcript and runs ~3x faster.
-            Transcript (KDE) regime only; ignored by the count regime.
+        :param kernel: KDE kernel, one of ``ssaft._count.KDE_KERNELS``:
+            ``'gaussian'`` (default), ``'tophat'``, ``'epanechnikov'``,
+            ``'exponential'``, ``'linear'`` or ``'cosine'``. ``bandwidth`` keeps the
+            SAME meaning for all of them: each kernel's own scale is derived from it
+            by variance matching (:func:`ssaft._count.kernel_scale`; e.g. the
+            Epanechnikov support ``H = bandwidth * sqrt(ndim + 4)``, 6.61 µm at the
+            default 2.5 in 3D), so they have the same width. The compact kernels
+            reach zero at their support instead of being truncated at
+            ``4.3 * bandwidth`` = 10.75 µm, so they touch ~3x fewer voxels per
+            transcript and run 2-3x faster; the smooth ones (Epanechnikov, linear,
+            cosine) give near-identical fields to the gaussian (per-voxel cosine
+            >= 0.99 on Xenium kidney and Visium HD). Transcript (KDE) regime only;
+            ignored by the count regime.
         :type kernel: str
         :param size_after_normalization: Target L1 scale of each voxel vector.
         :type size_after_normalization: float
@@ -3344,7 +3466,7 @@ class Analysis(object):
     def _map_celltypes_cpu(self, sdata, centroids=None, element_name=None,
                          exclude_gene_indices=None, marker_genes_path=None,
                          bandwidth=2.5, sampling_distance=1.0, prune_coefficient=4.3,
-                         kernel='epanechnikov',
+                         kernel='gaussian',
                          size_after_normalization=10, log_transform=True, overwrite=True,
                          save_vf=False, method='corr', gpu_device='cuda', force_cpu=False,
                          h5ad=None, column='cellman_annotation', map_kwargs=None):
@@ -3356,9 +3478,8 @@ class Analysis(object):
         dimensions.  KDE is computed chunk-by-chunk directly from
         ``self.locations`` (already stored by ``_prepare_grid``).
 
-        ``kernel='epanechnikov'`` is GPU-only: this path's KDE is the compiled
-        ``ssaft.utils.accumulate_gene_vector``, which has no kernel switch. It is
-        rejected here instead of silently producing a gaussian field.
+        The KDE is the compiled ``ssaft.utils.accumulate_gene_vector``, which takes
+        every kernel in ``ssaft._count.KDE_KERNELS``.
 
         Parameters
         ----------
@@ -3371,13 +3492,9 @@ class Analysis(object):
         -------
         celltype_maps, max_correlations : zarr arrays
         """
-        if not str(kernel).lower().startswith('gauss'):
-            raise ValueError(
-                f"kernel={kernel!r} is not available on the CPU transcript path "
-                "(the compiled KDE is gaussian-only). 'epanechnikov' is now the "
-                "DEFAULT, so this fires without you asking for it: run with a CUDA "
-                "device, or pass kernel='gaussian' explicitly.")
         from tqdm.auto import tqdm
+        from ._count import resolve_kernel, kernel_code
+        kernel = resolve_kernel(kernel)
 
         self.dataset.cluster_labels          = self.dataset.zarr_group['cluster_labels'][:]
         self.dataset.downsampled_vectors              = self.dataset.zarr_group['downsampled_vectors'][:]
@@ -3415,11 +3532,13 @@ class Analysis(object):
                       int(self.dataset.shape[1]),
                       int(self.dataset.shape[2]))
 
-        self.dataset.bandwidth = bandwidth
+        # the kernel's own scale, as the GPU path records it (norm_threshold, V_eff)
+        from ._count import resolve_kernel, kernel_scale, kernel_peak
         self.dataset.ndim = 2 if vz == 1 else 3
-        self.dataset.expression_threshold = (
-            1 / (np.sqrt(2 * np.pi) * bandwidth) ** self.dataset.ndim
-        )
+        self.dataset.bandwidth = kernel_scale(bandwidth, self.dataset.ndim, kernel)
+        self.dataset.kde_kernel = resolve_kernel(kernel)
+        self.dataset.expression_threshold = kernel_peak(
+            self.dataset.bandwidth, self.dataset.ndim, kernel)
         self.dataset.norm_threshold = self.dataset.expression_threshold * 2
 
         grouped = self.locations.groupby('gene', sort=True)
@@ -3534,7 +3653,7 @@ class Analysis(object):
 
         def _safe_remove(name):
             if name in self.dataset.zarr_group:
-                del self.dataset.zarr_group[name]
+                _remove_array(self.dataset.zarr_group, name)
 
         if overwrite:
             for name in ['vf_norm', 'celltype_maps', score_key,
@@ -3628,7 +3747,7 @@ class Analysis(object):
                     bandwidth=float(bandwidth),
                     prune_coefficient=float(prune_coefficient),
                     gidx=gidx, dim=int(dim), ncores=int(self.ncores),
-                    x0=int(x0), y0=0, z0=0,
+                    x0=int(x0), y0=0, z0=0, kernel=kernel_code(kernel),
                 )
                 if gene_bar is not None:
                     gene_bar.update(1)
@@ -4083,7 +4202,7 @@ class Analysis(object):
             filtered_ctmaps[~output_mask.astype(bool)] = -1
         self.dataset.filtered_celltype_maps = filtered_ctmaps
         if 'filtered_celltype_maps' in self.dataset.zarr_group:
-            del self.dataset.zarr_group['filtered_celltype_maps']
+            _remove_array(self.dataset.zarr_group, 'filtered_celltype_maps')
         self.dataset.zarr_group['filtered_celltype_maps'] = self.dataset.filtered_celltype_maps
 
         sdata = sdata if sdata is not None else getattr(
@@ -4142,6 +4261,7 @@ class Analysis(object):
         to skip the check and force one.
         """
         self._nuclei_global_affine = None
+        self._cells_cs = None
         if not isinstance(nuclei, str):
             xy = np.asarray(nuclei, dtype=float)
             if xy.ndim != 2 or xy.shape[1] < 2:
@@ -4160,6 +4280,22 @@ class Analysis(object):
             raise KeyError(f"'{nuclei}' is not a shapes or points element of the SpatialData")
 
         from spatialdata.transformations import get_transformation
+        count_frame = self.dataset._count_frame()
+        if count_frame is not None and frame is None:
+            # spatialdata_io count input: the map's µm frame is tied to the reader's
+            # coordinate system, so the markers go through it and nothing is guessed
+            cs = count_frame["coordinate_system"]
+            t_cs = get_transformation(el, get_all=True).get(cs)
+            if t_cs is None:
+                raise ValueError(f"'{nuclei}' has no transformation to {cs!r}, the coordinate "
+                                 f"system the count data was read in")
+            um_to_cs = np.asarray(count_frame["um_to_cs"], dtype=float)
+            M = np.linalg.inv(um_to_cs) @ np.asarray(
+                t_cs.to_affine_matrix(input_axes=("x", "y"), output_axes=("x", "y")), dtype=float)
+            self._nuclei_global_affine = um_to_cs
+            self._cells_cs = cs
+            self._m(f"segment_cells: markers read through coordinate system {cs!r}")
+            return (M[:2, :2] @ xy.T).T + M[:2, 2]
         t = get_transformation(el, "global")
         if t is None:
             self._nuclei_global_affine = np.eye(3)
@@ -4185,7 +4321,9 @@ class Analysis(object):
         if b.ndim == 2 and b.shape[0] >= 2:
             (x0, x1), (y0, y1) = b[0][:2], b[1][:2]
         elif b.ndim == 1 and b.size == 6:
-            x0, y0, x1, y1 = b[0], b[1], b[3], b[4]
+            # the count backend writes these bounds relative to the grid origin
+            gx, gy = self.dataset._celltype_map_origin(sdata)
+            x0, y0, x1, y1 = b[0] + gx, b[1] + gy, b[3] + gx, b[4] + gy
         elif b.ndim == 1 and b.size == 4:
             x0, y0, x1, y1 = b
         else:
@@ -4218,6 +4356,10 @@ class Analysis(object):
         dropped (that is the segmentation saying they belong to no cell)."""
         from scipy.sparse import coo_matrix
 
+        zg = getattr(self.dataset, 'zarr_group', None)
+        if transcripts is None and zg is not None and zg.attrs.get('backend') == 'blur':
+            # a count store: any points element (Stereo-seq's bin positions) is not molecules
+            return None, [], 0
         key = self._pick_element(getattr(sdata, 'points', {}), transcripts,
                                  kind='points', param='transcripts', required=False)
         if key is None:
@@ -4283,6 +4425,15 @@ class Analysis(object):
         raw = getattr(remembered, 'raw', None)
         if raw is not None:
             return raw, "the GridDataset remembered by compute_vf"
+        grid = getattr(self, '_count_grid', None)
+        if grid is not None:
+            return grid.raw, "the GridDataset compute_vf ran on"
+
+        from ._io._spatialdata_io import grid_from_spatialdata_io, is_count_reader_output
+        if sdata is not None and is_count_reader_output(sdata):
+            f = self.dataset._count_frame() or {}
+            g = grid_from_spatialdata_io(sdata, table_key=f.get('table_key'), load_image=False)
+            return g.raw, f"tables['{f.get('table_key') or 'bins'}'] (µm lattice)"
 
         tables = getattr(sdata, 'tables', None) or {}
         marked = {k: t for k, t in tables.items()
@@ -4373,14 +4524,20 @@ class Analysis(object):
         array of markers, which carries no frame, the map's own (:meth:`Dataset._map_to_global_affine`).
         """
         A = getattr(self, "_nuclei_global_affine", None)
-        return np.asarray(A, dtype=float) if A is not None else self.dataset._map_to_global_affine(sdata)
+        return np.asarray(A, dtype=float) if A is not None else self.dataset._map_frame(sdata)[1]
+
+    def _cells_coordinate_system(self, sdata):
+        """Coordinate system the cells are written into (see :meth:`_cells_global_affine`)."""
+        cs = getattr(self, "_cells_cs", None)
+        return cs if cs is not None else self.dataset._map_frame(sdata)[0]
 
     def segment_cells(self, sdata=None, nuclei=None, *, z=None,
                       simplify=None, min_area_um2=5.0, transcripts=None, bins=None,
                       shapes_key="ssaft_cell_boundaries_2d",
                       shapes_3d_key="ssaft_cell_boundaries_3d",
                       labels_3d_key="ssaft_cell_labels_3d", table_key="ssaft_cells",
-                      column="cellman_annotation", nuclei_frame=None, tile=1024, pad_um=64.0):
+                      column="cellman_annotation", nuclei_frame=None, tile=1024, pad_um=64.0,
+                      nuclei_z=None):
         """Cut the cell-type map into single cells by a celltype-constrained watershed.
 
         The segmentation-free map says *what* each voxel is but not *which cell* it
@@ -4411,8 +4568,13 @@ class Analysis(object):
         not the segmentation's, so no layers are picked here.
 
         * *markers* -- a marker only says where the water is poured: each nucleus centroid is one
-          seed voxel on the map's middle layer ``int(n_layers / 2)``, and its cell type is the
-          map's label there (a nucleus on background there is ignored).
+          seed voxel, and its cell type is the map's label there. The seed's layer is the
+          nucleus's own z (``nuclei_z``) when it is known and lands on a labelled voxel; otherwise
+          the labelled voxel of the nucleus's xy column nearest the middle of the column's
+          labelled run (the local tissue midline). A nucleus whose column is background on every
+          layer is ignored. One fixed layer for all nuclei would drop every nucleus where a tilted
+          or uneven section does not cross that layer -- two thirds of them on a Xenium section
+          spread over 60 µm in z.
         * *flood* -- per cell type, the 3D watershed of the Euclidean distance to the seeds,
           confined to that cell type's voxels, computed in xy tiles of ``tile`` voxels with
           ``pad_um`` of overlap (each tile keeps its core) on ``ncores`` processes.
@@ -4423,12 +4585,12 @@ class Analysis(object):
           ``label_id``;
         * ``shapes[shapes_3d_key]`` -- every cell's outline on every layer, one row per
           (cell, layer), with ``cell_id``, ``z_index`` and ``z_um``;
-        * ``shapes[shapes_key]`` -- the outlines on the map's middle layer ``int(n_layers / 2)``,
-          the seed layer and the layer of ``images['ssaft_celltype_map_rgb']``;
+        * ``shapes[shapes_key]`` -- one outline per cell, on the cell's own seed layer (the
+          nucleus's layer);
         * ``tables[table_key]`` annotating the 3D labels (``instance_key='label_id'``): one
           row per cell, transcripts counted by the 3D voxel they fall in (z clamped into the
           layers), ``obs`` with the cell type, ``volume_um3``, ``n_z``,
-          ``max_plane_area_um2`` and ``area_um2`` (middle layer), ``obsm['spatial']`` the
+          ``max_plane_area_um2``, ``area_um2`` (seed layer) and ``seed_z_um``, ``obsm['spatial']`` the
           voxel centroid in µm (x, y, z).
 
         ``min_area_um2`` drops a 3D cell whose largest layer is below it.
@@ -4467,6 +4629,10 @@ class Analysis(object):
             read in (default: the one that lands on the map).
         :param tile: 3D only: xy tile size, voxels.
         :param pad_um: 3D only: tile overlap, µm.
+        :param nuclei_z: 3D only: each nucleus's z in µm (the transcripts' z frame), in the order
+            of ``nuclei``; ``NaN`` where unknown. E.g. the median z of the transcripts inside each
+            nucleus (Xenium ``overlaps_nucleus``). Without it every seed sits on its column's
+            tissue midline.
         :returns: The SpatialData with the elements added.
         """
         if nuclei is None:
@@ -4487,7 +4653,7 @@ class Analysis(object):
                 sdata, nuclei, simplify=simplify, min_area_um2=min_area_um2,
                 transcripts=transcripts, shapes_key=shapes_key, shapes_3d_key=shapes_3d_key,
                 labels_3d_key=labels_3d_key, table_key=table_key, column=column,
-                nuclei_frame=nuclei_frame, tile=tile, pad_um=pad_um)
+                nuclei_frame=nuclei_frame, tile=tile, pad_um=pad_um, nuclei_z=nuclei_z)
         return self._segment_cells_2d(
             sdata, nuclei, z=z, simplify=simplify, min_area_um2=min_area_um2,
             transcripts=transcripts, bins=bins, shapes_key=shapes_key, table_key=table_key,
@@ -4495,7 +4661,7 @@ class Analysis(object):
 
     def _segment_cells_3d(self, sdata, nuclei, *, simplify, min_area_um2, transcripts,
                           shapes_key, shapes_3d_key, labels_3d_key, table_key, column,
-                          nuclei_frame, tile, pad_um):
+                          nuclei_frame, tile, pad_um, nuclei_z=None):
         """The 3D path of :meth:`segment_cells`."""
         import geopandas as gpd
         from joblib import Parallel, delayed
@@ -4520,22 +4686,48 @@ class Analysis(object):
         slab = np.ascontiguousarray(data)
         del data
         Z = Zall
-        z_mid = Zall // 2                  # the seed layer, the one write_celltype_map renders
         names, ct_colors = self._celltype_names_colors()
         K = len(names)
 
-        # ---- markers: where the water is poured -- each nucleus centroid, one voxel on the middle layer
+        # ---- markers: where the water is poured -- each nucleus centroid, one voxel on its own layer
         xy_um = self._nuclei_to_um(sdata, nuclei, frame=nuclei_frame)
         vx = np.rint((xy_um[:, 0] - ox) / sd_um).astype(np.int64)
         vy = np.rint((xy_um[:, 1] - oy) / sd_um).astype(np.int64)
         inside = (vx >= 0) & (vx < X) & (vy >= 0) & (vy < Y)
+        vz = np.full(len(vx), -1, dtype=np.int64)
+        own = np.zeros(len(vx), dtype=bool)
+        if nuclei_z is not None:
+            zz = np.asarray(nuclei_z, dtype=np.float64).ravel()
+            if zz.shape[0] != len(vx):
+                raise ValueError(f"nuclei_z has {zz.shape[0]} values for {len(vx)} nuclei")
+            has = inside & np.isfinite(zz)
+            k = np.rint((zz[has] - oz) / sd_um).astype(np.int64)
+            ok = (k >= 0) & (k < Zall)
+            idx = np.flatnonzero(has)[ok]
+            lab_ok = slab[vx[idx], vy[idx], k[ok]] >= 0
+            vz[idx[lab_ok]] = k[ok][lab_ok]
+            own[idx[lab_ok]] = True
+        # the rest: the labelled voxel of the column nearest the middle of its labelled run
+        rest = np.flatnonzero(inside & ~own)
+        n_mid = 0
+        for c0 in range(0, len(rest), 200_000):
+            r = rest[c0:c0 + 200_000]
+            col = slab[vx[r], vy[r], :] >= 0                          # (n, Z)
+            anyc = col.any(1)
+            lo = col.argmax(1)
+            hi = Zall - 1 - col[:, ::-1].argmax(1)
+            m = (lo + hi) // 2
+            dz = np.where(col, np.abs(np.arange(Zall)[None, :] - m[:, None]), Zall + 1)
+            vz[r[anyc]] = dz.argmin(1)[anyc]
+            n_mid += int(anyc.sum())
         cts = np.full(len(vx), -1, dtype=np.int32)
-        cts[inside] = slab[vx[inside], vy[inside], z_mid]
-        use = inside & (cts >= 0) & (cts < K)
+        ok = inside & (vz >= 0)
+        cts[ok] = slab[vx[ok], vy[ok], vz[ok]]
+        use = ok & (cts >= 0) & (cts < K)
         if not use.any():
-            raise ValueError("no nucleus falls on a labelled voxel of the cell-type map's middle layer — "
+            raise ValueError("no nucleus falls on a labelled voxel of the cell-type map on any layer — "
                              "check that nuclei and the map share a coordinate system")
-        seeds_xyz = np.c_[vx[use], vy[use], np.full(int(use.sum()), z_mid, dtype=np.int64)]
+        seeds_xyz = np.c_[vx[use], vy[use], vz[use]]
         seeds_ct = cts[use]
         seeds_id = np.arange(1, int(use.sum()) + 1, dtype=np.int32)
 
@@ -4576,24 +4768,25 @@ class Analysis(object):
         den = np.maximum(vol, 1)
         cen = np.c_[ox + sx / den * sd_um, oy + sy / den * sd_um, oz + (z0 + sz / den) * sd_um]
 
-        # ---- outlines on every layer, and the middle one
+        # ---- outlines on every layer, and each cell's on its own seed layer
         planes = Parallel(n_jobs=max(1, min(int(self.ncores), Z)))(
             delayed(_plane_polygons)(labels[:, :, k], sd_um, ox, oy, simplify) for k in range(Z))
-        k_mid = z_mid - z0
-        recs, area_mid = [], np.full(n_lab, np.nan)
+        seed_k = np.full(n_lab, -1, dtype=np.int64)
+        seed_k[seeds_id] = seeds_xyz[:, 2] - z0
+        recs, mid, area_mid = [], [], np.full(n_lab, np.nan)
         for k, polys in enumerate(planes):
             for lb, g in polys:
                 if lb < n_lab and keep[lb]:
                     recs.append((lb, z0 + k, g))
-                    if k == k_mid:
+                    if k == seed_k[lb]:
                         area_mid[lb] = g.area
+                        mid.append((lb, z0 + k, g))
         gdf3 = gpd.GeoDataFrame(
             {"cell_id": [f"cell_{r[0]}" for r in recs],
              "z_index": np.array([r[1] for r in recs], dtype=np.int32),
              "z_um": np.array([oz + r[1] * sd_um for r in recs], dtype=np.float32)},
             geometry=[r[2] for r in recs],
             index=pd.Index([f"cell_{r[0]}_z{r[1]}" for r in recs], name="plane_cell_id"))
-        mid = [r for r in recs if r[1] == z0 + k_mid]
         gdf2 = gpd.GeoDataFrame(geometry=[r[2] for r in mid],
                                 index=pd.Index([f"cell_{r[0]}" for r in mid], name="cell_id"))
 
@@ -4613,6 +4806,7 @@ class Analysis(object):
             "n_z": n_z[present],
             "max_plane_area_um2": (cover[present] * sd_um ** 2).astype(np.float32),
             "area_um2": area_mid[present].astype(np.float32),
+            "seed_z_um": (oz + (z0 + seed_k[present]) * sd_um).astype(np.float32),
             "region": pd.Categorical([labels_3d_key] * len(present)),
         }, index=idx)
         if Xc is None:
@@ -4622,13 +4816,17 @@ class Analysis(object):
         adata.uns[f'{column}_colors'] = list(ct_colors)
         adata.uns['cellman_celltype_names'] = list(names)
         adata.uns['segment_cells'] = dict(
-            n_dims=3, z_layers=[int(z0), int(z1)], seed_layer=int(z_mid),
+            n_dims=3, z_layers=[int(z0), int(z1)],
             z_um=[float(oz + z0 * sd_um), float(oz + z1 * sd_um)],
-            middle_layer=int(z0 + k_mid), middle_z_um=float(oz + (z0 + k_mid) * sd_um),
-            obsm_spatial="voxel centroid, µm (x, y, z)", area_um2="area on the middle layer")
+            seeds="per nucleus: its own z (nuclei_z) when labelled there, else its column's "
+                  "labelled voxel nearest the tissue midline",
+            n_seed_own_z=int((use & own).sum()), n_seed_column=int((use & ~own).sum()),
+            obsm_spatial="voxel centroid, µm (x, y, z)", area_um2="area on the cell's seed layer",
+            shapes_2d="each cell's outline on its seed layer")
 
         # ---- elements, in the frame the nuclei were read in
         A = self._cells_global_affine(sdata)
+        cells_cs = self._cells_coordinate_system(sdata)
         a, b, c = A[0]
         d, e, f = A[1]
         M4 = np.array([[sd_um, 0.0, 0.0, oz + z0 * sd_um],
@@ -4643,21 +4841,22 @@ class Analysis(object):
         sdata.labels[labels_3d_key] = Labels3DModel.parse(
             np.ascontiguousarray(labels.transpose(2, 1, 0)), dims=("z", "y", "x"),
             chunks=(Z, 1024, 1024),
-            transformations={"global": Affine(M4, input_axes=("z", "y", "x"),
+            transformations={cells_cs: Affine(M4, input_axes=("z", "y", "x"),
                                               output_axes=("z", "y", "x"))})
-        sdata.shapes[shapes_3d_key] = ShapesModel.parse(gdf3, transformations={"global": tf_xy})
-        sdata.shapes[shapes_key] = ShapesModel.parse(gdf2, transformations={"global": tf_xy})
+        sdata.shapes[shapes_3d_key] = ShapesModel.parse(gdf3, transformations={cells_cs: tf_xy})
+        sdata.shapes[shapes_key] = ShapesModel.parse(gdf2, transformations={cells_cs: tf_xy})
         sdata.tables[table_key] = TableModel.parse(
             adata, region=labels_3d_key, region_key="region", instance_key="label_id")
 
-        n_bg = int((inside & (cts < 0)).sum())
+        n_bg = int((inside & ~use).sum())
         print(f"[segment_cells] labels['{labels_3d_key}'] {len(present)} cells in 3D from "
-              f"{int(use.sum())}/{len(vx)} nuclei ({n_bg} on background on the seed layer ignored, "
-              f"{int((~inside).sum())} outside map"
+              f"{int(use.sum())}/{len(vx)} nuclei (seeds: {int((use & own).sum())} at the nucleus's own z, "
+              f"{int((use & ~own).sum())} on the column's tissue midline; {n_bg} on a background column "
+              f"ignored, {int((~inside).sum())} outside map"
               + (f", {drop_small} below {min_area_um2}µm² on every layer" if drop_small else "")
-              + f") @ all {Z} layers, seeds on layer {z_mid}, {sd_um}µm/voxel")
+              + f") @ all {Z} layers, {sd_um}µm/voxel")
         print(f"[segment_cells] shapes['{shapes_3d_key}'] {len(gdf3)} outlines on {Z} layers; "
-              f"shapes['{shapes_key}'] {len(gdf2)} on the middle layer z={z0 + k_mid}")
+              f"shapes['{shapes_key}'] {len(gdf2)} on each cell's seed layer")
         print(f"[segment_cells] tables['{table_key}'] {adata.shape} ({n_in:,} transcripts assigned, "
               f"median volume {float(np.median(obs['volume_um3'])):.0f}µm³)")
         return sdata
@@ -4824,7 +5023,7 @@ class Analysis(object):
         # nuclei element's (µm -> image pixels on Xenium / MERSCOPE) when the markers were
         # read intrinsically, the identity when they were read in 'global' (Visium HD).
         sdata.shapes[shapes_key] = ShapesModel.parse(
-            gdf, transformations={"global": Affine(self._cells_global_affine(sdata),
+            gdf, transformations={self._cells_coordinate_system(sdata): Affine(self._cells_global_affine(sdata),
                                                    input_axes=("x", "y"), output_axes=("x", "y"))})
         adata = ad.AnnData(X=X, obs=obs,
                            var=pd.DataFrame(index=pd.Index(var_names, name=None)))
@@ -4856,7 +5055,7 @@ class Analysis(object):
                           exclude_gene_indices=None, marker_genes_path=None,
                           h5ad=None, column='cellman_annotation', map_kwargs=None,
                           bandwidth=2.5, sampling_distance=1.0,
-                          prune_coefficient=4.3, kernel='epanechnikov',
+                          prune_coefficient=4.3, kernel='gaussian',
                           size_after_normalization=10,
                           log_transform=True, overwrite=True,
                           gpu_device='cuda', query_subchunk_size=None,
@@ -4929,7 +5128,7 @@ class Analysis(object):
     def _prepare_transcript_field(self, sdata, *, centroids, element_name,
                                   exclude_gene_indices, bandwidth, sampling_distance,
                                   prune_coefficient, size_after_normalization,
-                                  gpu_device, kernel='epanechnikov'):
+                                  gpu_device, kernel='gaussian'):
         """Resolve everything the KDE producer/consumer need (grid, gene set,
         centroids, transcripts on GPU)."""
         import torch
@@ -4953,19 +5152,14 @@ class Analysis(object):
                 size_after_normalization=size_after_normalization)
         vx, vy, vz = (int(self.dataset.shape[0]), int(self.dataset.shape[1]),
                       int(self.dataset.shape[2]))
-        # The Epanechnikov's scale is its support radius; the caller's ``bandwidth`` is
-        # gaussian-equivalent for both kernels, so convert here -- the grid
-        # dimensionality is only known now -- and let everything downstream
-        # (norm_threshold, V_eff, vf_params) read the converted scale.
-        from ._count import epanechnikov_support, kernel_peak
+        # Each kernel has its own scale (the support radius of a compact one); the
+        # caller's ``bandwidth`` is gaussian-equivalent for all of them, so convert
+        # here -- the grid dimensionality is only known now -- and let everything
+        # downstream (norm_threshold, V_eff, vf_params) read the converted scale.
+        from ._count import resolve_kernel, kernel_scale, kernel_peak
         _dim = 2 if vz == 1 else 3
-        _kern = str(kernel).lower()
-        if _kern.startswith('epa'):
-            _bw_kde = epanechnikov_support(bandwidth, _dim)
-        elif _kern.startswith('gauss'):
-            _bw_kde = float(bandwidth)
-        else:
-            raise ValueError(f"unknown kernel {kernel!r}; use 'gaussian' or 'epanechnikov'")
+        _kern = resolve_kernel(kernel)
+        _bw_kde = kernel_scale(bandwidth, _dim, _kern)
         self.dataset.bandwidth = _bw_kde
         self.dataset.kde_kernel = _kern
         self.dataset.ndim = _dim
@@ -5027,6 +5221,19 @@ class Analysis(object):
         cx, n_chunk = self.calc_chunk(vx, vy, vz, n_genes_use, mode='map_celltypes_cpu')
         if cx is None or cx <= 0:
             raise RuntimeError('Cannot determine chunk size.')
+        # Large transcript sets stay on the host: uploading all of them (MERSCOPE: ~0.5 billion,
+        # 16 GB as float64 + gene index) left no room on the card for the rest of the map. Each
+        # x-slab then uploads only the transcripts within its reach, found through an x-sorted
+        # index and put back in their original order, so the KDE sums them in the same order.
+        host = None
+        if len(loc_x_np) * 32 > int(os.environ.get('SSAFT_MAP_HOST_LOCS_BYTES', 2 << 30)):
+            _order = np.argsort(loc_x_np, kind='stable')
+            host = dict(x=np.ascontiguousarray(loc_x_np), y=np.ascontiguousarray(loc_y_np),
+                        z=np.ascontiguousarray(loc_z_np), gi=np.ascontiguousarray(gi_np),
+                        order=_order, xs=loc_x_np[_order])
+            _dev = lambda a, dt: torch.zeros(0, dtype=dt, device=gpu_device)  # noqa: E731
+        else:
+            _dev = lambda a, dt: torch.as_tensor(a, dtype=dt, device=gpu_device)  # noqa: E731
         return dict(
             vx=vx, vy=vy, vz=vz, dim=_dim,
             sd_um=float(sampling_distance), bandwidth=float(_bw_kde),
@@ -5035,11 +5242,9 @@ class Analysis(object):
             size_after_normalization=float(size_after_normalization),
             n_genes_use=int(n_genes_use), genes=genes, use_genes=use_genes,
             centroids_use=centroids_use, cx=int(cx), n_chunk=int(n_chunk),
-            loc_x_t=torch.as_tensor(loc_x_np, dtype=torch.float64, device=gpu_device),
-            loc_y_t=torch.as_tensor(loc_y_np, dtype=torch.float64, device=gpu_device),
-            loc_z_t=torch.as_tensor(loc_z_np, dtype=torch.float64, device=gpu_device),
-            gi_t=torch.as_tensor(gi_np, dtype=torch.int64, device=gpu_device),
-            gpu_device=gpu_device,
+            loc_x_t=_dev(loc_x_np, torch.float64), loc_y_t=_dev(loc_y_np, torch.float64),
+            loc_z_t=_dev(loc_z_np, torch.float64), gi_t=_dev(gi_np, torch.int64),
+            host_locs=host, gpu_device=gpu_device,
         )
 
     def _kde_field_iter_gpu(self, st, *, chunk_start, chunk_end, log_transform,
@@ -5062,8 +5267,9 @@ class Analysis(object):
         n_genes_use = st['n_genes_use']
         bandwidth = st['bandwidth']; prune_coefficient = st['prune_coefficient']
         kernel = st.get('kernel', 'gaussian')
-        # the Epanechnikov's own support IS its radius; prune_coefficient is gaussian-only
-        reach = bandwidth if kernel.startswith('epa') else bandwidth * prune_coefficient
+        # a compact kernel's own support IS its radius; prune_coefficient cuts the others
+        from ._count import kernel_reach
+        reach = kernel_reach(bandwidth, kernel, prune_coefficient)
         cx = st['cx']; n_chunk = st['n_chunk']
         if query_subchunk_size is None:
             query_subchunk_size = max(1024, int(gpu_target_bytes // (n_genes_use * 4)))
@@ -5092,7 +5298,7 @@ class Analysis(object):
         """The chunk loop of :meth:`_kde_field_iter_gpu`, split out only so the
         single progress bar can be closed in a ``finally`` around it."""
         import torch
-        from ._mapping_gpu import _kde_setup_celllist, _kde_run_subchunk
+        from ._mapping_gpu import _kde_setup_celllist, _kde_run_subchunk, _kde_nonzero_queries
         vx, vy, vz = st['vx'], st['vy'], st['vz']
         n_genes_use = st['n_genes_use']; sd_um = st['sd_um']
         bandwidth = st['bandwidth']; prune_coefficient = st['prune_coefficient']
@@ -5121,22 +5327,46 @@ class Analysis(object):
             cqzmin = float(qz_grid.min()) if N_total > 0 else 0.0
             cqzmax = float(qz_grid.max()) if N_total > 0 else 0.0
             _Rw_pad = float(reach + sd_um)
-            mask_chunk_t = (loc_x_t >= cqxmin - _Rw_pad) & (loc_x_t <= cqxmax + _Rw_pad)
+            H = st.get('host_locs')
+            if H is not None:
+                _lo = np.searchsorted(H['xs'], cqxmin - _Rw_pad, side='left')
+                _hi = np.searchsorted(H['xs'], cqxmax + _Rw_pad, side='right')
+                _idx = np.sort(H['order'][_lo:_hi])
+                c_x = torch.as_tensor(H['x'][_idx], dtype=torch.float64, device=gpu_device)
+                c_y = torch.as_tensor(H['y'][_idx], dtype=torch.float64, device=gpu_device)
+                c_z = torch.as_tensor(H['z'][_idx], dtype=torch.float64, device=gpu_device)
+                c_g = torch.as_tensor(H['gi'][_idx], dtype=torch.int64, device=gpu_device)
+                del _idx
+            else:
+                mask_chunk_t = (loc_x_t >= cqxmin - _Rw_pad) & (loc_x_t <= cqxmax + _Rw_pad)
+                c_x, c_y, c_z, c_g = (loc_x_t[mask_chunk_t], loc_y_t[mask_chunk_t],
+                                      loc_z_t[mask_chunk_t], gi_t[mask_chunk_t])
+                del mask_chunk_t
             state = _kde_setup_celllist(
-                loc_x_t[mask_chunk_t], loc_y_t[mask_chunk_t], loc_z_t[mask_chunk_t],
-                gi_t[mask_chunk_t], cqxmin, cqymin, cqzmin, cqxmax, cqymax, cqzmax,
+                c_x, c_y, c_z, c_g, cqxmin, cqymin, cqzmin, cqxmax, cqymax, cqzmax,
                 sd_um, bandwidth, prune_coefficient, dim, kernel=kernel)
-            del mask_chunk_t
 
-            n_sub = (N_total + query_subchunk_size - 1) // query_subchunk_size
+            # only the voxels with a transcript within the kernel's reach: the rest are exactly
+            # zero (vf_norm 0, never kept) and stay as the zero-initialised arrays have them
+            if os.environ.get('SSAFT_KDE_NO_SKIP') or N_total == 0:
+                qsel = np.arange(N_total)
+            else:
+                qsel = np.flatnonzero(_kde_nonzero_queries(
+                    c_x, c_y, c_z if dim == 3 else None, x0, local_cx, vy, vz,
+                    sd_um, reach, kernel))
+            del c_x, c_y, c_z, c_g
+            if kde_bar is not None:
+                kde_bar.update(N_total - len(qsel))
+            n_q = len(qsel)
+            n_sub = (n_q + query_subchunk_size - 1) // query_subchunk_size
             if kde_bar is not None:
                 kde_bar.set_postfix_str(f'chunk {chunk_idx + 1}/{n_chunk}', refresh=False)
             for s in range(n_sub):
-                s0 = s * query_subchunk_size; s1 = min(N_total, s0 + query_subchunk_size)
-                kde_t = _kde_run_subchunk(state, qx_flat[s0:s1], qy_flat[s0:s1],
-                                          qz_flat[s0:s1], n_genes_use, gpu_device)
+                s0 = s * query_subchunk_size; s1 = min(n_q, s0 + query_subchunk_size)
+                sub_idx = qsel[s0:s1]
+                kde_t = _kde_run_subchunk(state, qx_flat[sub_idx], qy_flat[sub_idx],
+                                          qz_flat[sub_idx], n_genes_use, gpu_device)
                 vf_norm_t = kde_t.sum(dim=1)
-                sub_idx = np.arange(s0, s1)
                 local_x = sub_idx // (vy * vz); rem = sub_idx % (vy * vz)
                 local_y = rem // vz; local_z = rem % vz
                 vf_norm_chunk[local_x, local_y, local_z] = (
@@ -5184,7 +5414,7 @@ class Analysis(object):
                         marker_genes_path=None,
                         method='corr', map_kwargs=None,
                         bandwidth=2.5, sampling_distance=1.0, prune_coefficient=4.3,
-                        kernel='epanechnikov',
+                        kernel='gaussian',
                         size_after_normalization=10, log_transform=True, overwrite=True,
                         gpu_device='cuda', query_subchunk_size=None,
                         gpu_target_bytes=int(1e9), chunk_start=None, chunk_end=None,
@@ -5276,7 +5506,7 @@ class Analysis(object):
 
         def _safe_remove(name):
             if name in zg:
-                del zg[name]
+                _remove_array(zg, name)
 
         if cx is not None:
             st['cx'] = int(cx)
@@ -5293,7 +5523,7 @@ class Analysis(object):
             # analytic_vf_norm_threshold reads -- transcript stores keep deriving
             # their threshold from the live dataset, exactly as before.
             zg.attrs['kde_kernel'] = st.get('kernel', 'gaussian')
-            zg.attrs['kde_bandwidth'] = float(st['bandwidth'])   # kernel's own scale (H if epa)
+            zg.attrs['kde_bandwidth'] = float(st['bandwidth'])   # kernel's own scale (H if compact)
             self.dataset._zarr_create_array(zg, 'vf_norm', (vx, vy, vz), 'f4')
             if do_map:
                 # gnb still routes to the CPU producer; corr and lda run here. The other
@@ -5362,6 +5592,8 @@ class Analysis(object):
         # whole chunk at once
         _stream = (do_map and method == 'lda' and _lda_on_gpu
                    and bool((map_kwargs or {}).get('stream_lda', True)))
+        from ._count import _SlabWriter
+        _slab = _SlabWriter(zg)
         it = self._kde_field_iter_gpu(
             st, chunk_start=chunk_start, chunk_end=chunk_end, log_transform=log_transform,
             want_full_field=save_vf, query_subchunk_size=query_subchunk_size,
@@ -5369,7 +5601,7 @@ class Analysis(object):
             on_batch=(_lda_on_batch if _stream else None))
         for fc in it:
             x0, x1 = fc['x0'], fc['x1']
-            zg['vf_norm'][x0:x1, :, :] = fc['vf_norm']
+            _slab('vf_norm', x0, x1, fc['vf_norm'])
             if save_vf and fc['full'] is not None:
                 if vf_ts is not None:
                     inflight.append(vf_ts[:, x0:x1, :, :].write(fc['full']))
@@ -5390,11 +5622,11 @@ class Analysis(object):
                         if _ms is not None and _pend['m']:
                             msv = np.zeros((local_cx, vy, vz), dtype=np.float32)
                             msv[kx, ky, kz] = np.concatenate(_pend['m'])
-                            zg['celltype_marker_score'][x0:x1, :, :] = msv
+                            _slab('celltype_marker_score', x0, x1, msv)
                     for _k in _pend:
                         _pend[_k].clear()
-                    zg['celltype_maps'][x0:x1, :, :] = ctmap
-                    zg[score_key][x0:x1, :, :] = corr
+                    _slab('celltype_maps', x0, x1, ctmap)
+                    _slab(score_key, x0, x1, corr)
                     continue
                 if fc['vecs'] is not None and fc['vecs'].shape[0] > 0:
                     if method == 'lda':
@@ -5455,12 +5687,12 @@ class Analysis(object):
                                                     _ms) / max(lda_veff, 1e-12)
                         ctmap[fc['kx'], fc['ky'], fc['kz']] = best_idx
                         corr[fc['kx'], fc['ky'], fc['kz']] = best_corr
-                        zg['celltype_maps'][x0:x1, :, :] = ctmap
-                        zg[score_key][x0:x1, :, :] = corr
+                        _slab('celltype_maps', x0, x1, ctmap)
+                        _slab(score_key, x0, x1, corr)
                         if _ms is not None:
                             msv = np.zeros((local_cx, vy, vz), dtype=np.float32)
                             msv[fc['kx'], fc['ky'], fc['kz']] = _msv
-                            zg['celltype_marker_score'][x0:x1, :, :] = msv
+                            _slab('celltype_marker_score', x0, x1, msv)
                         continue
                     if marker_idx is not None:
                         from ._marker_corr import masked_pearson_max_torch
@@ -5470,8 +5702,9 @@ class Analysis(object):
                         best_idx, best_corr = _pearson_max_gpu(centroids_t, fc['vecs'])
                     ctmap[fc['kx'], fc['ky'], fc['kz']] = best_idx.cpu().numpy()
                     corr[fc['kx'], fc['ky'], fc['kz']] = best_corr.cpu().numpy()
-                zg['celltype_maps'][x0:x1, :, :] = ctmap
-                zg[score_key][x0:x1, :, :] = corr
+                _slab('celltype_maps', x0, x1, ctmap)
+                _slab(score_key, x0, x1, corr)
+        _slab.flush()
         for f in inflight:
             f.result()
         if attach:
@@ -5487,7 +5720,7 @@ class Analysis(object):
     def init_map_celltypes(self, sdata, centroids=None, element_name=None,
                                exclude_gene_indices=None,
                                bandwidth=2.5, sampling_distance=1.0, prune_coefficient=4.3,
-                               kernel='epanechnikov',
+                               kernel='gaussian',
                                size_after_normalization=10, log_transform=True):
         """
         Initialize zarr arrays for a distributed ``map_celltypes_cpu`` run.
@@ -5556,8 +5789,9 @@ class Analysis(object):
                       int(self.dataset.shape[1]),
                       int(self.dataset.shape[2]))
 
-        self.dataset.bandwidth = bandwidth
+        from ._count import kernel_scale
         self.dataset.ndim = 2 if vz == 1 else 3
+        self.dataset.bandwidth = kernel_scale(bandwidth, self.dataset.ndim, kernel)
 
         grouped = self.locations.groupby('gene', sort=True)
         grouped_map = {gene: loc for gene, loc in grouped}
@@ -5580,7 +5814,7 @@ class Analysis(object):
 
         def _safe_remove(name):
             if name in self.dataset.zarr_group:
-                del self.dataset.zarr_group[name]
+                _remove_array(self.dataset.zarr_group, name)
 
         # correlation-only path; drop any posterior volume from an earlier gnb run so
         # filter_celltypemaps does not threshold this map with min_p.
@@ -5596,12 +5830,10 @@ class Analysis(object):
         self.dataset._zarr_create_array(self.dataset.zarr_group, 'celltype_maps', (vx, vy, vz), 'i4')
         self.dataset._zarr_create_array(self.dataset.zarr_group, 'max_correlations', (vx, vy, vz), 'f4')
         # the workers create no arrays, so the field's provenance is recorded here
-        from ._count import epanechnikov_support
+        from ._count import resolve_kernel, kernel_scale
         _dim = 2 if vz == 1 else 3
-        self.dataset.zarr_group.attrs['kde_kernel'] = str(kernel).lower()
-        self.dataset.zarr_group.attrs['kde_bandwidth'] = float(
-            epanechnikov_support(bandwidth, _dim)
-            if str(kernel).lower().startswith('epa') else bandwidth)
+        self.dataset.zarr_group.attrs['kde_kernel'] = resolve_kernel(kernel)
+        self.dataset.zarr_group.attrs['kde_bandwidth'] = kernel_scale(bandwidth, _dim, kernel)
 
         cx, n_chunk = self.calc_chunk(vx, vy, vz, len(shared_genes), mode='map_celltypes_cpu')
         if cx is None or cx <= 0:
@@ -5627,7 +5859,7 @@ class Analysis(object):
                                   centroids=None, element_name=None,
                                   exclude_gene_indices=None,
                                   bandwidth=2.5, sampling_distance=1.0, prune_coefficient=4.3,
-                                  kernel='epanechnikov',
+                                  kernel='gaussian',
                                   size_after_normalization=10, log_transform=True,
                                   gpu_device=None, force_cpu=False,
                                   query_subchunk_size=None, gpu_target_bytes=int(1e9)):
@@ -5700,14 +5932,9 @@ class Analysis(object):
                 gpu_target_bytes=gpu_target_bytes,
             )
 
-        if not str(kernel).lower().startswith('gauss'):
-            raise ValueError(
-                f"kernel={kernel!r} is not available on this worker's CPU fallback "
-                "(the compiled KDE is gaussian-only). 'epanechnikov' is now the "
-                "DEFAULT, so this fires without you asking for it: give the worker a "
-                "CUDA gpu_device, or pass kernel='gaussian' explicitly.")
-
         from tqdm.auto import tqdm
+        from ._count import resolve_kernel, kernel_code
+        kernel = resolve_kernel(kernel)
 
         self.dataset.cluster_labels          = self.dataset.zarr_group['cluster_labels'][:]
         self.dataset.downsampled_vectors              = self.dataset.zarr_group['downsampled_vectors'][:]
@@ -5733,11 +5960,13 @@ class Analysis(object):
                       int(self.dataset.shape[1]),
                       int(self.dataset.shape[2]))
 
-        self.dataset.bandwidth = bandwidth
+        # the kernel's own scale, as the GPU path records it (norm_threshold, V_eff)
+        from ._count import resolve_kernel, kernel_scale, kernel_peak
         self.dataset.ndim = 2 if vz == 1 else 3
-        self.dataset.expression_threshold = (
-            1 / (np.sqrt(2 * np.pi) * bandwidth) ** self.dataset.ndim
-        )
+        self.dataset.bandwidth = kernel_scale(bandwidth, self.dataset.ndim, kernel)
+        self.dataset.kde_kernel = resolve_kernel(kernel)
+        self.dataset.expression_threshold = kernel_peak(
+            self.dataset.bandwidth, self.dataset.ndim, kernel)
         self.dataset.norm_threshold = self.dataset.expression_threshold * 2
 
         grouped = self.locations.groupby('gene', sort=True)
@@ -5824,7 +6053,7 @@ class Analysis(object):
                     bandwidth=float(bandwidth),
                     prune_coefficient=float(prune_coefficient),
                     gidx=gidx, dim=int(dim), ncores=int(self.ncores),
-                    x0=int(x0), y0=0, z0=0,
+                    x0=int(x0), y0=0, z0=0, kernel=kernel_code(kernel),
                 )
                 if gene_bar is not None:
                     gene_bar.update(1)

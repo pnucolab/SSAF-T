@@ -237,7 +237,14 @@ class GridDataset:
         :param image_key: Staining-image key; defaults to the ``image_key``
             stored in the metadata.
         :type image_key: str, optional
+
+        A SpatialData straight from ``spatialdata_io.visium_hd`` or
+        ``spatialdata_io.stereoseq`` (no ``uns['cellman']``) is converted on the fly by
+        :func:`ssaft._io._spatialdata_io.grid_from_spatialdata_io`; the input is not modified.
         """
+        from ._io._spatialdata_io import grid_from_spatialdata_io, is_count_reader_output
+        if is_count_reader_output(sdata):
+            return grid_from_spatialdata_io(sdata, table_key=table_key, image_key=image_key)
         if table_key is None:
             table_key = next((k for k, t in sdata.tables.items()
                               if "cellman" in t.uns), next(iter(sdata.tables)))

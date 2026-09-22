@@ -35,24 +35,26 @@ def _gaussian_kernel_1d(sigma_bin, device, prune_coefficient=4.3):
     return g.view(1, 1, 1, -1), g.view(1, 1, -1, 1), radius
 
 
-def _epanechnikov_kernel_2d(sigma_bin, device):
-    """Dense radial Epanechnikov ``1 - (r/H)^2`` on the bin raster, sum-normalized.
+def _radial_kernel_2d(sigma_bin, kernel, device, prune_coefficient=4.3):
+    """Dense radial ``kernel`` on the bin raster, sum-normalized.
 
-    ``sigma_bin`` is the gaussian-equivalent sigma in bins; the support is
-    ``H = sigma_bin * sqrt(6)`` (2D variance matching, :func:`epanechnikov_support`).
-    Returned as a single ``(1, 1, 2r+1, 2r+1)`` kernel because the Epanechnikov is
-    radial and therefore NOT separable -- the gaussian's two 1D passes do not apply.
-    That costs more taps ((2r+1)^2 vs 2(2r+1)) but the radius is 2.4 sigma instead of
-    4.3 sigma, so at the default sigma_bin=1 it is 7x7=49 taps against 2x11=22, one
-    cuDNN launch instead of two.
+    ``sigma_bin`` is the gaussian-equivalent sigma in bins; the kernel's own scale is
+    derived from it by 2D variance matching (:func:`kernel_scale`), e.g. the
+    Epanechnikov support ``H = sigma_bin * sqrt(6)``. Returned as a single
+    ``(1, 1, 2r+1, 2r+1)`` kernel because only the gaussian is separable -- the other
+    radial kernels need the full square of taps, one cuDNN launch. At the default
+    sigma_bin=1 the compact kernels span 5x5 to 7x7 taps against the gaussian's
+    2x11=22; the exponential's long tail takes 13x13.
     """
     import torch
-    H = float(sigma_bin) * float(np.sqrt(6.0))
-    radius = int(np.ceil(H))
-    k = torch.arange(-radius, radius + 1, dtype=torch.float32, device=device)
-    r2 = k.view(-1, 1) ** 2 + k.view(1, -1) ** 2
-    w = torch.clamp(1.0 - r2 / (H * H), min=0.0)
+    scale = kernel_scale(sigma_bin, 2, kernel)
+    reach = kernel_reach(scale, kernel, prune_coefficient)
+    radius = int(np.ceil(reach))
+    k = np.arange(-radius, radius + 1, dtype=np.float64)
+    r = np.sqrt(k[:, None] ** 2 + k[None, :] ** 2)
+    w = np.where(r <= reach, kernel_profile(r / scale, kernel), 0.0)
     w /= w.sum()
+    w = torch.as_tensor(w, dtype=torch.float32, device=device)
     return w.view(1, 1, 2 * radius + 1, 2 * radius + 1), radius
 
 
@@ -80,8 +82,8 @@ def _rasterize_blur_tile_gpu(Xt, Rt, Ct, rp0, rp1, cp0, cp1, n_G,
     zero-padded edge effect and are discarded. Bounds GPU memory to
     ``n_G × (band_h + 2r) × (band_w + 2r)`` regardless of the full raster size.
 
-    With ``ky_g=None`` the kernel is treated as a RADIAL 2D one (Epanechnikov) and
-    applied in a single dense conv; the halo logic is unchanged."""
+    With ``ky_g=None`` the kernel is treated as a RADIAL 2D one (every kernel but the
+    gaussian) and applied in a single dense conv; the halo logic is unchanged."""
     import torch
     import torch.nn.functional as F
     h = rp1 - rp0
@@ -97,7 +99,7 @@ def _rasterize_blur_tile_gpu(Xt, Rt, Ct, rp0, rp1, cp0, cp1, n_G,
         v = torch.as_tensor(sub.data, device=device, dtype=dtype)
         raster.index_put_((g, r, c), v, accumulate=True)
     t = raster.unsqueeze(0)
-    if ky_g is None:            # radial (Epanechnikov): not separable, one dense pass
+    if ky_g is None:            # radial, not separable: one dense pass
         t = F.conv2d(t, kx_g, padding=(radius, radius), groups=n_G)
     else:
         t = F.conv2d(t, ky_g, padding=(radius, 0), groups=n_G)
@@ -152,6 +154,79 @@ def _tensorstore_array(group_dir, name, shape, chunks):
         },
     }
     return ts.open(spec, create=True, delete_existing=True).result()
+
+
+class _SlabWriter:
+    """Write x-slabs ``arr[x0:x1, ...]`` of existing store arrays through tensorstore, asynchronously.
+
+    The per-voxel map outputs (vf_norm, celltype_maps, the score and marker volumes) are written
+    one x-slab at a time; through zarr-python that is one event-loop thread (~35 MB/s on this
+    storage), which made writing a 3D map take longer than computing it. The arrays are opened
+    as they are on disk (zarr.json read, not re-declared), so dtype, fill value and codecs are
+    the store's own and the bytes are identical. Up to ``max_inflight`` slab writes overlap the
+    next slab's GPU work; ``flush()`` waits for all of them. Falls back to plain zarr-python
+    assignment when tensorstore is unavailable, the store is not a local directory, or
+    ``CELLMAN_NO_TENSORSTORE`` is set.
+    """
+
+    def __init__(self, zg, max_inflight=8):
+        self.zg, self.max_inflight = zg, int(max_inflight)
+        self.gd = _store_group_dir(zg)
+        self.ts = None
+        if self.gd is not None and not os.environ.get("CELLMAN_NO_TENSORSTORE"):
+            try:
+                import tensorstore as ts
+                self.ts = ts
+            except Exception:  # noqa: BLE001
+                self.ts = None
+        self.arrays, self.inflight = {}, []
+
+    def __call__(self, name, x0, x1, arr):
+        if self.ts is None:
+            self.zg[name][x0:x1, ...] = arr
+            return
+        a = self.arrays.get(name)
+        if a is None:
+            a = self.ts.open({"driver": "zarr3",
+                              "kvstore": {"driver": "file", "path": os.path.join(self.gd, name)}},
+                             open=True).result()
+            self.arrays[name] = a
+        f = a[x0:x1].write(arr)
+        f.copy.result()          # the source is copied: the caller may reuse its buffer; the commit stays async
+        self.inflight.append(f.commit)
+        while len(self.inflight) > self.max_inflight:
+            self.inflight.pop(0).result()
+
+    def flush(self):
+        for f in self.inflight:
+            f.result()
+        self.inflight.clear()
+
+
+def remove_array(zg, name):
+    """Delete ``zg[name]`` even when a killed writer left debris in it.
+
+    tensorstore leaves ``*.__lock`` files behind when its process dies mid-write, and on NFS a file
+    still open on a lost host lingers as ``.nfs*``; zarr's own delete then stops on the first key it
+    cannot remove. Fall back to removing the directory, and if even that leaves something (a
+    silly-renamed file), move the array aside so the name is free for the new one.
+    """
+    import shutil
+    import time
+    if name not in zg:
+        return
+    try:
+        del zg[name]
+        return
+    except OSError:
+        pass
+    gd = _store_group_dir(zg)
+    if gd is None:
+        raise
+    path = os.path.join(gd, name)
+    shutil.rmtree(path, ignore_errors=True)
+    if os.path.exists(path):
+        os.rename(path, f"{path}.stale.{int(time.time())}")
 
 
 def _store_group_dir(zg):
@@ -249,6 +324,157 @@ def _tensorstore_vf(group_dir, n_G, out_R, out_C, sh, sw):
                               (n_G, out_R, out_C), (n_G, sh, sw))
 
 
+# ----------------------------------------------------------------------------
+# KDE kernels
+#
+# Every kernel is radial, K(r) = f(r / s) / Z, with its OWN scale ``s``: sigma for
+# the gaussian, the support radius H for the compact ones, the decay length for
+# the exponential. The user-facing ``bandwidth`` is gaussian-equivalent for all
+# of them: ``s`` is chosen so the kernel has the gaussian's per-axis VARIANCE
+# (h^2) in the grid's dimensionality, so one bandwidth means one spatial width
+# whatever the kernel. The C extension (utils.cpp) and the Triton kernels
+# (_kde_gpu.py) index the same table by position in KDE_KERNELS and hold their
+# own copy of the scale / norm constants; tests assert they agree with this one.
+#
+#   kernel        f(u)            scale s / h (dim d)          reach
+#   gaussian      exp(-u^2/2)     1                           prune_coefficient * s
+#   tophat        1               sqrt(d + 2)                 s
+#   epanechnikov  1 - u^2         sqrt(d + 4)                 s
+#   exponential   exp(-u)         1 / sqrt(d + 1)             prune_coefficient^2 / 2 * s
+#   linear        1 - u           sqrt((d+2)(d+3) / (d+1))    s
+#   cosine        cos(pi u / 2)   1 / sqrt(E[u^2] / d)        s
+#
+# The exponential is cut where it falls to the gaussian's own relative value at
+# ``prune_coefficient`` sigma (exp(-4.3^2/2) at the default), so both
+# infinite-support kernels drop the same share of their peak.
+# ----------------------------------------------------------------------------
+
+KDE_KERNELS = ('gaussian', 'tophat', 'epanechnikov', 'exponential', 'linear', 'cosine')
+_COMPACT_KERNELS = frozenset({'tophat', 'epanechnikov', 'linear', 'cosine'})
+
+# cosine: per-axis variance of f(u) = cos(pi u / 2) on the unit ball, E[u^2] / d
+_A = np.pi / 2
+_COSINE_VAR = {
+    1: (1.0 / _A - 2.0 / _A ** 3) / (1.0 / _A),
+    2: (1.0 / _A - 6.0 / _A ** 3 + 6.0 / _A ** 4) / (1.0 / _A - 1.0 / _A ** 2) / 2.0,
+    3: (1.0 / _A - 12.0 / _A ** 3 + 24.0 / _A ** 5)
+       / (1.0 / _A - 2.0 / _A ** 3) / 3.0,
+}
+
+
+def resolve_kernel(kernel):
+    """Canonical kernel name from ``kernel`` (case-insensitive).
+
+    Accepts the six names in :data:`KDE_KERNELS` and, for stores and callers that
+    predate them, any unambiguous prefix (``'gauss'``, ``'epa'``). Raises
+    ``ValueError`` for anything else, so a typo cannot fall through to a default.
+    """
+    k = str(kernel).strip().lower()
+    if k in KDE_KERNELS:
+        return k
+    hits = [name for name in KDE_KERNELS if name.startswith(k)] if len(k) >= 3 else []
+    if len(hits) == 1:
+        return hits[0]
+    raise ValueError(f"unknown kernel {kernel!r}; use one of {', '.join(KDE_KERNELS)}")
+
+
+def kernel_code(kernel):
+    """Integer id of ``kernel`` for the compiled and Triton KDEs (its index in KDE_KERNELS)."""
+    return KDE_KERNELS.index(resolve_kernel(kernel))
+
+
+def kernel_scale(bandwidth, ndim, kernel='gaussian'):
+    """Gaussian-equivalent ``bandwidth`` -> the kernel's own scale, matched on per-axis variance.
+
+    ``ndim`` is the grid's dimensionality (2 or 3; 1 is accepted for completeness):
+    the same width needs a different scale in 3D, since a radial kernel's variance
+    per axis depends on how much of its mass sits at large r.
+    """
+    k = resolve_kernel(kernel); d = int(ndim); h = float(bandwidth)
+    if k == 'gaussian':
+        return h
+    if k == 'tophat':
+        return h * float(np.sqrt(d + 2))
+    if k == 'epanechnikov':
+        return h * float(np.sqrt(d + 4))
+    if k == 'exponential':
+        return h / float(np.sqrt(d + 1))
+    if k == 'linear':
+        return h * float(np.sqrt((d + 2) * (d + 3) / (d + 1)))
+    return h / float(np.sqrt(_COSINE_VAR[d]))
+
+
+def kernel_reach(scale, kernel='gaussian', prune_coefficient=4.3):
+    """Truncation radius of ``kernel`` at its own ``scale``, in the same units.
+
+    The compact kernels reach zero on their own at ``scale``, so
+    ``prune_coefficient`` applies only to the gaussian and the exponential.
+    """
+    k = resolve_kernel(kernel)
+    if k in _COMPACT_KERNELS:
+        return float(scale)
+    if k == 'exponential':
+        return float(scale) * float(prune_coefficient) ** 2 / 2.0
+    return float(scale) * float(prune_coefficient)
+
+
+def kernel_search_cells(reach, sampling_distance, kernel='gaussian'):
+    """Neighbour-search radius, in grid cells, of the cell-list KDEs (C and Triton alike).
+
+    Query and molecule are each binned by ``floor``, so a molecule within ``reach``
+    can sit ``floor(reach / sd) + 1`` cells away. The gaussian and exponential keep
+    the historical ``floor(reach / sd)``: what that misses is their tail below ~1e-4
+    of the peak, and the gaussian's fields stay what they have always been. A
+    compact kernel still carries real weight at its edge (all of it for the
+    tophat), so it gets the extra cell and its whole support.
+    """
+    extra = 1 if resolve_kernel(kernel) in _COMPACT_KERNELS else 0
+    return int(np.floor(float(reach) / float(sampling_distance) + 1e-12)) + extra
+
+
+def kernel_norm(scale, ndim, kernel='gaussian'):
+    """Integral of the unnormalized profile ``f(r / scale)`` over R^ndim (so ``K = f / norm``).
+
+    Closed forms; the gaussian and exponential integrals are the untruncated ones,
+    as the compiled KDE has always used for the gaussian.
+    """
+    k = resolve_kernel(kernel); d = int(ndim); s = float(scale)
+    unit_ball = {1: 2.0, 2: np.pi, 3: 4.0 * np.pi / 3.0}[d]
+    if k == 'gaussian':
+        return float((np.sqrt(2.0 * np.pi) * s) ** d)
+    if k == 'tophat':
+        return float(unit_ball * s ** d)
+    if k == 'epanechnikov':
+        return float(unit_ball * s ** d * 2.0 / (d + 2))
+    if k == 'linear':
+        return float(unit_ball * s ** d / (d + 1))
+    if k == 'exponential':
+        return float({1: 2.0, 2: 2.0 * np.pi, 3: 8.0 * np.pi}[d] * s ** d)
+    return float({1: 4.0 / np.pi,
+                  2: 4.0 - 8.0 / np.pi,
+                  3: 8.0 - 64.0 / np.pi ** 2}[d] * s ** d)
+
+
+def kernel_profile(u, kernel='gaussian'):
+    """Unnormalized radial profile ``f(u)`` at ``u = r / scale`` (numpy; zero outside the support)."""
+    k = resolve_kernel(kernel)
+    u = np.asarray(u, dtype=np.float64)
+    if k == 'gaussian':
+        return np.exp(-0.5 * u * u)
+    if k == 'exponential':
+        return np.exp(-u)
+    inside = u <= 1.0
+    if k == 'tophat':
+        f = np.ones_like(u)
+    elif k == 'epanechnikov':
+        f = 1.0 - u * u
+    elif k == 'linear':
+        f = 1.0 - u
+    else:
+        f = np.cos(_A * u)
+    return np.where(inside, f, 0.0)
+
+
 def epanechnikov_support(bandwidth, ndim):
     """Gaussian bandwidth -> Epanechnikov support radius, matched on VARIANCE.
 
@@ -258,21 +484,18 @@ def epanechnikov_support(bandwidth, ndim):
 
         H = h * sqrt(ndim + 4)          (2.236 h in 1D, 2.449 h in 2D, 2.646 h in 3D)
 
-    which is the standard moment-matched conversion and, in 1D, within 1% of the
-    canonical-bandwidth (AMISE-equivalent) ratio 2.214. Because the Epanechnikov
-    reaches zero at ``H``, its truncation radius is ``H`` itself -- 6.61 µm against the
-    gaussian's ``4.3 h`` = 10.75 µm at the default bandwidth. The cost of a KDE goes as
-    the cube of the reach, so the same kernel width comes out about 3x cheaper.
+    Kept for callers that predate :func:`kernel_scale`, which generalizes it.
     """
-    return float(bandwidth) * float(np.sqrt(int(ndim) + 4))
+    return kernel_scale(bandwidth, ndim, 'epanechnikov')
 
 
 def kernel_peak(scale, ndim, kernel='gaussian'):
     """Peak of ONE molecule's kernel = ``1 / V_eff``, the pipeline's ``expression_threshold``.
 
     ``scale`` is the kernel's OWN scale in the units ``vf_norm`` is measured in
-    (gaussian sigma, or the Epanechnikov support radius ``H`` -- convert with
-    :func:`epanechnikov_support`, never pass the gaussian bandwidth here).
+    (gaussian sigma, the support radius of a compact kernel, the exponential's decay
+    length -- convert with :func:`kernel_scale`, never pass the gaussian bandwidth here).
+    Every profile is 1 at the origin, so the peak is ``1 / kernel_norm``:
 
         gaussian       1 / (sqrt(2*pi) * sigma) ** ndim
         epanechnikov   3/(4H) [1D]   2/(pi H^2) [2D]   15/(8 pi H^3) [3D]
@@ -281,20 +504,15 @@ def kernel_peak(scale, ndim, kernel='gaussian'):
     2x it (a voxel holding less than two molecules' worth of evidence), and the
     LDA count reconstruction multiplies the density back up by ``V_eff = 1/peak``.
     Both come out wrong -- silently, by a factor of ~2 at the default bandwidth --
-    if the gaussian formula is applied to an Epanechnikov field.
+    if the gaussian formula is applied to another kernel's field.
     """
-    scale = float(scale); ndim = int(ndim)
-    if str(kernel).lower().startswith('epa'):
-        return float(1.0 / {1: (4.0 / 3.0) * scale,
-                            2: (np.pi / 2.0) * scale ** 2,
-                            3: (8.0 * np.pi / 15.0) * scale ** 3}[ndim])
-    return float(1.0 / (np.sqrt(2 * np.pi) * scale) ** ndim)
+    return float(1.0 / kernel_norm(scale, ndim, kernel))
 
 
 def compute_vf_blur(analysis, bin_adata, *, sigma_bin: float = 1.0,
                     chunk_h: int = 64, chunk_w: int = 512, bin_size_um: float = 2.0,
                     sampling_distance: float = None, prune_coefficient: float = 4.3,
-                    kernel: str = "epanechnikov",
+                    kernel: str = "gaussian",
                     size_after_normalization: float = 10.0,
                     store_chunk=32,
                     device: str = "cuda") -> None:
@@ -338,16 +556,19 @@ def compute_vf_blur(analysis, bin_adata, *, sigma_bin: float = 1.0,
     :type bin_size_um: float
     :param sampling_distance: output vector-field grid spacing in microns; defaults to ``bin_size_um``.
     :type sampling_distance: float
-    :param prune_coefficient: kernel truncation radius in units of sigma (gaussian only).
+    :param prune_coefficient: truncation radius of the infinite-support kernels in
+        units of sigma (gaussian; the exponential is cut at the same relative height).
     :type prune_coefficient: float
-    :param kernel: ``'epanechnikov'`` (default) or ``'gaussian'``. ``sigma_bin`` keeps
-        the same meaning for both -- the Epanechnikov support is derived from it by
-        variance matching, ``H = sigma_bin * sqrt(6)`` bins -- so the two produce
-        near-identical fields. Not separable, so it runs as one dense conv, whose cost
-        grows with the SQUARE of the radius while the gaussian's separable pair grows
-        linearly. Below ``sigma_bin`` about 6 the Epanechnikov's smaller radius still
-        wins (~0.8x at 1-4); above it the gaussian pulls ahead (2.3x at 16). On a
-        wide blur, pass ``kernel='gaussian'``.
+    :param kernel: one of :data:`KDE_KERNELS` -- ``'gaussian'`` (default),
+        ``'tophat'``, ``'epanechnikov'``, ``'exponential'``, ``'linear'``,
+        ``'cosine'``. ``sigma_bin`` keeps the same meaning for all of them: each
+        kernel's own scale is derived from it by variance matching
+        (:func:`kernel_scale`, e.g. the Epanechnikov support ``H = sigma_bin *
+        sqrt(6)`` bins), so they smooth over the same width. Only the gaussian is
+        separable; the others run as one dense conv, whose cost grows with the
+        SQUARE of the radius while the gaussian's separable pair grows linearly.
+        Below ``sigma_bin`` about 6 a compact kernel's smaller radius still wins
+        (~0.8x at 1-4 for the Epanechnikov); above it the gaussian pulls ahead.
     :type kernel: str
     :param size_after_normalization: L1 scale applied before ``log1p``.
     :type size_after_normalization: float
@@ -373,16 +594,14 @@ def compute_vf_blur(analysis, bin_adata, *, sigma_bin: float = 1.0,
     bw_um = float(sigma_bin * bin_size_um)
     out_R = (n_R + stride - 1) // stride
     out_C = (n_C + stride - 1) // stride
-    _epa = str(kernel).lower().startswith('epa')
-    if _epa:
-        kx, radius = _epanechnikov_kernel_2d(sigma_bin, device)
-        ky = None
-    elif str(kernel).lower().startswith('gauss'):
+    kernel = resolve_kernel(kernel)
+    if kernel == 'gaussian':
         kx, ky, radius = _gaussian_kernel_1d(sigma_bin, device, prune_coefficient)
     else:
-        raise ValueError(f"unknown kernel {kernel!r}; use 'gaussian' or 'epanechnikov'")
+        kx, radius = _radial_kernel_2d(sigma_bin, kernel, device, prune_coefficient)
+        ky = None
     # the field's own smoothing scale, in the units vf_norm lives in (bins -> µm)
-    kde_scale_bin = (epanechnikov_support(sigma_bin, 2) if _epa else float(sigma_bin))
+    kde_scale_bin = kernel_scale(sigma_bin, 2, kernel)
     blur_dtype = torch.float32
     chunk_w = max(1, int(chunk_w))
     row_order = np.argsort(R, kind="stable")
@@ -425,7 +644,7 @@ def compute_vf_blur(analysis, bin_adata, *, sigma_bin: float = 1.0,
     zg.attrs["sampling_distance"] = sd_um
     zg.attrs["stride"] = int(stride)
     zg.attrs["prune_coefficient"] = float(prune_coefficient)
-    zg.attrs["kde_kernel"] = 'epanechnikov' if _epa else 'gaussian'
+    zg.attrs["kde_kernel"] = kernel
     zg.attrs["size_after_normalization"] = float(size_after_normalization)
     zg.attrs["backend"] = "blur"
 
@@ -773,8 +992,8 @@ def analytic_vf_norm_threshold(zg, mult: float = 2.0) -> float:
     * transcript backend: ``vf_norm`` is per µm^ndim and the blur is the
       bandwidth in **µm** -> ``mult / (sqrt(2*pi) * bandwidth)^ndim``
 
-    ``attrs['kde_kernel'] == 'epanechnikov'`` swaps in that kernel's peak
-    (:func:`kernel_peak`) instead; the stored scale is already its support radius.
+    Any other ``attrs['kde_kernel']`` swaps in that kernel's peak
+    (:func:`kernel_peak`) instead; the stored scale is already the kernel's own.
 
     Mixing the two is a factor of ``bin_size_um^ndim`` (4x at 2 µm bins in 2D).
 
@@ -785,16 +1004,14 @@ def analytic_vf_norm_threshold(zg, mult: float = 2.0) -> float:
     kern = a.get('kde_kernel', 'gaussian')
     sigma_bin = a.get('sigma_bin')
     if sigma_bin:
-        scale = epanechnikov_support(sigma_bin, 2) \
-            if str(kern).lower().startswith('epa') else float(sigma_bin)
-        return float(mult * kernel_peak(scale, 2, kern))
+        return float(mult * kernel_peak(kernel_scale(sigma_bin, 2, kern), 2, kern))
     bandwidth = a.get('bandwidth', a.get('bandwidth_um'))
     if bandwidth is None and 'vf_params' in zg:
         vp = np.asarray(zg['vf_params'][:]).ravel()
         bandwidth = float(vp[1]) if vp.size > 1 else None
     if bandwidth:
-        # vf_params[1] / attrs['bandwidth'] store the kernel's OWN scale (H for the
-        # Epanechnikov), so no conversion here -- only the peak formula changes.
+        # vf_params[1] / attrs['bandwidth'] store the kernel's OWN scale (H for a
+        # compact kernel), so no conversion here -- only the peak formula changes.
         ndim = int(a.get('ndim', 2))
         return float(mult * kernel_peak(bandwidth, ndim, kern))
     return 0.0

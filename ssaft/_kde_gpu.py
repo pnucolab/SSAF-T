@@ -37,6 +37,28 @@ except ImportError:
 
 if _HAS_TRITON:
     @triton.jit
+    def _kde_weight(r2, two_h2, inv_norm, Rw2, inv_scale, KERN: tl.constexpr):
+        """One molecule's weight at squared distance ``r2`` (the caller masks r2 > Rw2).
+
+        ``KERN`` is the id in ``ssaft._count.KDE_KERNELS``. The gaussian and
+        Epanechnikov lines are the expressions these kernels have always used (the
+        Epanechnikov's support H is ``sqrt(Rw2)``), so their results are unchanged.
+        """
+        if KERN == 0:        # gaussian
+            w = tl.exp(-r2 / two_h2) * inv_norm
+        elif KERN == 1:      # tophat
+            w = r2 * 0.0 + inv_norm
+        elif KERN == 2:      # epanechnikov 1 - (r/H)^2
+            w = (1.0 - r2 / Rw2) * inv_norm
+        elif KERN == 3:      # exponential exp(-r/lambda)
+            w = tl.exp(-tl.sqrt(r2) * inv_scale) * inv_norm
+        elif KERN == 4:      # linear 1 - r/H
+            w = (1.0 - tl.sqrt(r2) * inv_scale) * inv_norm
+        else:                # cosine cos(pi r / 2H)
+            w = tl.cos(1.5707963267948966 * tl.sqrt(r2) * inv_scale) * inv_norm
+        return w
+
+    @triton.jit
     def _kde_cell_kernel(
         qx_ptr, qy_ptr,
         sx_ptr, sy_ptr, sg_ptr,
@@ -44,8 +66,8 @@ if _HAS_TRITON:
         out_ptr,
         N, n_genes, W, H, Rp,
         x_min, y_min,
-        inv_sd, two_h2, inv_norm, Rw2,
-        BLOCK_T: tl.constexpr, EPA: tl.constexpr,
+        inv_sd, two_h2, inv_norm, Rw2, inv_scale,
+        BLOCK_T: tl.constexpr, KERN: tl.constexpr,
     ):
         pid = tl.program_id(0)
         if pid >= N:
@@ -77,11 +99,7 @@ if _HAS_TRITON:
                             dy = ty - qy
                             r2 = dx * dx + dy * dy
                             keep = mask & (r2 <= Rw2) & (tg >= 0) & (tg < n_genes)
-                            if EPA:
-                                # 1 - (r/H)^2 on the ball, zero outside; Rw2 = H^2
-                                w = (1.0 - r2 / Rw2) * inv_norm
-                            else:
-                                w = tl.exp(-r2 / two_h2) * inv_norm
+                            w = _kde_weight(r2, two_h2, inv_norm, Rw2, inv_scale, KERN)
                             tl.atomic_add(out_row + tg,
                                           tl.cast(w, tl.float32),
                                           mask=keep)
@@ -94,8 +112,8 @@ if _HAS_TRITON:
         out_ptr,
         N, n_genes, W, H, D, Rp,
         x_min, y_min, z_min,
-        inv_sd, two_h2, inv_norm, Rw2,
-        BLOCK_T: tl.constexpr, EPA: tl.constexpr,
+        inv_sd, two_h2, inv_norm, Rw2, inv_scale,
+        BLOCK_T: tl.constexpr, KERN: tl.constexpr,
     ):
         pid = tl.program_id(0)
         if pid >= N:
@@ -135,10 +153,7 @@ if _HAS_TRITON:
                                     dz = tz - qz
                                     r2 = dx * dx + dy * dy + dz * dz
                                     keep = mask & (r2 <= Rw2) & (tg >= 0) & (tg < n_genes)
-                                    if EPA:
-                                        w = (1.0 - r2 / Rw2) * inv_norm
-                                    else:
-                                        w = tl.exp(-r2 / two_h2) * inv_norm
+                                    w = _kde_weight(r2, two_h2, inv_norm, Rw2, inv_scale, KERN)
                                     tl.atomic_add(out_row + tg,
                                                   tl.cast(w, tl.float32),
                                                   mask=keep)
@@ -193,7 +208,7 @@ def kde_at_points_gpu(
     gene_indices, n_genes,
     sampling_distance, bandwidth, prune_coefficient,
     dim, ncores=None,
-    device='cuda', kernel='epanechnikov',
+    device='cuda', kernel='gaussian', _split=True, _grid_origin=None, _qbatch=True,
 ):
     """
     GPU equivalent of ``ssaft.utils.kde_at_points`` (2D and 3D).
@@ -219,12 +234,16 @@ def kde_at_points_gpu(
     :type n_genes: int
     :param sampling_distance: cell-list grid spacing.
     :type sampling_distance: float
-    :param bandwidth: Gaussian KDE bandwidth.
+    :param bandwidth: gaussian-equivalent KDE bandwidth; each kernel's own scale is
+        matched to it on variance (:func:`ssaft._count.kernel_scale`).
     :type bandwidth: float
-    :param prune_coefficient: kernel truncation radius in units of bandwidth
-        (gaussian only -- the Epanechnikov's radius is its own support).
-    :param kernel: ``'epanechnikov'`` (default) or ``'gaussian'``.
+    :param prune_coefficient: truncation radius of the infinite-support kernels in
+        units of bandwidth (gaussian; the exponential is cut at the same relative
+        height). The compact kernels stop at their own support.
     :type prune_coefficient: float
+    :param kernel: one of ``ssaft._count.KDE_KERNELS``; ``'gaussian'`` (default),
+        ``'tophat'``, ``'epanechnikov'``, ``'exponential'``, ``'linear'``, ``'cosine'``.
+    :type kernel: str
     :param dim: spatial dimensionality (2 or 3).
     :type dim: int
     :param ncores: accepted for signature parity with the C++ path; ignored.
@@ -238,33 +257,73 @@ def kde_at_points_gpu(
         raise NotImplementedError(
             f"kde_at_points_gpu supports dim=2 or 3, got dim={dim}.")
 
-    # ``bandwidth`` is gaussian-equivalent for both kernels; the Epanechnikov's own
-    # scale is the support radius it reaches zero at, and prune_coefficient does not
-    # apply to it (see ssaft._count.epanechnikov_support).
-    epa = str(kernel).lower().startswith('epa')
-    if epa:
-        from ._count import epanechnikov_support
-        Rw = epanechnikov_support(bandwidth, dim)
-        norm = {1: (4.0 / 3.0) * Rw,
-                2: (math.pi / 2.0) * Rw ** 2,
-                3: (8.0 * math.pi / 15.0) * Rw ** 3}[int(dim)]
-    elif str(kernel).lower().startswith('gauss'):
-        Rw = bandwidth * prune_coefficient
-        norm = (2.0 * math.pi * bandwidth * bandwidth) ** (0.5 * dim)
-    else:
-        raise ValueError(f"unknown kernel {kernel!r}; use 'gaussian' or 'epanechnikov'")
+    # ``bandwidth`` is gaussian-equivalent for every kernel; the kernel's own scale,
+    # reach and norm come from the one table in ssaft._count
+    from ._count import (resolve_kernel, kernel_code, kernel_scale, kernel_reach,
+                         kernel_norm, kernel_search_cells)
+    kernel = resolve_kernel(kernel)
+    kcode = kernel_code(kernel)
+    scale = kernel_scale(bandwidth, dim, kernel)
+    Rw = kernel_reach(scale, kernel, prune_coefficient)
     Rw2 = Rw * Rw
-    two_h2 = 2.0 * bandwidth * bandwidth
-    inv_norm = 1.0 / norm
+    two_h2 = 2.0 * scale * scale
+    inv_scale = 1.0 / scale
+    inv_norm = 1.0 / kernel_norm(scale, dim, kernel)
     inv_sd = 1.0 / sampling_distance
-    Rp = int(math.floor(Rw / sampling_distance + 1e-12))
+    Rp = kernel_search_cells(Rw, sampling_distance, kernel)
 
-    lx_g = torch.as_tensor(loc_x, dtype=torch.float64, device=device).contiguous()
-    ly_g = torch.as_tensor(loc_y, dtype=torch.float64, device=device).contiguous()
-    gi_g = torch.as_tensor(np.asarray(gene_indices, dtype=np.int64),
-                           device=device).contiguous()
-    qx_g = torch.as_tensor(query_x, dtype=torch.float64, device=device).contiguous()
-    qy_g = torch.as_tensor(query_y, dtype=torch.float64, device=device).contiguous()
+    # the (queries x genes) output alone can exceed the card (a 5k-gene panel: ~23 GB for one plane's
+    # anchors): score the queries in batches that fit, on the cell grid the whole query set would have
+    # had, so every batch sees exactly the transcripts the single call would
+    n_q = len(query_x)
+    if _qbatch and n_q:
+        free = torch.cuda.mem_get_info(torch.device(device))[0]
+        max_q = max(1, int(0.25 * free) // (4 * max(int(n_genes), 1)))
+        if n_q > max_q:
+            lx_, ly_ = np.asarray(loc_x, dtype=np.float64), np.asarray(loc_y, dtype=np.float64)
+            qx_, qy_ = np.asarray(query_x, dtype=np.float64), np.asarray(query_y, dtype=np.float64)
+            origin = _grid_origin
+            if origin is None:
+                oz = 0.0
+                if int(dim) == 3:
+                    oz = float(min(np.min(loc_z), np.min(query_z))) - Rw - sampling_distance
+                origin = (float(min(lx_.min(), qx_.min())) - Rw - sampling_distance,
+                          float(min(ly_.min(), qy_.min())) - Rw - sampling_distance, oz)
+            qz_ = np.asarray(query_z, dtype=np.float64) if int(dim) == 3 else query_z
+            out = np.empty((n_q, int(n_genes)), dtype=np.float32)
+            for s0 in range(0, n_q, max_q):
+                s1 = min(n_q, s0 + max_q)
+                out[s0:s1] = kde_at_points_gpu(
+                    qx_[s0:s1], qy_[s0:s1], (qz_[s0:s1] if int(dim) == 3 else query_z),
+                    loc_x, loc_y, loc_z, gene_indices, n_genes,
+                    sampling_distance, bandwidth, prune_coefficient, dim,
+                    device=device, kernel=kernel, _split=_split, _grid_origin=origin, _qbatch=False)
+            return out
+
+    try:
+        lx_g = torch.as_tensor(loc_x, dtype=torch.float64, device=device).contiguous()
+        ly_g = torch.as_tensor(loc_y, dtype=torch.float64, device=device).contiguous()
+        gi_g = torch.as_tensor(np.asarray(gene_indices, dtype=np.int64),
+                               device=device).contiguous()
+        qx_g = torch.as_tensor(query_x, dtype=torch.float64, device=device).contiguous()
+        qy_g = torch.as_tensor(query_y, dtype=torch.float64, device=device).contiguous()
+        if int(dim) == 3:
+            lz_g = torch.as_tensor(loc_z, dtype=torch.float64, device=device).contiguous()
+            qz_g = torch.as_tensor(query_z, dtype=torch.float64, device=device).contiguous()
+    except torch.cuda.OutOfMemoryError:
+        # not even the inputs fit (the GPU is shared): in 3D, two strips, each uploading only its
+        # own transcripts; the grid origin is the one the whole domain would have had
+        torch.cuda.empty_cache()
+        if int(dim) != 3 or not _split or len(query_x) == 0:
+            raise
+        lx_, ly_, lz_ = (np.asarray(v, dtype=np.float64) for v in (loc_x, loc_y, loc_z))
+        qx_, qy_, qz_ = (np.asarray(v, dtype=np.float64) for v in (query_x, query_y, query_z))
+        origin = (float(min(lx_.min(), qx_.min())) - Rw - sampling_distance,
+                  float(min(ly_.min(), qy_.min())) - Rw - sampling_distance,
+                  float(min(lz_.min(), qz_.min())) - Rw - sampling_distance)
+        return _kde_3d_in_strips(qx_, qy_, qz_, lx_, ly_, lz_, gene_indices, n_genes,
+                                 sampling_distance, bandwidth, prune_coefficient, device, kernel,
+                                 pad=Rw + 2 * sampling_distance, n_strips=2, origin=origin)
 
     N = qx_g.shape[0]
     if N == 0:
@@ -274,6 +333,11 @@ def kde_at_points_gpu(
     y_min = float(min(ly_g.min().item(), qy_g.min().item())) - Rw - sampling_distance
     x_max = float(max(lx_g.max().item(), qx_g.max().item())) + Rw + sampling_distance
     y_max = float(max(ly_g.max().item(), qy_g.max().item())) + Rw + sampling_distance
+    if _grid_origin is not None:
+        # a strip of a larger domain: put its cells exactly where the whole domain's cells are,
+        # so the neighbour-cell search (floor(Rw / sd) cells) includes the same transcripts
+        x_min = _grid_origin[0] + math.floor((x_min - _grid_origin[0]) * inv_sd) * sampling_distance
+        y_min = _grid_origin[1] + math.floor((y_min - _grid_origin[1]) * inv_sd) * sampling_distance
     W = int(math.ceil((x_max - x_min) * inv_sd)) + 1
     H = int(math.ceil((y_max - y_min) * inv_sd)) + 1
 
@@ -291,40 +355,134 @@ def kde_at_points_gpu(
                 out,
                 N, n_genes, W, H, Rp,
                 x_min, y_min,
-                inv_sd, two_h2, inv_norm, Rw2,
-                BLOCK_T=32, EPA=1 if epa else 0,
+                inv_sd, two_h2, inv_norm, Rw2, inv_scale,
+                BLOCK_T=32, KERN=kcode,
             )
     else:
-        lz_g = torch.as_tensor(loc_z, dtype=torch.float64, device=device).contiguous()
-        qz_g = torch.as_tensor(query_z, dtype=torch.float64, device=device).contiguous()
         z_min = float(min(lz_g.min().item(), qz_g.min().item())) - Rw - sampling_distance
         z_max = float(max(lz_g.max().item(), qz_g.max().item())) + Rw + sampling_distance
+        if _grid_origin is not None:
+            z_min = _grid_origin[2] + math.floor((z_min - _grid_origin[2]) * inv_sd) * sampling_distance
         D = int(math.ceil((z_max - z_min) * inv_sd)) + 1
 
         n_cells = W * H * D
         cell_bytes = (n_cells + 1) * 4
-        if cell_bytes > (8 << 30):
+        if cell_bytes > _MAX_CELL_LIST_BYTES and not _split:
             raise RuntimeError(
-                f"3D cell list too large: W={W}, H={H}, D={D} → "
-                f"{cell_bytes / (1 << 30):.1f} GiB. "
-                f"Tile the input or use force_2d=True.")
+                f"3D cell list too large even for one strip: W={W}, H={H}, D={D} -> "
+                f"{cell_bytes / (1 << 30):.1f} GiB")
+        if cell_bytes > _MAX_CELL_LIST_BYTES:
+            # the cell list spans the whole domain and lives on the GPU; split the queries into x
+            # strips instead, each with only the transcripts within the kernel radius of it. A
+            # query's value depends only on those transcripts, so the result is unchanged.
+            del out, lx_g, ly_g, lz_g, gi_g, qx_g, qy_g, qz_g     # the strips upload their own subsets
+            torch.cuda.empty_cache()
+            n_strips = int(math.ceil(cell_bytes / _STRIP_CELL_LIST_BYTES))
+            return _kde_3d_in_strips(query_x, query_y, query_z, loc_x, loc_y, loc_z,
+                                     gene_indices, n_genes, sampling_distance, bandwidth,
+                                     prune_coefficient, device, kernel,
+                                     pad=Rw + 2 * sampling_distance, n_strips=n_strips,
+                                     origin=(x_min, y_min, z_min))
 
-        sx, sy, sz, sg, cell_start = _build_cell_list_3d(
-            lx_g, ly_g, lz_g, gi_g, sampling_distance,
-            x_min, y_min, z_min, W, H, D,
-        )
-        with torch.cuda.device(qx_g.device):
-            _kde_cell_kernel_3d[(N,)](
-                qx_g, qy_g, qz_g,
-                sx, sy, sz, sg,
-                cell_start,
-                out,
-                N, n_genes, W, H, D, Rp,
-                x_min, y_min, z_min,
-                inv_sd, two_h2, inv_norm, Rw2,
-                BLOCK_T=32, EPA=1 if epa else 0,
+        try:
+            sx, sy, sz, sg, cell_start = _build_cell_list_3d(
+                lx_g, ly_g, lz_g, gi_g, sampling_distance,
+                x_min, y_min, z_min, W, H, D,
             )
+            with torch.cuda.device(qx_g.device):
+                _kde_cell_kernel_3d[(N,)](
+                    qx_g, qy_g, qz_g,
+                    sx, sy, sz, sg,
+                    cell_start,
+                    out,
+                    N, n_genes, W, H, D, Rp,
+                    x_min, y_min, z_min,
+                    inv_sd, two_h2, inv_norm, Rw2, inv_scale,
+                    BLOCK_T=32, KERN=kcode,
+                )
+        except torch.cuda.OutOfMemoryError:
+            if not _split:
+                raise                      # a strip: _kde_3d_in_strips halves it and retries
+            # the GPU is short (another job on it): the same computation in two strips
+            del out, lx_g, ly_g, lz_g, gi_g, qx_g, qy_g, qz_g
+            torch.cuda.empty_cache()
+            return _kde_3d_in_strips(query_x, query_y, query_z, loc_x, loc_y, loc_z,
+                                     gene_indices, n_genes, sampling_distance, bandwidth,
+                                     prune_coefficient, device, kernel,
+                                     pad=Rw + 2 * sampling_distance, n_strips=2,
+                                     origin=(x_min, y_min, z_min))
     return out.cpu().numpy()
+
+
+# Budgets for the int32 cell list; building it also needs int64 temporaries (the arange and the
+# searchsorted result), ~20 bytes per cell in all, so 1 GiB here is ~5 GiB of GPU memory at peak.
+_MAX_CELL_LIST_BYTES = 1 << 30       # a larger domain is split into x strips
+_STRIP_CELL_LIST_BYTES = 512 << 20   # target per strip
+
+
+def _wait_for_gpu_and_retry(fn, tries=60, wait_s=60):
+    """Call ``fn`` until it stops running out of GPU memory, waiting ``wait_s`` between attempts.
+
+    For the smallest KDE strip: when even that does not fit, the card is held by other jobs, and the
+    only way through is to wait for them to release memory (up to ``tries x wait_s`` seconds)."""
+    import time
+    for attempt in range(tries):
+        try:
+            return fn()
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+            if not isinstance(e, torch.cuda.OutOfMemoryError) and "out of memory" not in str(e):
+                raise
+            torch.cuda.empty_cache()
+            if attempt == tries - 1:
+                raise
+            time.sleep(wait_s)
+
+
+def _kde_3d_in_strips(query_x, query_y, query_z, loc_x, loc_y, loc_z, gene_indices, n_genes,
+                      sampling_distance, bandwidth, prune_coefficient, device, kernel, *,
+                      pad, n_strips, origin):
+    """3D KDE over x strips of the query points (see :func:`kde_at_points_gpu`)."""
+    qx = np.asarray(query_x, dtype=np.float64)
+    qy = np.asarray(query_y, dtype=np.float64)
+    qz = np.asarray(query_z, dtype=np.float64)
+    lx = np.asarray(loc_x, dtype=np.float64)
+    ly = np.asarray(loc_y, dtype=np.float64)
+    lz = np.asarray(loc_z, dtype=np.float64)
+    gi = np.asarray(gene_indices)
+    out = np.zeros((qx.shape[0], n_genes), dtype=np.float32)
+    edges = np.linspace(qx.min(), qx.max(), n_strips + 1)
+    for i in range(n_strips):
+        lo, hi = edges[i], edges[i + 1]
+        qm = (qx >= lo) & ((qx < hi) if i < n_strips - 1 else (qx <= hi))
+        if not qm.any():
+            continue
+        lm = (lx >= lo - pad) & (lx <= hi + pad)
+        if not lm.any():
+            continue
+        try:
+            out[qm] = kde_at_points_gpu(qx[qm], qy[qm], qz[qm], lx[lm], ly[lm], lz[lm], gi[lm],
+                                        n_genes, sampling_distance, bandwidth, prune_coefficient,
+                                        3, device=device, kernel=kernel, _split=False,
+                                        _grid_origin=origin)
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+            if not isinstance(e, torch.cuda.OutOfMemoryError) and "out of memory" not in str(e) \
+                    and "too large" not in str(e):
+                raise
+            # not enough GPU memory for this strip: halve it and retry (same numbers, smaller pieces)
+            torch.cuda.empty_cache()
+            if hi - lo > 2 * pad:
+                out[qm] = _kde_3d_in_strips(qx[qm], qy[qm], qz[qm], lx[lm], ly[lm], lz[lm], gi[lm],
+                                            n_genes, sampling_distance, bandwidth, prune_coefficient,
+                                            device, kernel, pad=pad, n_strips=2, origin=origin)
+                continue
+            # already as small as a strip gets: the card is full of other jobs' memory, and no
+            # smaller piece will fit -- wait for them to release it rather than fail the stage
+            out[qm] = _wait_for_gpu_and_retry(
+                lambda: kde_at_points_gpu(qx[qm], qy[qm], qz[qm], lx[lm], ly[lm], lz[lm], gi[lm],
+                                          n_genes, sampling_distance, bandwidth, prune_coefficient,
+                                          3, device=device, kernel=kernel, _split=False,
+                                          _grid_origin=origin))
+    return out
 
 
 @contextlib.contextmanager
@@ -368,11 +526,16 @@ def gpu_kde(device: str = 'cuda', fallback_3d_to_cpu: bool = False,
     original = _utils.kde_at_points
     warned_fallback = {'flag': False}
 
+    # Same signature as the compiled kde_at_points, ``kernel`` (its integer id) included.
+    # Dropping it would run every call at kde_at_points_gpu's own default kernel,
+    # whatever the caller asked for.
     def _wrapped(query_x, query_y, query_z,
                  loc_x, loc_y, loc_z,
                  gene_indices, n_genes,
                  sampling_distance, bandwidth, prune_coefficient,
-                 dim, ncores=None):
+                 dim, ncores=None, kernel=0):
+        from ._count import KDE_KERNELS
+        kname = KDE_KERNELS[int(kernel)]
         if int(dim) != 2:
             if force_2d:
                 qz0 = np.zeros_like(np.asarray(query_z, dtype=np.float64))
@@ -382,7 +545,7 @@ def gpu_kde(device: str = 'cuda', fallback_3d_to_cpu: bool = False,
                     loc_x, loc_y, lz0,
                     gene_indices, n_genes,
                     sampling_distance, bandwidth, prune_coefficient,
-                    2, device=device,
+                    2, device=device, kernel=kname,
                 )
             if fallback_3d_to_cpu:
                 if not warned_fallback['flag']:
@@ -398,13 +561,14 @@ def gpu_kde(device: str = 'cuda', fallback_3d_to_cpu: bool = False,
                     gene_indices, n_genes,
                     sampling_distance, bandwidth, prune_coefficient,
                     int(dim), int(ncores) if ncores is not None else 1,
+                    kernel=int(kernel),
                 )
         return kde_at_points_gpu(
             query_x, query_y, query_z,
             loc_x, loc_y, loc_z,
             gene_indices, n_genes,
             sampling_distance, bandwidth, prune_coefficient,
-            int(dim), device=device,
+            int(dim), device=device, kernel=kname,
         )
 
     _utils.kde_at_points = _wrapped

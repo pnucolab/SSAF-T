@@ -13,7 +13,7 @@ final cell-type map is written back into either as ``labels['ssaft_celltype_map'
 """
 
 from ._grid import aggregate_to_grid, fit_affine_lstsq
-from ._loaders import load_strata, load_visiumhd
+from ._loaders import from_visiumhd, load_strata, load_visiumhd
 
 LOADERS = {
     "visiumhd": load_visiumhd,
@@ -42,5 +42,5 @@ def load(platform: str, *args, **kwargs):
 
 __all__ = [
     "aggregate_to_grid", "fit_affine_lstsq",
-    "load_visiumhd", "load_strata", "load", "LOADERS",
+    "load_visiumhd", "from_visiumhd", "load_strata", "load", "LOADERS",
 ]

@@ -42,27 +42,27 @@ def _kde_setup_celllist(loc_x_t, loc_y_t, loc_z_t, gi_t,
                         chunk_q_xmin, chunk_q_ymin, chunk_q_zmin,
                         chunk_q_xmax, chunk_q_ymax, chunk_q_zmax,
                         sampling_distance, bandwidth, prune_coefficient,
-                        dim, kernel='epanechnikov'):
+                        dim, kernel='gaussian'):
     """Build a cell-list spanning the chunk's query bbox + transcripts.
 
     Returns a state dict consumed by :func:`_kde_run_subchunk`, or
     ``None`` when there are no transcripts (caller treats the result
     as all-zero KDE).
 
-    :param kernel: ``'epanechnikov'`` (default) or ``'gaussian'``. The gaussian has
-        no compact support and is truncated at ``bandwidth * prune_coefficient``;
-        the Epanechnikov reaches zero on its own at ``H = bandwidth``, so
-        ``prune_coefficient`` is ignored for it and the reach is ``bandwidth``.
-        Pass the CONVERTED bandwidth for the Epanechnikov -- see
-        :func:`ssaft._count.epanechnikov_support`.
+    :param kernel: one of ``ssaft._count.KDE_KERNELS`` (default ``'gaussian'``).
+        ``bandwidth`` here is the kernel's OWN scale, already converted from the
+        gaussian-equivalent one (:func:`ssaft._count.kernel_scale`); the reach is
+        :func:`ssaft._count.kernel_reach` of it, so ``prune_coefficient`` matters
+        only for the gaussian and the exponential.
     """
     if not _HAS_TRITON:
         raise ImportError("_kde_setup_celllist requires torch + triton.")
     if loc_x_t.shape[0] == 0:
         return None
 
-    epa = str(kernel).lower().startswith('epa')
-    Rw = bandwidth if epa else bandwidth * prune_coefficient
+    from ._count import resolve_kernel, kernel_reach
+    kernel = resolve_kernel(kernel)
+    Rw = kernel_reach(bandwidth, kernel, prune_coefficient)
     inv_sd = 1.0 / sampling_distance
 
     x_min = float(min(loc_x_t.min().item(), chunk_q_xmin)) - Rw - sampling_distance
@@ -77,7 +77,7 @@ def _kde_setup_celllist(loc_x_t, loc_y_t, loc_z_t, gi_t,
         'sampling_distance': float(sampling_distance),
         'bandwidth': float(bandwidth),
         'prune_coefficient': float(prune_coefficient),
-        'epa': bool(epa),
+        'kernel': kernel,
         'x_min': x_min, 'y_min': y_min, 'W': W, 'H': H,
     }
 
@@ -99,6 +99,39 @@ def _kde_setup_celllist(loc_x_t, loc_y_t, loc_z_t, gi_t,
     return state
 
 
+def _kde_nonzero_queries(loc_x, loc_y, loc_z, x0, nx, ny, nz, sampling_distance, reach,
+                         kernel='gaussian'):
+    """Which voxels of a query slab can have a nonzero KDE: flat (C-order ``(nx, ny, nz)``) bool.
+
+    ``_kde_run_subchunk`` sums only transcripts in the cells within
+    :func:`ssaft._count.kernel_search_cells` of the query's cell, so a voxel with no transcript
+    in a cube of half-width that + 2 voxels around it (the +2 absorbs the cell grid's own
+    origin) is exactly zero; skipping it changes nothing. On a 3D section most of the bounding box is such voxels (XEN010: ~70%).
+    The occupancy grid is dilated with three separable 1D max-pools on the device.
+    Query voxel ``(i, j, k)`` of the slab sits at ``((x0 + i) sd, j sd, k sd)`` in the frame of
+    ``loc_*`` (the frame the queries are built in).
+    """
+    import torch.nn.functional as F
+    from ._count import kernel_search_cells
+    r = kernel_search_cells(reach, sampling_distance, kernel) + 2
+    dev = loc_x.device
+    ix = torch.floor(loc_x / sampling_distance).long() - (x0 - r)
+    iy = torch.floor(loc_y / sampling_distance).long() + r
+    iz = (torch.floor(loc_z / sampling_distance).long() + r) if loc_z is not None else \
+        torch.full_like(ix, r)
+    px, py, pz = nx + 2 * r, ny + 2 * r, nz + 2 * r
+    ok = (ix >= 0) & (ix < px) & (iy >= 0) & (iy < py) & (iz >= 0) & (iz < pz)
+    occ = torch.zeros((px, py, pz), dtype=torch.float16, device=dev)
+    occ[ix[ok], iy[ok], iz[ok]] = 1
+    del ix, iy, iz, ok
+    k = 2 * r + 1
+    g = occ[None, None]
+    g = F.max_pool3d(g, (k, 1, 1), stride=1)
+    g = F.max_pool3d(g, (1, k, 1), stride=1)
+    g = F.max_pool3d(g, (1, 1, k), stride=1)
+    return (g[0, 0] > 0).reshape(-1).cpu().numpy()
+
+
 def _kde_run_subchunk(state, qx, qy, qz, n_genes, device):
     """Run KDE for a sub-chunk of query points using ``state``.
 
@@ -115,25 +148,20 @@ def _kde_run_subchunk(state, qx, qy, qz, n_genes, device):
 
     qy_g = torch.as_tensor(qy, dtype=torch.float64, device=device).contiguous()
 
-    bw = state['bandwidth']
+    from ._count import kernel_code, kernel_reach, kernel_norm, kernel_search_cells
+    bw = state['bandwidth']              # the kernel's own scale
     pc = state['prune_coefficient']
     sd = state['sampling_distance']
-    epa = bool(state.get('epa', False))
+    kernel = state.get('kernel', 'gaussian')
+    kcode = kernel_code(kernel)
     dim = state['dim']
-    Rw = bw if epa else bw * pc
+    Rw = kernel_reach(bw, kernel, pc)
     Rw2 = Rw * Rw
     two_h2 = 2.0 * bw * bw
-    if epa:
-        # unit-mass Epanechnikov on the ball of radius H = bw:
-        #   1D 3/(4H)  ·  2D 2/(pi H^2)  ·  3D 15/(8 pi H^3)
-        norm_const = {1: (4.0 / 3.0) * bw,
-                      2: (math.pi / 2.0) * bw ** 2,
-                      3: (8.0 * math.pi / 15.0) * bw ** 3}[int(dim)]
-    else:
-        norm_const = (2.0 * math.pi * bw * bw) ** (0.5 * dim)
-    inv_norm = 1.0 / norm_const
+    inv_scale = 1.0 / bw
+    inv_norm = 1.0 / kernel_norm(bw, dim, kernel)
     inv_sd = 1.0 / sd
-    Rp = int(math.floor(Rw / sd + 1e-12))
+    Rp = kernel_search_cells(Rw, sd, kernel)
 
     out = torch.zeros((N, n_genes), dtype=torch.float32, device=device)
 
@@ -145,8 +173,8 @@ def _kde_run_subchunk(state, qx, qy, qz, n_genes, device):
                 out,
                 N, n_genes, state['W'], state['H'], Rp,
                 state['x_min'], state['y_min'],
-                inv_sd, two_h2, inv_norm, Rw2,
-                BLOCK_T=32, EPA=1 if epa else 0,
+                inv_sd, two_h2, inv_norm, Rw2, inv_scale,
+                BLOCK_T=32, KERN=kcode,
             )
     else:
         qz_g = torch.as_tensor(qz, dtype=torch.float64, device=device).contiguous()
@@ -157,8 +185,8 @@ def _kde_run_subchunk(state, qx, qy, qz, n_genes, device):
                 out,
                 N, n_genes, state['W'], state['H'], state['D'], Rp,
                 state['x_min'], state['y_min'], state['z_min'],
-                inv_sd, two_h2, inv_norm, Rw2,
-                BLOCK_T=32, EPA=1 if epa else 0,
+                inv_sd, two_h2, inv_norm, Rw2, inv_scale,
+                BLOCK_T=32, KERN=kcode,
             )
     return out
 

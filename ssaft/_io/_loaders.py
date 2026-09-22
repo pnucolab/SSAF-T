@@ -31,12 +31,12 @@ from ._grid import fit_affine_lstsq
 
 def load_visiumhd(path: str | Path, *, species: str = "mouse",
                   organ: str = "small_intestine", bin_um: int = 2,
-                  fullres_image_file: Optional[str] = None) -> GridDataset:
+                  fullres_image_file: Optional[str] = None):
     """Load a 10x Visium HD ``outs/`` directory at the ``bin_um`` µm bin.
 
-    Uses ``spatialdata_io.visium_hd`` for the counts + fullres H&E, and fits a
-    lattice-to-pixel affine from the bin's ``tissue_positions`` (array_col/row to
-    pxl_col/row) on the SAME lattice the vector field uses.
+    Convenience wrapper: reads the directory with ``spatialdata_io.visium_hd`` and
+    converts the result with :func:`from_visiumhd`. If you already hold that
+    SpatialData, call :func:`from_visiumhd` on it directly.
 
     :param path: Path to the Visium HD ``outs/`` directory.
     :type path: str or pathlib.Path
@@ -48,42 +48,85 @@ def load_visiumhd(path: str | Path, *, species: str = "mouse",
     :type bin_um: int
     :param fullres_image_file: Optional path to an explicit fullres image file.
     :type fullres_image_file: str, optional
+    :returns: The count SpatialData (see :func:`from_visiumhd`).
+    :rtype: spatialdata.SpatialData
     """
-    import pandas as pd
     import spatialdata_io
 
-    path = Path(path)
     kw = {}
     if fullres_image_file is not None:
         kw["fullres_image_file"] = fullres_image_file
     sdata = spatialdata_io.visium_hd(str(path), bin_size=bin_um,
                                      load_all_images=True, **kw)
+    um_per_px = None
+    sf = Path(path) / "binned_outputs" / f"square_{bin_um:03d}um" / "spatial" / "scalefactors_json.json"
+    if sf.exists():
+        import json
+        um_per_px = json.loads(sf.read_text()).get("microns_per_pixel")
+    return from_visiumhd(sdata, species=species, organ=organ, bin_um=bin_um, um_per_px=um_per_px)
 
+
+def from_visiumhd(sdata, *, species: str, organ: str, bin_um: int = 2,
+                  table_key: Optional[str] = None, image_key: Optional[str] = None,
+                  um_per_px: Optional[float] = None):
+    """Convert a ``spatialdata_io.visium_hd`` SpatialData into the SSAF-T count layout.
+
+    Takes the ``bin_um`` µm bin table, keeps the in-tissue bins, places each bin at
+    ``(array_col, array_row) * bin_um`` µm, and fits the image-pixel -> µm affine from
+    the bins' ``(array_col, array_row)`` against their full-resolution pixel positions
+    (``obsm['spatial']`` as ``spatialdata_io`` stores it), on the same lattice the
+    vector field uses.
+
+    :param sdata: SpatialData returned by ``spatialdata_io.visium_hd`` (loaded with the
+        ``bin_um`` bin size).
+    :type sdata: spatialdata.SpatialData
+    :param species: Species name used for marker-panel lookup.
+    :type species: str
+    :param organ: Cell-Ontology module name for the gene panel.
+    :type organ: str
+    :param bin_um: Bin size in µm; selects the ``square_{bin_um:03d}um`` table.
+    :type bin_um: int
+    :param table_key: Bin table key; defaults to the table whose key contains
+        ``square_{bin_um:03d}um``.
+    :type table_key: str, optional
+    :param image_key: Staining image key; defaults to the full-resolution image (a key
+        containing ``full``), else the first image.
+    :type image_key: str, optional
+    :param um_per_px: µm per full-resolution pixel. It sets the tissue-mask sampling density in
+        ``downsample_vector``. Defaults to the scale of the fitted affine; Space Ranger's
+        ``scalefactors_json.json`` ``microns_per_pixel`` differs from it in the fourth decimal,
+        and :func:`load_visiumhd` passes that value so earlier runs reproduce exactly.
+    :type um_per_px: float, optional
+    :returns: SpatialData with ``tables['table']`` (bins x genes, ``obsm['spatial']`` in
+        µm, metadata in ``uns['cellman']``) and ``images['staining']`` (the H&E with its
+        pixel -> µm Affine).
+    :rtype: spatialdata.SpatialData
+    """
     suffix = f"square_{bin_um:03d}um"
-    tkey = next((k for k in sdata.tables if suffix in k), None)
+    tkey = table_key or next((k for k in sdata.tables if suffix in k), None)
     if tkey is None:
         raise RuntimeError(f"no {bin_um}µm table; have {list(sdata.tables)}")
     adata = sdata.tables[tkey].copy()
     adata.var_names_make_unique()
-
-    pos_path = path / "binned_outputs" / suffix / "spatial" / "tissue_positions.parquet"
-    pos = pd.read_parquet(pos_path).set_index("barcode")
-    common = adata.obs_names.intersection(pos.index)
-    adata = adata[common].copy()
-    pos = pos.loc[common]
-    for c in ("array_row", "array_col", "in_tissue",
-              "pxl_col_in_fullres", "pxl_row_in_fullres"):
-        if c in pos.columns:
-            adata.obs[c] = pos[c].to_numpy()
+    missing = [c for c in ("array_row", "array_col") if c not in adata.obs]
+    if missing or "spatial" not in adata.obsm:
+        raise RuntimeError(f"table {tkey!r} lacks {missing or ['obsm[spatial]']}; "
+                           "pass the SpatialData returned by spatialdata_io.visium_hd")
+    px = np.asarray(adata.obsm["spatial"], dtype=np.float64)       # (pxl_col, pxl_row)
     if "in_tissue" in adata.obs:
-        adata = adata[adata.obs["in_tissue"].astype(bool)].copy()
+        keep = adata.obs["in_tissue"].astype(bool).to_numpy()
+        adata, px = adata[keep].copy(), px[keep]
+    array_col = adata.obs["array_col"].to_numpy()
+    array_row = adata.obs["array_row"].to_numpy()
 
-    adata.obsm["spatial"] = np.stack(
-        [adata.obs["array_col"].to_numpy(), adata.obs["array_row"].to_numpy()],
-        axis=1).astype(np.float64) * bin_um
+    adata.obsm["spatial"] = np.stack([array_col, array_row], axis=1).astype(np.float64) * bin_um
+    for c in ("region", "location_id"):                              # TableModel annotation
+        if c in adata.obs:
+            del adata.obs[c]
+    adata.uns.pop("spatialdata_attrs", None)
 
-    imgkey = next((k for k in sdata.images if "full" in k), next(iter(sdata.images)))
-    img_el = sdata.images[imgkey]
+    ikey = image_key or next((k for k in sdata.images if "full" in k), next(iter(sdata.images)))
+    img_el = sdata.images[ikey]
     from xarray import DataArray as _DataArray
     if not isinstance(img_el, _DataArray):
         _keys = list(img_el.keys())
@@ -94,16 +137,10 @@ def load_visiumhd(path: str | Path, *, species: str = "mouse",
     if arr.ndim == 3 and arr.shape[0] in (3, 4):
         arr = np.moveaxis(arr, 0, -1)
 
-    ptab = pos[pos.get("in_tissue", 1) == 1] if "in_tissue" in pos else pos
-    affine_inv = fit_affine_lstsq(ptab["array_col"], ptab["array_row"],
-                                  ptab["pxl_col_in_fullres"], ptab["pxl_row_in_fullres"])
+    affine_inv = fit_affine_lstsq(array_col, array_row, px[:, 0], px[:, 1])
     affine_px_to_um = affine_inv * float(bin_um)
-
-    um_per_px = 1.0
-    sf = path / "binned_outputs" / suffix / "spatial" / "scalefactors_json.json"
-    if sf.exists():
-        import json
-        um_per_px = float(json.load(open(sf)).get("microns_per_pixel", 1.0))
+    if um_per_px is None:
+        um_per_px = float(np.sqrt(abs(np.linalg.det(affine_px_to_um[:, :2]))))
 
     return GridDataset(
         raw=adata, image=arr, um_per_px=um_per_px, species=species, organ=organ,

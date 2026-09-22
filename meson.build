@@ -80,6 +80,7 @@ py.install_sources([
   'ssaft/_io/__init__.py',
   'ssaft/_io/_grid.py',
   'ssaft/_io/_loaders.py',
+  'ssaft/_io/_spatialdata_io.py',
 ], subdir: 'ssaft/_io')
 
 # command-line helpers the tutorials call by path (Path(ssaft.__file__).parent / 'scripts')
