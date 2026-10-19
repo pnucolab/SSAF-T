@@ -34,3 +34,4 @@ data/
 
 # tutorial outputs (symlinked out of the repo when executed)
 notebooks/outputs
+docs/_build/

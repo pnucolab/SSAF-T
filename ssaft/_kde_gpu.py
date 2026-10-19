@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import contextlib
 import math
+import os
 import warnings
 from typing import Optional
 
@@ -291,13 +292,55 @@ def kde_at_points_gpu(
                           float(min(ly_.min(), qy_.min())) - Rw - sampling_distance, oz)
             qz_ = np.asarray(query_z, dtype=np.float64) if int(dim) == 3 else query_z
             out = np.empty((n_q, int(n_genes)), dtype=np.float32)
-            for s0 in range(0, n_q, max_q):
-                s1 = min(n_q, s0 + max_q)
-                out[s0:s1] = kde_at_points_gpu(
-                    qx_[s0:s1], qy_[s0:s1], (qz_[s0:s1] if int(dim) == 3 else query_z),
-                    loc_x, loc_y, loc_z, gene_indices, n_genes,
+            gi_ = np.asarray(gene_indices, dtype=np.int64)
+            # Every batch uploads the transcripts it can reach, not all of them: a 5k-gene Xenium
+            # slide carries 368 M transcripts, whose coordinates plus the cell-list sort are 27 GB
+            # on their own and leave nothing for the scoring. Ordering the queries by x makes each
+            # batch a strip, so the reachable set is a contiguous run of the x-sorted transcripts.
+            # Whole-set upload is kept for the small case, where the sort costs more than it saves.
+            # SSAFT_KDE_STRIP=1/0 forces the choice (the equivalence test uses it)
+            _sf = os.environ.get('SSAFT_KDE_STRIP')
+            strip = (_sf == '1') if _sf in ('0', '1') else (lx_.nbytes * 4 > 0.25 * free)
+            if strip:
+                lorder = np.argsort(lx_, kind='stable')
+                lxs = lx_[lorder]
+                qorder = np.argsort(qx_, kind='stable')
+            else:
+                lorder = lxs = qorder = None
+            # a strip's transcripts cost 24 B each on the device plus the cell-list sort (~40 B/row
+            # in all), so the batch is cut by whichever bound comes first: max_q queries or this
+            # many reachable transcripts. A tall slide (CosMx 6K: 431 M transcripts over 102 k px of
+            # y) fills an x-strip with the whole column, which is what ran a 24 GB card out of
+            # memory even after the strip split.
+            loc_budget = max(4_000_000, int(0.30 * free) // 40)
+            reach = Rw + sampling_distance
+            s0 = 0
+            while s0 < n_q:
+                size = min(max_q, n_q - s0)
+                while strip and size > 1:
+                    q_ = qorder[s0:s0 + size]
+                    a = int(np.searchsorted(lxs, qx_[q_].min() - reach, 'left'))
+                    b = int(np.searchsorted(lxs, qx_[q_].max() + reach, 'right'))
+                    if b - a <= loc_budget:
+                        break
+                    size //= 2                      # narrower strip, fewer transcripts in reach
+                s1 = s0 + size
+                q = slice(s0, s1) if qorder is None else qorder[s0:s1]
+                if strip:
+                    a = int(np.searchsorted(lxs, qx_[q].min() - reach, 'left'))
+                    b = int(np.searchsorted(lxs, qx_[q].max() + reach, 'right'))
+                    sel = lorder[a:b]
+                    lsx, lsy = lx_[sel], ly_[sel]
+                    lsz = np.asarray(loc_z, dtype=np.float64)[sel] if int(dim) == 3 else loc_z
+                    lsg = gi_[sel]
+                else:
+                    lsx, lsy, lsz, lsg = loc_x, loc_y, loc_z, gene_indices
+                out[q] = kde_at_points_gpu(
+                    qx_[q], qy_[q], (qz_[q] if int(dim) == 3 else query_z),
+                    lsx, lsy, lsz, lsg, n_genes,
                     sampling_distance, bandwidth, prune_coefficient, dim,
                     device=device, kernel=kernel, _split=_split, _grid_origin=origin, _qbatch=False)
+                s0 = s1
             return out
 
     try:

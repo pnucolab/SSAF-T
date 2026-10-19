@@ -44,7 +44,6 @@ except ImportError:
 from sklearn.neighbors import LocalOutlierFactor
 from tqdm import tqdm
 
-import time
 
 from scipy.ndimage import map_coordinates
 
@@ -91,22 +90,48 @@ def _nest_rings(g):
     if g is None or g.is_empty or g.geom_type != "MultiPolygon":
         return g
     parts = sorted(g.geoms, key=lambda p: p.area, reverse=True)
-    shells, holes = [], []
-    for p in parts:
-        depth = sum(1 for q in parts if q is not p and q.contains(p))
-        (holes if depth % 2 else shells).append(p)
-    out = []
-    for s in shells:
-        inner = [h for h in holes
-                 if s.contains(h) and not any(t.area < s.area and t.contains(h)
-                                              for t in shells)]
-        out.append(Polygon(s.exterior, [h.exterior for h in inner]))
+    n = len(parts)
+    # Which part contains which, by spatial index rather than by comparing every pair. A cell has
+    # one or two parts and the pairs are free; a cell type EXCLUDED from the watershed does not --
+    # it comes back as one body covering most of the section, perforated by every vessel and every
+    # other cell inside it, so one z layer can hand back tens of thousands of rings and the pairwise
+    # pass becomes ~1e8 containment tests on many-vertex polygons (measured: hours per layer on a
+    # heart section). Containment implies envelope containment, so the tree returns a superset and
+    # the predicate still decides -- same answer, without the square.
+    if n > 8:
+        from shapely import STRtree
+        tree = STRtree(parts)
+        # 'within': the predicate runs as predicate(input, tree_item), so this asks which tree
+        # parts the input sits inside -- the parts that CONTAIN it
+        depths = [len(set(int(j) for j in tree.query(p, predicate="within")) - {i})
+                  for i, p in enumerate(parts)]
+    else:
+        depths = [sum(1 for q in parts if q is not p and q.contains(p)) for p in parts]
+    shells = [p for p, d in zip(parts, depths) if not d % 2]
+    holes = [p for p, d in zip(parts, depths) if d % 2]
+    inner = [[] for _ in shells]
+    if shells and holes:
+        if len(shells) > 8:
+            from shapely import STRtree
+            stree = STRtree(shells)
+            owners = [[int(j) for j in stree.query(h, predicate="within")] for h in holes]
+        else:
+            owners = [[j for j, s in enumerate(shells) if s.contains(h)] for h in holes]
+        for h, own in zip(holes, owners):
+            if not own:
+                continue
+            # a hole belongs to the SMALLEST shell containing it (ties keep both, as before)
+            lo = min(shells[j].area for j in own)
+            for j in own:
+                if shells[j].area == lo:
+                    inner[j].append(h)
+    out = [Polygon(s.exterior, [h.exterior for h in hs]) for s, hs in zip(shells, inner)]
     if not out:
         return g
     return out[0] if len(out) == 1 else MultiPolygon(out)
 
 
-def _watershed3d_tile(slab, seeds_xyz, seeds_ct, seeds_id, x0, x1, y0, y1, pad):
+def _watershed3d_tile(slab, seeds_xyz, seeds_ct, seeds_id, x0, x1, y0, y1, pad, exclude=()):
     """One padded xy tile of the 3D celltype-constrained watershed; returns ``(core, x0, y0)``.
 
     ``slab`` is the ``(x, y, z)`` cell-type map. Each seed is one voxel ``(x, y, z)`` of its
@@ -125,6 +150,8 @@ def _watershed3d_tile(slab, seeds_xyz, seeds_ct, seeds_id, x0, x1, y0, y1, pad):
         sx, sy, sz = seeds_xyz[sel, 0] - px0, seeds_xyz[sel, 1] - py0, seeds_xyz[sel, 2]
         sct, sid = seeds_ct[sel], seeds_id[sel]
         for c in np.unique(sct):
+            if int(c) in exclude:          # left whole, labelled by connected component instead
+                continue
             m = sct == c
             mask = sub == c
             if not mask.any():
@@ -143,6 +170,101 @@ def _watershed3d_tile(slab, seeds_xyz, seeds_ct, seeds_id, x0, x1, y0, y1, pad):
             lab[box][hit] = lab_c[hit]
     cx0, cy0 = x0 - px0, y0 - py0
     return lab[cx0:cx0 + (x1 - x0), cy0:cy0 + (y1 - y0), :], x0, y0
+
+
+def _blob_labels(mask, first_id, out):
+    """Label ``mask``'s connected components ``first_id, first_id+1, ...`` into ``out``; returns how many.
+
+    This is what a cell type that is NOT segmented gets: one object per connected piece of it, so a
+    syncytium (or any tissue the nucleus-per-cell model does not fit) stays the one body the cell-type
+    map found instead of being cut into one fragment per nucleus.
+    """
+    cc, n = ndimage.label(mask)
+    if n:
+        hit = cc > 0
+        out[hit] = cc[hit].astype(out.dtype) + np.int32(first_id - 1)
+    return int(n)
+
+
+def _cap_label_volume(labels, seed_xyz, voxel_vol_um3, max_volume_um3, counts=None):
+    """Trim every cell to the voxels nearest its own seed, up to ``max_volume_um3``.
+
+    The 3D counterpart of :func:`_cap_label_area`, and the right bound for a 3D run: a cap on each
+    LAYER's cross-section leaves the total free to grow with the number of layers a cell spans
+    (200 um^2 over 30 layers is 6,000 um^3), whereas a cell's size in 3D is its volume. Distance is
+    measured in 3D to the seed voxel, which sits at distance 0 and so is never what gets trimmed.
+
+    ``seed_xyz`` is indexed by label id. Only labels already over the cap are touched, and their
+    voxels are gathered a layer at a time, so the cost is set by the oversized cells rather than by
+    the volume. ``labels`` is modified in place; returns the ids that were trimmed.
+    """
+    if not max_volume_um3:
+        return np.empty(0, dtype=np.int64)
+    cap = max(1, int(float(max_volume_um3) // float(voxel_vol_um3)))
+    n_lab = labels.max() + 1 if counts is None else len(counts)
+    if counts is None:
+        counts = np.zeros(int(n_lab), np.int64)
+        for k in range(labels.shape[2]):
+            counts += np.bincount(labels[:, :, k].ravel(), minlength=int(n_lab))[:int(n_lab)]
+    over = np.flatnonzero(counts > cap)
+    over = over[over > 0]
+    if over.size == 0:
+        return np.empty(0, dtype=np.int64)
+    sel = np.zeros(int(n_lab), bool)
+    sel[over] = True
+    xs, ys, zs, labs = [], [], [], []
+    for k in range(labels.shape[2]):
+        plane = labels[:, :, k]
+        hit = sel[plane]
+        if not hit.any():
+            continue
+        a, b = np.nonzero(hit)
+        xs.append(a); ys.append(b)
+        zs.append(np.full(a.size, k, dtype=np.int64))
+        labs.append(plane[a, b])
+    x = np.concatenate(xs); y = np.concatenate(ys); z = np.concatenate(zs)
+    lab = np.concatenate(labs).astype(np.int64)
+    d2 = ((x - seed_xyz[lab, 0]) ** 2 + (y - seed_xyz[lab, 1]) ** 2
+          + (z - seed_xyz[lab, 2]) ** 2)
+    order = np.lexsort((d2, lab))
+    lab_s = lab[order]
+    uniq, first, cnt = np.unique(lab_s, return_index=True, return_counts=True)
+    rank = np.arange(order.size, dtype=np.int64) - np.repeat(first, cnt)
+    drop = order[rank >= cap]
+    if drop.size:
+        labels[x[drop], y[drop], z[drop]] = 0
+    return uniq[cnt > cap]
+
+
+def _cap_label_area(lab2d, seed_a, seed_b, voxel_area_um2, max_area_um2):
+    """Trim every label on one plane to the voxels nearest its own seed, up to ``max_area_um2``.
+
+    The flood is poured on the nucleus, so the nucleus is what a cap must never take: the seed
+    voxel sits at distance 0 and is kept first, and the cells that ran away lose their outside,
+    inwards, until they fit. Without this a nucleus sitting alone in a large region of its own
+    celltype floods that whole region -- the watershed has nothing else to stop it, and on a
+    tissue edge or a sparse celltype that produces single "cells" of hundreds of µm².
+
+    ``seed_a`` / ``seed_b`` give each label's seed position along axis 0 / axis 1 of ``lab2d``,
+    indexed by label id. Voxels equally far from the seed are kept in index order. ``lab2d`` is
+    modified in place; returns the ids of the labels that were trimmed.
+    """
+    if not max_area_um2:
+        return np.empty(0, dtype=np.int64)
+    cap = max(1, int(float(max_area_um2) // float(voxel_area_um2)))
+    aa, bb = np.nonzero(lab2d)                   # works on a strided view (labels[:, :, k])
+    if aa.size == 0:
+        return np.empty(0, dtype=np.int64)
+    lab = lab2d[aa, bb]
+    d2 = ((aa - seed_a[lab]) ** 2 + (bb - seed_b[lab]) ** 2)
+    order = np.lexsort((d2, lab))
+    lab_sorted = lab[order]
+    uniq, first, counts = np.unique(lab_sorted, return_index=True, return_counts=True)
+    over = (np.arange(order.size, dtype=np.int64) - np.repeat(first, counts)) >= cap
+    if over.any():
+        drop = order[over]
+        lab2d[aa[drop], bb[drop]] = 0
+    return uniq[counts > cap]
 
 
 def _plane_polygons(lab_xy, sd_um, ox, oy, simplify=None):
@@ -1469,10 +1591,18 @@ class Analysis(object):
                 raise ValueError(f'images={images!r}: two files claim the same plane number '
                                  f'({[_P(f).name for _, f in order]})')
             if z_step is None:
-                raise ValueError(
-                    f'images={images!r} is {how}: per-plane files carry no z spacing, so pass '
-                    f"z_step= (distance between consecutive planes, in the transcripts' z units)")
-            step = float(z_step)
+                # Per-plane files record no spacing. Default to 1, i.e. the plane's own number
+                # is its z -- which is exactly the unit MERSCOPE's `global_z` is in, so the
+                # planes and the molecules line up with nothing to look up. The price is
+                # geometry: x/y stay µm while z counts planes, so the KDE kernel and every
+                # volume are stretched in z by the real spacing (1.5 µm on MERSCOPE, from
+                # dataorganization.csv `zPos`). Pass z_step=<µm> when that matters.
+                warnings.warn(
+                    f'images={images!r} is {how} and carries no z spacing: z_step defaults to '
+                    '1, so a plane sits at its own number (the unit MERSCOPE global_z uses). '
+                    'x/y are µm, so z distances and volumes are off by the true spacing; pass '
+                    'z_step=<µm> for true geometry.', UserWarning, stacklevel=2)
+            step = 1.0 if z_step is None else float(z_step)
 
             def _win(path, r0, r1, c0, c1):
                 store = tifffile.imread(path, aszarr=True)
@@ -1554,8 +1684,151 @@ class Analysis(object):
                 for k in range(shape[zax])], float(step)
 
     @staticmethod
-    def zstack_image(source, *, like=None, z_step=None, z_origin=0.0, scale_factors=None,
-                     chunk=2048):
+    def _select_planes(planes, step, z, z_origin):
+        """Keep the planes ``z`` asks for and give back the (step, origin) that place them.
+
+        ``planes`` carry their ORIGINAL number in ``index`` (the page for a z-stack file, the
+        ``_z<N>`` in the name for per-plane files), and that number is what ``z`` selects on,
+        so a subset keeps the z it had in the full stack.
+
+        The element's z axis is one scale + one translation, so the kept planes have to be
+        evenly spaced: plane ``j`` of the subset ends up at ``origin + j * step'``. A stride is
+        fine (every second plane doubles the step); an irregular pick is refused rather than
+        silently placed on a lattice it does not sit on.
+
+        :returns: ``(planes, step, z_origin)`` for the subset.
+        """
+        if z is None:
+            return planes, step, z_origin
+        have = [int(pl['index']) for pl in planes]
+        if isinstance(z, slice):
+            want = have[z]
+        else:
+            want = [int(v) for v in (z if hasattr(z, '__iter__') else [z])]
+            missing = [v for v in want if v not in have]
+            if missing:
+                raise ValueError(f'z={z!r}: no plane numbered {missing} (have {have})')
+            want = sorted(set(want))
+        if not want:
+            raise ValueError(f'z={z!r} selects no plane (have {have})')
+        if len(want) > 1:
+            strides = {b - a for a, b in zip(want, want[1:])}
+            if len(strides) != 1:
+                raise ValueError(
+                    f'z={z!r} picks planes {want}, which are not evenly spaced: the element '
+                    'places plane j at origin + j * step, so an irregular subset cannot be '
+                    'written as one z transformation. Pick a constant stride, or build one '
+                    'element per run of planes.')
+            stride = strides.pop()
+        else:
+            stride = 1
+        keep = [pl for pl in planes if int(pl['index']) in set(want)]
+        return keep, float(step) * stride, float(z_origin) + want[0] * float(step)
+
+    @staticmethod
+    def zstack_planes(source, sdata=None, *, z=None, z_step=None, z_origin=0.0,
+                      element_name=None, transcripts_z=None, z_unit=None, slab=None,
+                      verbose=True):
+        """What each imaging plane is worth: where it sits, and how many molecules are there.
+
+        Use it before :meth:`zstack_image` to choose ``z``. A stack usually reaches past the
+        section on both sides, and a plane outside the tissue still gets a tissue mask (its
+        Otsu is computed on that plane alone), so it costs a full plane of sampling and returns
+        anchors whose vectors are ambient. Counting the molecules at each plane's own depth
+        says which planes are worth stacking.
+
+        The molecules' ``z`` comes in one of two units, and the count follows it:
+
+        * **plane index** (MERSCOPE ``global_z`` is 0, 1, 2 ... one value per imaging plane) —
+          each plane is matched by its OWN NUMBER, so the count is exact: no slab, and the
+          physical spacing is not involved in it at all. ``z_step`` still has to be passed,
+          because it is what puts the planes in µm for everything downstream.
+        * **µm** (Xenium ``z_location`` is continuous) — a plane takes the molecules within
+          ``slab`` of its µm position, ``z_step`` by default, so the slabs tile the axis.
+
+        Which one it is, is detected from the values (all integers within the plane numbers ->
+        plane index) and reported; pass ``z_unit='plane'`` / ``'um'`` to force it.
+
+        :param source: what :meth:`zstack_image` would take -- a z-stack file, a folder, a glob
+            or a list of per-plane files.
+        :param sdata: SpatialData holding the molecules; the first points element is read
+            unless ``element_name`` says otherwise.
+        :param z: optional pre-selection, as in :meth:`zstack_image`; the census then describes
+            only those planes, and counts the rest as outside.
+        :param z_step: µm between consecutive planes. Read from the OME ``PhysicalSizeZ`` of a
+            stack file (Xenium); for per-plane files (MERSCOPE) it defaults to 1, which puts
+            each plane at its own number -- the unit ``global_z`` already uses, so the two line
+            up without looking the spacing up. Pass the real µm (1.5 on MERSCOPE) when z
+            distances or volumes have to be physical.
+        :param transcripts_z: the z values directly, instead of ``sdata``.
+        :param z_unit: ``'plane'`` / ``'um'`` to override the detection.
+        :param slab: µm counted around each plane; ``z_step`` by default. Ignored for plane
+            indices, where the match is exact.
+        :returns: a :class:`pandas.DataFrame` indexed by the plane's own number, with its ``z``,
+            the molecules it holds, that as a fraction of all of them, and the running total.
+            ``df.attrs`` carries ``unit``, ``outside`` (molecules no kept plane holds) and
+            ``slab``.
+        """
+        import pandas as pd
+        planes, step = Analysis._image_planes(source, z_step=z_step, z_origin=0.0)
+        planes, step, z_origin = Analysis._select_planes(planes, step, z, z_origin)
+        if transcripts_z is None:
+            if sdata is None:
+                raise ValueError('pass sdata= (or transcripts_z=) to count the molecules')
+            name = element_name or next(iter(getattr(sdata, 'points', {}) or {}), None)
+            if name is None:
+                raise ValueError('no points element in sdata')
+            pts = sdata.points[name]
+            if 'z' not in getattr(pts, 'columns', []):
+                raise ValueError(f'points[{name!r}] has no z column, so there is nothing to '
+                                 'count per plane')
+            col = pts['z']
+            transcripts_z = np.asarray(col.compute() if hasattr(col, 'compute') else col,
+                                       dtype=np.float64)
+        tz = np.asarray(transcripts_z, dtype=np.float64)
+        idx = [int(pl['index']) for pl in planes]
+        if z_unit is None:
+            # A plane index is a small non-negative integer that NAMES a plane; a µm depth is
+            # a continuous measurement. Do not compare against the planes on hand: a bundle
+            # may ship images for only some of the planes its molecules were decoded on
+            # (MsLiver has z0 and z3 of 7), and the molecules on the missing ones are then
+            # counted as outside, not taken as proof that z is in µm.
+            uniq = np.unique(tz) if tz.size else tz
+            z_unit = ('plane' if (uniq.size and uniq.size <= 100
+                                  and np.all(uniq == np.rint(uniq)) and uniq.min() >= 0)
+                      else 'um')
+        elif z_unit not in ('plane', 'um'):
+            raise ValueError(f"z_unit={z_unit!r}: 'plane' or 'um'")
+        half = float(slab if slab is not None else step) / 2.0
+
+        rows, inside = [], np.zeros(len(tz), dtype=bool)
+        for j, k in enumerate(idx):
+            zc = float(z_origin) + j * float(step)
+            m = (tz == k) if z_unit == 'plane' else ((tz >= zc - half) & (tz < zc + half))
+            inside |= m
+            rows.append(dict(plane=k, z=zc, molecules=int(m.sum())))
+        df = pd.DataFrame(rows).set_index('plane')
+        n = max(len(tz), 1)
+        df['fraction'] = df['molecules'] / n
+        df['cumulative'] = df['fraction'].cumsum()
+        df.attrs.update(unit=z_unit, outside=int((~inside).sum()),
+                        slab=(None if z_unit == 'plane' else 2 * half),
+                        z_step=float(step), z_origin=float(z_origin))
+        if verbose:
+            how = ('molecule z is the plane index: counted by plane number'
+                   if z_unit == 'plane' else
+                   f'molecule z is µm: counted within a {2 * half:g} µm slab')
+            print(f'[zstack_planes] {len(planes)} planes, step {step:g} µm, origin '
+                  f'{z_origin:g} µm; {len(tz):,} molecules, {how}; '
+                  f'{int((~inside).sum()):,} on no kept plane\n' +
+                  df.to_string(formatters={'z': '{:g}'.format, 'molecules': '{:,}'.format,
+                                           'fraction': '{:.2%}'.format,
+                                           'cumulative': '{:.1%}'.format}))
+        return df
+
+    @staticmethod
+    def zstack_image(source, *, like=None, z=None, z_step=None, z_origin=0.0,
+                     scale_factors=None, chunk=2048):
         """A z-stack as a SpatialData 3D image element, ready for ``sdata.images[key] = ...``.
 
         :meth:`downsample_vector` reads every image from ``sdata.images``. For ``z=3`` the
@@ -1573,10 +1846,16 @@ class Analysis(object):
             ``sdata.images['morphology_focus']``). Its transformations give the element's
             x/y placement in every coordinate system, and its size is checked. Without it
             the x/y transformation is the identity.
+        :param z: which planes to stack, by their own number -- the page in a z-stack file,
+            the ``_z<N>`` in a per-plane file name. ``None`` (default) takes all of them; pass
+            an iterable (``z=[5, 6, 7, 8]``) or a slice. The kept planes keep the z they had in
+            the full stack, so ``z_origin`` still refers to plane 0 of the SOURCE and does not
+            have to be moved by hand. They must be evenly spaced, since the element's z axis is
+            a single scale + translation. :meth:`zstack_planes` says which planes are worth it.
         :param z_step: distance between consecutive planes in the transcripts' z units.
-            Read from the OME ``PhysicalSizeZ`` of a stack file; required for per-plane files
-            (MERSCOPE ``global_z`` is a plane index, so ``1`` unless converted).
-        :param z_origin: z of plane 0, same units.
+            Read from the OME ``PhysicalSizeZ`` of a stack file; for per-plane files it
+            defaults to 1, i.e. the plane's own number (what MERSCOPE ``global_z`` counts).
+        :param z_origin: z of plane 0 OF THE SOURCE, same units (not of the first kept plane).
         :param scale_factors: x/y pyramid factors, default ``[2, 2, 2]``; z is never
             downscaled, since each plane is an image of its own.
         :returns: an ``Image3DModel`` element ``(c, z, y, x)``. Plane ``k`` sits at
@@ -1590,6 +1869,7 @@ class Analysis(object):
                                                  get_transformation as _get_tf)
 
         planes, step = Analysis._image_planes(source, z_step=z_step, z_origin=0.0)
+        planes, step, z_origin = Analysis._select_planes(planes, step, z, z_origin)
 
         def _lazy(src):
             path, _, k = src.partition('[Z=')
@@ -2285,6 +2565,16 @@ class Analysis(object):
             sigma_bin = float(bandwidth_um) / float(bin_um)
         elif sigma_bin is None:
             sigma_bin = 1.0
+        if sigma_bin < 0.5:
+            # The blur happens on the bin raster, so a sigma under half a bin cannot reach the
+            # neighbouring bin and the field stays a lattice of isolated bins. It means the
+            # raster is finer than the data it carries (e.g. 8 µm Visium HD bins blurred on a
+            # 2 µm raster) or the bandwidth is too small for the bin size.
+            warnings.warn(
+                f'bandwidth {sigma_bin * bin_um:g} µm is {sigma_bin:.2f} of a {bin_um:g} µm '
+                'bin: the gaussian does not reach the next bin, so the field will be isolated '
+                'bins rather than a continuous one. Raise the bandwidth or lower bin_um to the '
+                "data's own bin size.", UserWarning, stacklevel=2)
         compute_vf_blur(self, bin_adata, sigma_bin=sigma_bin, chunk_h=chunk_h,
                         chunk_w=chunk_w, store_chunk=store_chunk,
                         bin_size_um=bin_um, sampling_distance=sampling_distance,
@@ -4103,8 +4393,20 @@ class Analysis(object):
             if _cm.ndim == 3 and _factor.size > 1 and not np.all(_factor == 1.0):
                 _vf = _vf / np.nan_to_num(_factor, nan=1.0).astype(np.float32)[None, None, :]
             n_before = int(mask.sum())
+            # One pass, not one per celltype. `mask &= ~((_cm == cidx) & (_vf < cut))` walks the
+            # whole volume twice for every celltype -- 38 passes over 2.5e9 voxels on a section
+            # this size, each allocating its own temporary. The cut is a property of the voxel's
+            # celltype, so it can be gathered: cut_of[_cm] gives every voxel its own threshold and
+            # the comparison happens once. Same mask, 1/19th of the traffic.
+            _ncls = int(max(_cuts) if _cuts else 0) + 2
+            cut_of = np.full(_ncls, -np.inf, dtype=np.float32)      # -inf: not cut at all
             for cidx, cut in _cuts.items():
-                mask &= ~((_cm == cidx) & (_vf < cut))
+                cut_of[int(cidx)] = cut
+            _lastax = _cm.ndim - 1
+            for _k in range(_cm.shape[_lastax]):                   # a plane at a time: flat memory
+                _cmk = _cm[..., _k]
+                _safe = np.where((_cmk >= 0) & (_cmk < _ncls - 1), _cmk, _ncls - 1)
+                mask[..., _k] &= ~(_vf[..., _k] < cut_of[_safe])
             _depth = (f', density normalised over {int(np.isfinite(_factor).sum())} planes'
                       if _factor.size > 1 and not np.all(_factor == 1.0) else '')
             self._m(f"filter_celltypemaps: norm_f={norm_f} -> "
@@ -4526,13 +4828,41 @@ class Analysis(object):
         A = getattr(self, "_nuclei_global_affine", None)
         return np.asarray(A, dtype=float) if A is not None else self.dataset._map_frame(sdata)[1]
 
+    def _excluded_celltype_ids(self, exclude, names):
+        """Cell-type ids named by ``exclude`` (names, as in the map's celltype list, or ids).
+
+        Matching on names is case-insensitive and ignores surrounding space; a name that is not in
+        this map's cell types is an error rather than a silent no-op, because the caller asked for a
+        cell type to be left whole and would not see it happen.
+        """
+        if exclude is None:
+            return set()
+        if isinstance(exclude, (str, int, np.integer)):
+            exclude = [exclude]
+        by_name = {str(n).strip().lower(): i for i, n in enumerate(names)}
+        ids, missing = set(), []
+        for e in exclude:
+            if isinstance(e, (int, np.integer)) and not isinstance(e, bool):
+                ids.add(int(e))
+                continue
+            i = by_name.get(str(e).strip().lower())
+            if i is None:
+                missing.append(str(e))
+            else:
+                ids.add(int(i))
+        if missing:
+            raise ValueError(f"exclude_celltypes: {missing} not among the map's cell types "
+                             f"({len(names)}): {sorted(names)[:8]}...")
+        return ids
+
     def _cells_coordinate_system(self, sdata):
         """Coordinate system the cells are written into (see :meth:`_cells_global_affine`)."""
         cs = getattr(self, "_cells_cs", None)
         return cs if cs is not None else self.dataset._map_frame(sdata)[0]
 
     def segment_cells(self, sdata=None, nuclei=None, *, z=None,
-                      simplify=None, min_area_um2=5.0, transcripts=None, bins=None,
+                      simplify=None, min_area_um2=5.0, max_area_um2=None,
+                      max_volume_um3=None, exclude_celltypes=None, transcripts=None, bins=None,
                       shapes_key="ssaft_cell_boundaries_2d",
                       shapes_3d_key="ssaft_cell_boundaries_3d",
                       labels_3d_key="ssaft_cell_labels_3d", table_key="ssaft_cells",
@@ -4595,6 +4925,33 @@ class Analysis(object):
 
         ``min_area_um2`` drops a 3D cell whose largest layer is below it.
 
+        ``exclude_celltypes`` leaves a cell type whole. The watershed assumes one nucleus = one
+        cell, which a syncytium breaks: syncytiotrophoblast is one multinucleated body, and cutting
+        it midway between its nuclei invents cells that do not exist. A named type is skipped by the
+        flood and labelled by CONNECTED COMPONENT instead, so each contiguous piece of it (one
+        villous branch, say) becomes one object, exactly as the filtered map drew it. Its nuclei are
+        not seeds; they are counted, and ``obs['n_nuclei']`` says how many fell in each body.
+        ``obs['segmented']`` is False for those rows, and neither area bound applies to them -- a cap
+        exists to stop a cell running away, which is not a question for a body the map itself
+        delimited. The other cell types are untouched: each type floods only inside its own mask, so
+        excluding one cannot move a voxel of another.
+
+        ``max_volume_um3`` (3D) and ``max_area_um2`` (2D) cap how far a cell may flood -- both OFF
+        by default. The bound follows the dimension because a cell's size does: in 3D a per-layer
+        area bound would leave the total free to grow with the number of layers the cell spans
+        (200 um^2 over 30 layers is 6,000 um^3), so the 3D run bounds the VOLUME and the 2D run the
+        area. Passing the other dimension's bound is an error rather than a silent no-op. The water is poured on
+        the nucleus, so that is the part a cap must never take: voxels are kept in order of their
+        distance to the cell's own seed and everything past the cap is given back to the
+        background, which eats the cell's outside inwards and always leaves the nucleus. Turn it
+        on where a nucleus sitting alone in a wide region of its own celltype claims all of it --
+        the watershed has no other cell there to stop it, so on a tissue edge or for a sparse
+        celltype a single "cell" can grow to hundreds of µm². In 3D the cap is applied per layer,
+        i.e. to the cross-sectional area, which is what ``area_um2`` reports. It is off by default
+        because the honest size of a cell is the one the map and the neighbouring nuclei give it;
+        a cap is a correction to be chosen per dataset, not a default (100 µm² is a reasonable
+        starting point -- it is about a 11 µm disc).
+
         Polygons trace voxel BOUNDARIES (:func:`spatialdata.to_polygons`): a contour through
         boundary voxel centres would inset every cell by half a voxel and lose 1-2 voxel
         cells. Geometry is in the map's µm frame (so areas are µm²); the elements carry the
@@ -4618,6 +4975,13 @@ class Analysis(object):
         :param simplify: Douglas-Peucker tolerance in µm for the polygons (``None`` = exact).
         :param min_area_um2: Drop cells smaller than this (2D: the polygon; 3D: its largest
             layer). ``0`` keeps all.
+        :param exclude_celltypes: Cell types (names or ids) NOT to cut into cells: each stays the
+            body the cell-type map found, one object per connected piece. See above.
+        :param max_area_um2: 2D only. Cap on one cell's area, trimmed from the voxels farthest
+            from the nucleus the cell was seeded on. ``None`` (the default) / ``0`` leaves the
+            watershed uncapped.
+        :param max_volume_um3: 3D only. Cap on one cell's volume, trimmed from the voxels farthest
+            (in 3D) from its nucleus. ``None`` (the default) / ``0`` leaves it uncapped.
         :param transcripts: Key of the points element to count; defaults to the only one.
         :param bins: 2D count platforms: the bin table to aggregate when there are no points.
         :param shapes_key: Outlines on the segmented 2D plane / the 3D middle layer.
@@ -4648,18 +5012,27 @@ class Analysis(object):
             raise ValueError("no filtered cell-type map; run filter_celltypemaps first")
         three_d = (getattr(self, 'n_dims', None) == 3 and z is None
                    and np.ndim(fm) == 3 and np.shape(fm)[2] > 1)
+        if three_d and max_area_um2:
+            raise ValueError("max_area_um2 is the 2D bound; a 3D run caps the volume — pass "
+                             "max_volume_um3=<um^3> instead")
+        if not three_d and max_volume_um3:
+            raise ValueError("max_volume_um3 is the 3D bound; this run is 2D — pass "
+                             "max_area_um2=<um^2> instead")
         if three_d:
             return self._segment_cells_3d(
                 sdata, nuclei, simplify=simplify, min_area_um2=min_area_um2,
+                max_volume_um3=max_volume_um3, exclude_celltypes=exclude_celltypes,
                 transcripts=transcripts, shapes_key=shapes_key, shapes_3d_key=shapes_3d_key,
                 labels_3d_key=labels_3d_key, table_key=table_key, column=column,
                 nuclei_frame=nuclei_frame, tile=tile, pad_um=pad_um, nuclei_z=nuclei_z)
         return self._segment_cells_2d(
             sdata, nuclei, z=z, simplify=simplify, min_area_um2=min_area_um2,
+            max_area_um2=max_area_um2, exclude_celltypes=exclude_celltypes,
             transcripts=transcripts, bins=bins, shapes_key=shapes_key, table_key=table_key,
             column=column, nuclei_frame=nuclei_frame)
 
-    def _segment_cells_3d(self, sdata, nuclei, *, simplify, min_area_um2, transcripts,
+    def _segment_cells_3d(self, sdata, nuclei, *, simplify, min_area_um2, max_volume_um3,
+                          exclude_celltypes, transcripts,
                           shapes_key, shapes_3d_key, labels_3d_key, table_key, column,
                           nuclei_frame, tile, pad_um, nuclei_z=None):
         """The 3D path of :meth:`segment_cells`."""
@@ -4727,9 +5100,13 @@ class Analysis(object):
         if not use.any():
             raise ValueError("no nucleus falls on a labelled voxel of the cell-type map on any layer — "
                              "check that nuclei and the map share a coordinate system")
-        seeds_xyz = np.c_[vx[use], vy[use], vz[use]]
-        seeds_ct = cts[use]
-        seeds_id = np.arange(1, int(use.sum()) + 1, dtype=np.int32)
+        ex_ids = self._excluded_celltype_ids(exclude_celltypes, names)
+        seed_use = use & ~np.isin(cts, list(ex_ids)) if ex_ids else use
+        if not seed_use.any() and ex_ids:
+            raise ValueError("every nucleus sits on an excluded cell type; nothing would be segmented")
+        seeds_xyz = np.c_[vx[seed_use], vy[seed_use], vz[seed_use]]
+        seeds_ct = cts[seed_use]
+        seeds_id = np.arange(1, int(seed_use.sum()) + 1, dtype=np.int32)
 
         # ---- 3D watershed in xy tiles
         pad = int(np.ceil(float(pad_um) / sd_um))
@@ -4738,15 +5115,41 @@ class Analysis(object):
                 for x0 in range(0, X, tile) for y0 in range(0, Y, tile)]
         labels = np.zeros((X, Y, Z), dtype=np.int32)
         for core, x0, y0 in Parallel(n_jobs=max(1, min(int(self.ncores), len(jobs))))(
-                delayed(_watershed3d_tile)(slab, seeds_xyz, seeds_ct, seeds_id, *j, pad) for j in jobs):
+                delayed(_watershed3d_tile)(slab, seeds_xyz, seeds_ct, seeds_id, *j, pad, ex_ids)
+                for j in jobs):
             labels[x0:x0 + core.shape[0], y0:y0 + core.shape[1], :] = core
+        slab_ex = slab if ex_ids else None       # the excluded types are read off it below
         del slab
 
-        # ---- per-cell size, planes and centroid; drop cells whose largest layer is too small
+        # ---- cap each cell's VOLUME: the seed voxel is the nearest one to itself, so what a cell
+        # loses is its outside (see _cap_label_volume)
         n_lab = int(seeds_id.max()) + 1
+        seed_xyz = np.zeros((n_lab, 3), np.int64)
+        seed_xyz[seeds_id] = seeds_xyz
+        n_capped = len(_cap_label_volume(labels, seed_xyz, sd_um ** 3, max_volume_um3))
+
+        # ---- the excluded cell types: one object per connected piece, after the cap so no bound of
+        # the segmented cells can reach them (ndimage.label walks the whole volume once per type)
+        blob_ct, n_blob = {}, 0
+        if ex_ids:
+            nxt = int(labels.max()) + 1
+            for c in sorted(ex_ids):
+                n = _blob_labels(slab_ex == c, nxt, labels)
+                for i in range(n):
+                    blob_ct[nxt + i] = int(c)
+                nxt += n
+                n_blob += n
+                if self.verbose:
+                    print(f"[segment_cells] {names[c] if c < len(names) else c}: "
+                          f"{n} connected bodies, not segmented", flush=True)
+            del slab_ex
+        n_lab = max(n_lab, int(labels.max()) + 1)
+
+        # ---- per-cell size, planes and centroid; drop cells whose largest layer is too small
         vol = np.zeros(n_lab, np.int64)
         cover = np.zeros(n_lab, np.int64)
         n_z = np.zeros(n_lab, np.int16)
+        cover_k = np.zeros(n_lab, np.int64)
         sx, sy, sz = np.zeros(n_lab), np.zeros(n_lab), np.zeros(n_lab)
         xi = np.broadcast_to(np.arange(X, dtype=np.float64)[:, None], (X, Y)).ravel()
         yi = np.broadcast_to(np.arange(Y, dtype=np.float64)[None, :], (X, Y)).ravel()
@@ -4754,12 +5157,16 @@ class Analysis(object):
             L = labels[:, :, k].ravel()
             c = np.bincount(L, minlength=n_lab)
             vol += c
+            cover_k[c > cover] = k
             cover = np.maximum(cover, c)
             n_z += (c > 0)
             sx += np.bincount(L, weights=xi, minlength=n_lab)
             sy += np.bincount(L, weights=yi, minlength=n_lab)
             sz += c * k
-        keep = (cover > 0) & (cover * sd_um ** 2 >= (min_area_um2 or 0))
+        is_blob = np.zeros(n_lab, bool)
+        if blob_ct:
+            is_blob[list(blob_ct)] = True
+        keep = (cover > 0) & ((cover * sd_um ** 2 >= (min_area_um2 or 0)) | is_blob)
         keep[0] = False
         drop_small = int(((cover > 0) & ~keep)[1:].sum())
         if drop_small:
@@ -4773,6 +5180,7 @@ class Analysis(object):
             delayed(_plane_polygons)(labels[:, :, k], sd_um, ox, oy, simplify) for k in range(Z))
         seed_k = np.full(n_lab, -1, dtype=np.int64)
         seed_k[seeds_id] = seeds_xyz[:, 2] - z0
+        seed_k[is_blob] = cover_k[is_blob]
         recs, mid, area_mid = [], [], np.full(n_lab, np.nan)
         for k, polys in enumerate(planes):
             for lb, g in polys:
@@ -4796,6 +5204,15 @@ class Analysis(object):
 
         ctid = np.full(n_lab, -1, dtype=np.int32)
         ctid[seeds_id] = seeds_ct
+        for lb, c in blob_ct.items():
+            ctid[lb] = c
+        n_nuclei = np.zeros(n_lab, np.int32)
+        n_nuclei[seeds_id] = 1                        # one nucleus per segmented cell, by construction
+        if ex_ids:
+            exn = use & np.isin(cts, list(ex_ids))    # the nuclei inside the untouched bodies
+            if exn.any():
+                lb = labels[vx[exn], vy[exn], vz[exn] - z0]
+                n_nuclei += np.bincount(lb[lb > 0], minlength=n_lab)[:n_lab].astype(np.int32)
         idx = pd.Index([f"cell_{i}" for i in present])
         obs = pd.DataFrame({
             column: pd.Categorical.from_codes(ctid[present], categories=list(names)),
@@ -4807,6 +5224,8 @@ class Analysis(object):
             "max_plane_area_um2": (cover[present] * sd_um ** 2).astype(np.float32),
             "area_um2": area_mid[present].astype(np.float32),
             "seed_z_um": (oz + (z0 + seed_k[present]) * sd_um).astype(np.float32),
+            "segmented": ~is_blob[present],
+            "n_nuclei": n_nuclei[present],
             "region": pd.Categorical([labels_3d_key] * len(present)),
         }, index=idx)
         if Xc is None:
@@ -4822,7 +5241,9 @@ class Analysis(object):
                   "labelled voxel nearest the tissue midline",
             n_seed_own_z=int((use & own).sum()), n_seed_column=int((use & ~own).sum()),
             obsm_spatial="voxel centroid, µm (x, y, z)", area_um2="area on the cell's seed layer",
-            shapes_2d="each cell's outline on its seed layer")
+            shapes_2d="each cell's outline on its seed layer",
+            excluded_celltypes=[names[i] if i < len(names) else int(i) for i in sorted(ex_ids)],
+            n_whole_bodies=int(n_blob))
 
         # ---- elements, in the frame the nuclei were read in
         A = self._cells_global_affine(sdata)
@@ -4854,6 +5275,10 @@ class Analysis(object):
               f"{int((use & ~own).sum())} on the column's tissue midline; {n_bg} on a background column "
               f"ignored, {int((~inside).sum())} outside map"
               + (f", {drop_small} below {min_area_um2}µm² on every layer" if drop_small else "")
+              + (f", {n_capped} trimmed to {max_volume_um3}µm³" if n_capped else "")
+              + (f"; {n_blob} whole bodies of "
+                 f"{', '.join(names[i] if i < len(names) else str(i) for i in sorted(ex_ids))}"
+                 if n_blob else "")
               + f") @ all {Z} layers, {sd_um}µm/voxel")
         print(f"[segment_cells] shapes['{shapes_3d_key}'] {len(gdf3)} outlines on {Z} layers; "
               f"shapes['{shapes_key}'] {len(gdf2)} on each cell's seed layer")
@@ -4901,7 +5326,8 @@ class Analysis(object):
                         shape=(len(lab_of_cell), len(var_names))).tocsr()
         return Xm, list(var_names), int(hit.sum())
 
-    def _segment_cells_2d(self, sdata, nuclei, *, z, simplify, min_area_um2, transcripts, bins,
+    def _segment_cells_2d(self, sdata, nuclei, *, z, simplify, min_area_um2, max_area_um2,
+                          exclude_celltypes, transcripts, bins,
                           shapes_key, table_key, column, nuclei_frame):
         """One plane of the cell-type map cut into cells; the 2D path of :meth:`segment_cells`."""
         import geopandas as gpd
@@ -4933,14 +5359,20 @@ class Analysis(object):
             raise ValueError("no nucleus falls on a labelled voxel of the cell-type "
                              "map — check that nuclei and the map share a coordinate system")
 
+        names, ct_colors = self._celltype_names_colors()
+        ex_ids = self._excluded_celltype_ids(exclude_celltypes, names)
+        seed_use = use & ~np.isin(cts, list(ex_ids)) if ex_ids else use
+        if not seed_use.any() and ex_ids:
+            raise ValueError("every nucleus sits on an excluded cell type; nothing would be segmented")
+
         seeds = np.zeros(ctmap.shape, dtype=np.int32)
-        seeds[vox[use, 1], vox[use, 0]] = np.arange(1, int(use.sum()) + 1)
+        seeds[vox[seed_use, 1], vox[seed_use, 0]] = np.arange(1, int(seed_use.sum()) + 1)
 
         labels = np.zeros(ctmap.shape, dtype=np.int32)
         seed_ct = {}
-        for c in np.unique(cts[use]):
-            mk = np.where(np.isin(seeds, seeds[vox[use & (cts == c), 1],
-                                               vox[use & (cts == c), 0]]), seeds, 0)
+        for c in np.unique(cts[seed_use]):
+            mk = np.where(np.isin(seeds, seeds[vox[seed_use & (cts == c), 1],
+                                               vox[seed_use & (cts == c), 0]]), seeds, 0)
             dist = ndimage.distance_transform_edt(mk == 0)
             lab_c = watershed(dist, mk, mask=(ctmap == c))
             hit = lab_c > 0
@@ -4948,7 +5380,38 @@ class Analysis(object):
             for s in np.unique(lab_c[hit]):
                 seed_ct[int(s)] = int(c)
 
-        names, ct_colors = self._celltype_names_colors()
+        # cap the flood: keep each cell's voxels nearest its own seed, give the rest back to
+        # the background. The seed is at distance 0, so the nucleus the water was poured on is
+        # never what gets trimmed (see _cap_label_area).
+        n_lab = int(seed_use.sum()) + 1
+        seed_a, seed_b = np.zeros(n_lab, np.int64), np.zeros(n_lab, np.int64)
+        seed_a[1:] = vox[seed_use, 1]                      # axis 0 of labels is y
+        seed_b[1:] = vox[seed_use, 0]
+        n_capped = len(_cap_label_area(labels, seed_a, seed_b, sd_um ** 2, max_area_um2))
+
+        # the excluded cell types: one object per connected piece, after the cap so no bound of the
+        # segmented cells can reach them
+        blob_ct, n_blob = {}, 0
+        if ex_ids:
+            nxt = int(labels.max()) + 1
+            for c in sorted(ex_ids):
+                n = _blob_labels(ctmap == c, nxt, labels)
+                for i in range(n):
+                    blob_ct[nxt + i] = int(c)
+                    seed_ct[nxt + i] = int(c)
+                nxt += n
+                n_blob += n
+                if self.verbose:
+                    print(f"[segment_cells] {names[c] if c < len(names) else c}: "
+                          f"{n} connected bodies, not segmented", flush=True)
+        n_nuclei = {}
+        if ex_ids:
+            exn = use & np.isin(cts, list(ex_ids))
+            if exn.any():
+                lb = labels[vox[exn, 1], vox[exn, 0]]
+                for v, n in zip(*np.unique(lb[lb > 0], return_counts=True)):
+                    n_nuclei[int(v)] = int(n)
+
         # Raster -> vector. The watershed IS already the segmentation: every voxel
         # belongs to exactly one cell and the borders run along voxel EDGES. All
         # that is left is transcribing that partition faithfully, which means the
@@ -4978,12 +5441,13 @@ class Analysis(object):
         for lb, g in zip(poly.index.to_numpy(), poly.geometry.to_numpy()):
             if g is None or g.is_empty:
                 continue
-            if min_area_um2 and g.area < min_area_um2:
+            if min_area_um2 and g.area < min_area_um2 and int(lb) not in blob_ct:
                 drop_small += 1
                 continue
             ct_id = seed_ct.get(int(lb), -1)
             recs.append((f"cell_{int(lb)}", g, ct_id,
-                         names[ct_id] if 0 <= ct_id < len(names) else "Unknown"))
+                         names[ct_id] if 0 <= ct_id < len(names) else "Unknown",
+                         int(lb) not in blob_ct, n_nuclei.get(int(lb), 1)))
 
         idx = pd.Index([r[0] for r in recs], name="cell_id")
         gdf = gpd.GeoDataFrame(geometry=[r[1] for r in recs], index=idx)
@@ -4999,6 +5463,8 @@ class Analysis(object):
             column: pd.Categorical([r[3] for r in recs], categories=ct_cats),
             "celltype_id": np.array([r[2] for r in recs], dtype=np.int32),
             "area_um2": gdf.geometry.area.to_numpy(),
+            "segmented": np.array([r[4] for r in recs], dtype=bool),
+            "n_nuclei": np.array([r[5] for r in recs], dtype=np.int32),
             "region": pd.Categorical([shapes_key] * len(recs)),
             "cell_id": idx.to_numpy(),
         }, index=idx)
@@ -5040,6 +5506,10 @@ class Analysis(object):
               f"from {int(use.sum())}/{len(vox)} nuclei "
               f"({n_bg} on background ignored, {int((~inside).sum())} outside map"
               + (f", {drop_small} below {min_area_um2}µm²" if drop_small else "")
+              + (f", {n_capped} trimmed to {max_area_um2}µm²" if n_capped else "")
+              + (f"; {n_blob} whole bodies of "
+                 f"{', '.join(names[i] if i < len(names) else str(i) for i in sorted(ex_ids))}"
+                 if n_blob else "")
               + f") @ z={z}, {sd_um}µm/px")
         print(f"[segment_cells] tables['{table_key}'] {adata.shape} "
               f"({n_in:,} {unit} assigned, "
@@ -5721,7 +6191,9 @@ class Analysis(object):
                                exclude_gene_indices=None,
                                bandwidth=2.5, sampling_distance=1.0, prune_coefficient=4.3,
                                kernel='gaussian',
-                               size_after_normalization=10, log_transform=True):
+                               size_after_normalization=10, log_transform=True,
+                               method='corr', marker_genes_path=None, h5ad=None,
+                               column='cellman_annotation', leiden_column='leiden', cmap=None):
         """
         Initialize zarr arrays for a distributed ``map_celltypes_cpu`` run.
 
@@ -5765,6 +6237,15 @@ class Analysis(object):
                'prune_coefficient': float, 'kernel': str,
                'size_after_normalization': float, 'log_transform': bool}``
         """
+        # The classes come from the annotation, exactly as in map_celltypes. A distributed run
+        # has to fix them BEFORE the workers start: each worker rebuilds the LDA factors from
+        # this store, so they must all read the same classes.
+        if h5ad is not None:
+            from ._mapping_inputs import build_centroids_from_h5ad
+            build_centroids_from_h5ad(
+                self.dataset.zarr_group, h5ad, column=column, leiden_column=leiden_column,
+                cmap=cmap, store_dir=self.dataset._zarr_store_path(self.dataset.zarr_store))
+            self.dataset.zarr_group.attrs['annotation_h5ad'] = os.path.abspath(h5ad)
         self.dataset.cluster_labels          = self.dataset.zarr_group['cluster_labels'][:]
         self.dataset.downsampled_vectors              = self.dataset.zarr_group['downsampled_vectors'][:]
         self.dataset.normalized_vectors      = self.dataset.zarr_group['normalized_vectors'][:]
@@ -5780,10 +6261,10 @@ class Analysis(object):
         if getattr(self.dataset, 'shape', None) is None or \
                 not hasattr(self, 'locations') or self.locations is None:
             self._prepare_grid(sdata, element_name=element_name,
-                               bandwidth=bandwidth,
-                               sampling_distance=sampling_distance,
-                               prune_coefficient=prune_coefficient,
-                               size_after_normalization=size_after_normalization)
+                           bandwidth=bandwidth,
+                           sampling_distance=sampling_distance,
+                           prune_coefficient=prune_coefficient,
+                           size_after_normalization=size_after_normalization)
 
         vx, vy, vz = (int(self.dataset.shape[0]),
                       int(self.dataset.shape[1]),
@@ -5818,7 +6299,10 @@ class Analysis(object):
 
         # correlation-only path; drop any posterior volume from an earlier gnb run so
         # filter_celltypemaps does not threshold this map with min_p.
-        for name in ['vf_norm', 'celltype_maps', 'max_correlations', 'max_probabilities']:
+        from ._count import score_key_for
+        score_key = score_key_for(method)
+        for name in ['vf_norm', 'celltype_maps', 'max_correlations', 'max_probabilities',
+                     'celltype_marker_score']:
             _safe_remove(name)
         self.dataset.max_probabilities = None
 
@@ -5828,7 +6312,11 @@ class Analysis(object):
 
         self.dataset._zarr_create_array(self.dataset.zarr_group, 'vf_norm', (vx, vy, vz), 'f4')
         self.dataset._zarr_create_array(self.dataset.zarr_group, 'celltype_maps', (vx, vy, vz), 'i4')
-        self.dataset._zarr_create_array(self.dataset.zarr_group, 'max_correlations', (vx, vy, vz), 'f4')
+        self.dataset._zarr_create_array(self.dataset.zarr_group, score_key, (vx, vy, vz), 'f4')
+        if method == 'lda' and marker_genes_path is not None:
+            self.dataset._zarr_create_array(
+                self.dataset.zarr_group, 'celltype_marker_score', (vx, vy, vz), 'f4')
+        self.dataset.zarr_group.attrs['mapping_method'] = method
         # the workers create no arrays, so the field's provenance is recorded here
         from ._count import resolve_kernel, kernel_scale
         _dim = 2 if vz == 1 else 3
@@ -5846,6 +6334,7 @@ class Analysis(object):
         return {
             'cx': cx,
             'n_chunk': n_chunk,
+            'method': method,
             'vx': vx, 'vy': vy, 'vz': vz,
             'bandwidth': bandwidth,
             'sampling_distance': sampling_distance,
@@ -5862,7 +6351,8 @@ class Analysis(object):
                                   kernel='gaussian',
                                   size_after_normalization=10, log_transform=True,
                                   gpu_device=None, force_cpu=False,
-                                  query_subchunk_size=None, gpu_target_bytes=int(1e9)):
+                                  query_subchunk_size=None, gpu_target_bytes=int(1e9),
+                                  method='corr', marker_genes_path=None, map_kwargs=None):
         """
         Process a contiguous range of X-axis chunks for a distributed run.
 
@@ -5894,6 +6384,14 @@ class Analysis(object):
             worker uses the CPU path.
         force_cpu : bool, default False
             Force the CPU path even if ``gpu_device`` is given.
+        method : {'corr', 'lda'}, default 'corr'
+            Must match ``init_map_celltypes``: it decides which score volume the worker writes
+            (``max_correlations`` / ``max_probabilities``) and, for ``'lda'``, that the factors are
+            rebuilt from the store. Every worker reads the same store, so they build the same
+            factors and their slices join into the single-process result.
+        marker_genes_path, map_kwargs
+            As ``map_celltypes``. ``marker_genes_path`` is what makes ``'lda'`` write
+            ``celltype_marker_score``, so pass the same value to ``init_map_celltypes``.
         query_subchunk_size, gpu_target_bytes
             Forwarded to the GPU core (ignored on CPU).
         bandwidth, sampling_distance, prune_coefficient,
@@ -5922,6 +6420,7 @@ class Analysis(object):
                 sdata, do_map=True, save_vf=False,
                 chunk_start=chunk_start, chunk_end=chunk_end, cx=cx,
                 create_arrays=False, attach=False,
+                method=method, marker_genes_path=marker_genes_path, map_kwargs=map_kwargs,
                 centroids=centroids, element_name=element_name,
                 exclude_gene_indices=exclude_gene_indices, bandwidth=bandwidth,
                 sampling_distance=sampling_distance, prune_coefficient=prune_coefficient,
@@ -5951,10 +6450,10 @@ class Analysis(object):
         if getattr(self.dataset, 'shape', None) is None or \
                 not hasattr(self, 'locations') or self.locations is None:
             self._prepare_grid(sdata, element_name=element_name,
-                               bandwidth=bandwidth,
-                               sampling_distance=sampling_distance,
-                               prune_coefficient=prune_coefficient,
-                               size_after_normalization=size_after_normalization)
+                           bandwidth=bandwidth,
+                           sampling_distance=sampling_distance,
+                           prune_coefficient=prune_coefficient,
+                           size_after_normalization=size_after_normalization)
 
         vx, vy, vz = (int(self.dataset.shape[0]),
                       int(self.dataset.shape[1]),

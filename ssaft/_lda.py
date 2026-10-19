@@ -123,11 +123,23 @@ def _core_weights(pos, labels, *, radius=8.0):
     from scipy.spatial import cKDTree
     pos = np.atleast_2d(np.asarray(pos, dtype=np.float64))
     lab = np.asarray(labels)
+    r = float(radius)
+    # Counts, not neighbour lists. query_ball_point's default hands back one Python list per
+    # anchor -- 5.9 M lists of ~180 indices on a section this size -- and the per-anchor loop that
+    # reads them is what the stage spends its time on. The same two numbers come from
+    # return_length=True: the whole neighbourhood from one tree, the same-label part from a tree
+    # per label. Same w, no lists.
+    tot = cKDTree(pos).query_ball_point(pos, r=r, workers=-1, return_length=True).astype(np.int64)
+    same = np.ones(len(lab), dtype=np.int64)
+    for k in np.unique(lab):
+        idx = np.flatnonzero(lab == k)
+        if idx.size == 0:
+            continue
+        sub = pos[idx]
+        same[idx] = cKDTree(sub).query_ball_point(sub, r=r, workers=-1, return_length=True)
     w = np.ones(len(lab), dtype=np.float64)
-    for i, js in enumerate(cKDTree(pos).query_ball_point(pos, r=float(radius), workers=-1)):
-        if len(js) > 1:
-            j = np.asarray(js)
-            w[i] = (int((lab[j] == lab[i]).sum()) - 1) / (len(j) - 1)
+    m = tot > 1
+    w[m] = (same[m] - 1) / (tot[m] - 1)
     return w
 
 
@@ -205,32 +217,48 @@ def build_factors(zg, *, gene_indices=None, size_after_normalization=10.0,
     if 'normalized_vectors' not in zg or 'cluster_labels' not in zg:
         raise ValueError('LDA factors need normalized_vectors + cluster_labels; '
                          'pass h5ad=<annotated .h5ad> to map_celltypes first')
-    V = np.asarray(zg['normalized_vectors'][:], dtype=np.float64)
-    if not log_transformed:
-        V = np.log1p(V)
     y = np.asarray(zg['cluster_labels'][:])
+    n_anchor = int(zg['normalized_vectors'].shape[0])
     if 'downsampled_vf_norm' in zg:
         vn = np.asarray(zg['downsampled_vf_norm'][:], dtype=np.float64).ravel()
     else:                       # no per-anchor density: treat every vector equally
-        vn = np.ones(V.shape[0], dtype=np.float64)
+        vn = np.ones(n_anchor, dtype=np.float64)
     K = int(zg['centroids'].shape[0]) if 'centroids' in zg else int(y.max()) + 1
-    cnt = _pseudo_counts(V, vn, size_after_normalization, veff)
-    del V
-    if gene_indices is not None:
-        cnt = cnt[:, np.asarray(gene_indices, dtype=np.int64)]
+    gi = None if gene_indices is None else np.asarray(gene_indices, dtype=np.int64)
+    n_gene = int(zg['normalized_vectors'].shape[1]) if gi is None else int(gi.size)
     pos, _ = anchor_positions(zg, sampling_distance=sampling_distance)
     w = _core_weights(pos, y, radius=purity_radius)
-    lam = np.zeros((K, cnt.shape[1]), dtype=np.float64)
+    # soften the classes that are too thin to be core-weighted BEFORE the pass over the
+    # anchors, so each anchor's weight is final and the sums can be accumulated blockwise
     n_soft = 0
     for k in range(K):
         m = y == k
         if not m.any():
             continue
-        wk = w[m]
-        if wk.sum() < float(min_effective):
-            wk = 0.5 * (wk + 1.0)
+        if w[m].sum() < float(min_effective):
+            w[m] = 0.5 * (w[m] + 1.0)
             n_soft += 1
-        lam[k] = (cnt[m] * wk[:, None]).sum(0)
+    # blockwise: materializing every anchor's counts at once is 274 GB on a 5k-gene panel
+    # with 7.4 M anchors (float64), and the watchdog killed the stage there. One block of
+    # rows at a time costs `block` x n_gene x 8 B and sums into the same float64 lam.
+    lam = np.zeros((K, n_gene), dtype=np.float64)
+    block = max(1, int(2 << 30) // max(1, n_gene * 8))       # ~2 GiB of working rows
+    for s0 in range(0, n_anchor, block):
+        s1 = min(s0 + block, n_anchor)
+        V = np.asarray(zg['normalized_vectors'][s0:s1], dtype=np.float64)
+        if not log_transformed:
+            V = np.log1p(V)
+        cnt = _pseudo_counts(V, vn[s0:s1], size_after_normalization, veff)
+        del V
+        if gi is not None:
+            cnt = cnt[:, gi]
+        yb, wb = y[s0:s1], w[s0:s1]
+        for k in np.unique(yb):
+            if k < 0 or k >= K:
+                continue
+            m = yb == k
+            lam[k] += (cnt[m] * wb[m][:, None]).sum(0)
+        del cnt
     real = _real_class_mask(zg, K)
     sets = _owned_gene_sets(lam, real, own_frac)
     beta = _marker_aware_beta(lam, sets)
@@ -659,7 +687,10 @@ class GriddedAnchorPrior:
     def _exact_rows(self, pix_xy, sel):
         """The KD-tree prior for the handful of positions k_max would truncate."""
         from scipy.spatial import cKDTree
-        q = np.asarray(pix_xy)[sel]
+        # the caller may pass (x, y, z) while this prior's tree is built on (x, y) alone -- a 2D
+        # lattice over transcripts that carry a z (CosMx whole slides). Query in the tree's own
+        # dimensions; the extra column is the one the gridded field already ignores.
+        q = np.asarray(pix_xy)[sel][:, :self._tree.m]
         dist, idx = self._tree.query(q, k=self.k_max,
                                      distance_upper_bound=self.d_max, workers=-1)
         if dist.ndim == 1:
