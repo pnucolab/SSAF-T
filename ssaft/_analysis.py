@@ -1550,7 +1550,7 @@ class Analysis(object):
         raise RuntimeError('No points element found in sdata.')
 
     @staticmethod
-    def _image_planes(images, z_step=None, z_origin=0.0):
+    def _image_planes(images, z_step=None, z_origin=0.0, stain=None):
         """Resolve z-stack files into imaging planes, for :meth:`zstack_image`.
 
         Accepts
@@ -1633,12 +1633,20 @@ class Analysis(object):
                     groups.setdefault(pat.sub('', f.name), []).append(str(f))
             if not groups:
                 raise FileNotFoundError(f'images={s!r}: no per-plane *_z<N>.tif files in this folder')
-            if len(groups) > 1:
-                ex = sorted(groups)[0]
+            # A folder holds one plane series PER STAIN (MERSCOPE images/: mosaic_DAPI_z0.tif,
+            # mosaic_PolyT_z0.tif ...). Which stain the tissue mask is thresholded on changes
+            # the mask and so the anchors, so it is named, never guessed -- not even when the
+            # folder happens to hold a single series today.
+            if stain is None:
                 raise ValueError(
-                    f'images={s!r} holds {len(groups)} plane series ({sorted(groups)}); pick one '
-                    f"with a glob, e.g. images='{p / (ex + '_z*.tif')}'")
-            return _from_files(next(iter(groups.values())), 'a folder')
+                    f'images={s!r} is a folder: name the stain to stack, e.g. stain=\'DAPI\'. '
+                    f'Available: {sorted(groups)}')
+            hits = [k for k in groups if str(stain).lower() in k.lower()]
+            if len(hits) != 1:
+                raise ValueError(
+                    f'stain={stain!r} matches {len(hits)} of the plane series {sorted(groups)} '
+                    f'in {s!r}; give the name of exactly one')
+            return _from_files(groups[hits[0]], f'a folder (stain {stain!r})')
         if not p.is_file():
             raise FileNotFoundError(f'images={s!r} does not exist')
 
@@ -1726,7 +1734,7 @@ class Analysis(object):
         return keep, float(step) * stride, float(z_origin) + want[0] * float(step)
 
     @staticmethod
-    def zstack_planes(source, sdata=None, *, z=None, z_step=None, z_origin=0.0,
+    def zstack_planes(source, sdata=None, *, stain=None, z=None, z_step=None, z_origin=0.0,
                       element_name=None, transcripts_z=None, z_unit=None, slab=None,
                       verbose=True):
         """What each imaging plane is worth: where it sits, and how many molecules are there.
@@ -1770,7 +1778,8 @@ class Analysis(object):
             ``slab``.
         """
         import pandas as pd
-        planes, step = Analysis._image_planes(source, z_step=z_step, z_origin=0.0)
+        planes, step = Analysis._image_planes(source, z_step=z_step, z_origin=0.0,
+                                              stain=stain)
         planes, step, z_origin = Analysis._select_planes(planes, step, z, z_origin)
         if transcripts_z is None:
             if sdata is None:
@@ -1827,21 +1836,41 @@ class Analysis(object):
         return df
 
     @staticmethod
-    def zstack_image(source, *, like=None, z=None, z_step=None, z_origin=0.0,
+    def zstack_image(source, *, sdata=None, key=None, stain=None, write=True,
+                     like=None, z=None, z_step=None, z_origin=0.0,
                      scale_factors=None, chunk=2048):
-        """A z-stack as a SpatialData 3D image element, ready for ``sdata.images[key] = ...``.
+        """Stack imaging planes into a SpatialData 3D image element.
 
-        :meth:`downsample_vector` reads every image from ``sdata.images``. For ``z=3`` the
-        element named by ``images=`` must carry a ``z`` axis; this builds one, lazily, so it
-        can be added to the SpatialData the rest of the analysis already uses::
+        OPTIONAL. :meth:`downsample_vector` samples the element named by ``image_key=``,
+        whatever it is: a plain 2D stain gives one tissue mask, this gives one per plane.
+        Use it when several planes are worth sampling — :meth:`zstack_planes` says which::
 
-            sdata.images['morphology_zstack'] = Analysis.zstack_image(
-                '.../morphology.ome.tif', like=sdata.images['morphology_focus'])
-            analysis.downsample_vector(sdata, z=3, images='morphology_zstack', ...)
+            key = Analysis.zstack_image('.../morphology.ome.tif', sdata=sdata,
+                                        like=sdata.images['morphology_focus'])
+            # -> stored and persisted as sdata.images['morphology_zstack']
+            analysis.downsample_vector(sdata, z=3, image_key=key, ...)
+
+        MERSCOPE, where a folder holds one series per stain, names the stain::
+
+            key = Analysis.zstack_image('.../images', sdata=sdata, stain='DAPI',
+                                        z=[2, 3, 4], z_step=1.5,
+                                        like=sdata.images['DAPI'])   # -> 'DAPI_zstack'
+
+        With ``sdata`` the element is stored (and, unless ``write=False``, written to the
+        store) and the KEY is returned; without it the element itself is returned.
 
         :param source: a ``ZYX`` stack file (Xenium ``morphology.ome.tif``), a folder of
             per-plane ``*_z<N>.tif`` files (MERSCOPE ``images/``), a glob pattern or a list
             of files — see :meth:`_image_planes`.
+        :param sdata: store the element in ``sdata.images`` and return its key. Without it
+            the element is returned and the caller stores it.
+        :param key: the key to store it under; the default is the stain's (or the source
+            file's) name + ``_zstack`` — ``morphology.ome.tif`` -> ``morphology_zstack``,
+            ``stain='DAPI'`` -> ``DAPI_zstack``.
+        :param stain: which stain to stack. **Required when ``source`` is a folder**, since
+            a folder holds one plane series per stain and the choice decides the tissue
+            mask; a glob or a file list names the stain already.
+        :param write: with ``sdata``, also persist the element to the store (default True).
         :param like: the 2D image element whose pixel grid the planes share (e.g.
             ``sdata.images['morphology_focus']``). Its transformations give the element's
             x/y placement in every coordinate system, and its size is checked. Without it
@@ -1868,7 +1897,8 @@ class Analysis(object):
         from spatialdata.transformations import (Scale, Sequence, Translation,
                                                  get_transformation as _get_tf)
 
-        planes, step = Analysis._image_planes(source, z_step=z_step, z_origin=0.0)
+        planes, step = Analysis._image_planes(source, z_step=z_step, z_origin=0.0,
+                                              stain=stain)
         planes, step, z_origin = Analysis._select_planes(planes, step, z, z_origin)
 
         def _lazy(src):
@@ -1899,10 +1929,71 @@ class Analysis(object):
         # where each plane lives, so a whole plane can be decoded straight from the file (in
         # parallel) instead of through the rechunked multiscale graph -- ~10x faster on JPEG2000
         el.attrs['ssaft_plane_sources'] = [pl['source'] for pl in planes]
-        return el
+        if sdata is None:
+            return el
+        k = str(key) if key else Analysis._zstack_key(source, stain)
+        sdata.images[k] = el
+        print(f"zstack_image: images[{k!r}] <- {len(planes)} planes of {source!r}"
+              + (f" (stain {stain!r})" if stain else "")
+              + f", z {[round(pl['z'], 3) for pl in planes]}", flush=True)
+        if write:
+            try:
+                sdata.write_element(k, overwrite=True)
+            except TypeError:
+                sdata.write_element(k)
+            print(f"zstack_image: persisted images[{k!r}]", flush=True)
+        return k
 
     @staticmethod
-    def _sdata_image_planes(sdata, images):
+    def _zstack_key(source, stain=None):
+        """The element key a stack is stored under: the stain's (or the file's) name + ``_zstack``.
+
+        ``morphology.ome.tif`` -> ``morphology_zstack``; ``stain='DAPI'`` -> ``DAPI_zstack``.
+        """
+        import re as _re
+        from pathlib import Path as _P
+        if stain:
+            base = str(stain)
+        else:
+            src = source[0] if isinstance(source, (list, tuple)) and len(source) else source
+            base = _P(str(src)).name
+            base = _re.sub(r'\[Z=\d+\]$', '', base)
+            for suf in ('.ome.tif', '.ome.tiff', '.tif', '.tiff'):
+                if base.lower().endswith(suf):
+                    base = base[:-len(suf)]
+                    break
+            base = _re.sub(r'[_-]?z[\d*?]+$', '', base, flags=_re.I)
+            base = _re.sub(r'[*?\[\]]', '', base).strip('_-')
+        return f'{base or "image"}_zstack'
+
+    @staticmethod
+    def _element_leaf(node):
+        """The full-resolution DataArray of an image element (multiscale or not)."""
+        if not hasattr(node, 'values') or hasattr(node, 'children'):
+            first = node[list(node.keys())[0]]
+            return first['image'] if hasattr(first, 'image') else first[list(first.data_vars)[0]]
+        return node
+
+    def _transcripts_z_mid(self, sdata, element_name=None):
+        """Middle of the molecules' z range -- where a stain with no z of its own is placed.
+
+        A projected stain (Xenium ``morphology_focus``, a MIP) marks tissue in x/y and says
+        nothing about depth. In a 3D run its one plane has to sit somewhere, and the centre of
+        the section is the only choice that is not arbitrary: a plane outside the molecules'
+        z range is skipped by :meth:`_select_vectors_3d` and would yield no anchors at all.
+        """
+        key = self._pick_element(getattr(sdata, 'points', {}), element_name,
+                                 kind='points', param='element_name')
+        df = sdata.points[key]
+        if 'z' not in list(getattr(df, 'columns', [])):
+            raise ValueError(f"points[{key!r}] carries no z column, so a 3D run has no depth to "
+                             f"place a 2D stain at — give a z-stack element instead")
+        zmin = float(df['z'].min().compute())
+        zmax = float(df['z'].max().compute())
+        return 0.5 * (zmin + zmax)
+
+    @staticmethod
+    def _sdata_image_planes(sdata, images, flat_z=None):
         """The planes of ``sdata.images[images]``, a 3D image element, for :meth:`_select_vectors_3d`.
 
         Each plane's ``z`` is its pixel centre pushed through the element's ``'global'``
@@ -1933,8 +2024,9 @@ class Analysis(object):
                             f'(or a list of keys), got {type(images).__name__} {images!r}')
         if images not in sdata.images:
             raise KeyError(f"sdata.images has no {images!r} (available: {list(sdata.images.keys())}). "
-                           f"For z=3 add the z-stack as a 3D image element first, e.g. "
-                           f"sdata.images[{images!r}] = Analysis.zstack_image(path, like=sdata.images[...])")
+                           f"To sample several imaging planes, stack them first: "
+                           f"Analysis.zstack_image(path, sdata=sdata, like=sdata.images[...]) "
+                           f"returns the key it stored them under.")
         node = sdata.images[images]
         if not hasattr(node, 'values') or hasattr(node, 'children'):
             first = node[list(node.keys())[0]]
@@ -1942,8 +2034,20 @@ class Analysis(object):
         else:
             leaf = node
         if 'z' not in leaf.dims:
-            raise ValueError(f"sdata.images[{images!r}] has dims {tuple(leaf.dims)}: z=3 needs a 3D "
-                             f"image element with a z axis (see Analysis.zstack_image)")
+            # A PLAIN 2D stain (a projection such as Xenium morphology_focus). It is one plane,
+            # and it carries no depth of its own, so the caller says where it sits: `flat_z`,
+            # the middle of the molecules' z range. The number of imaging planes is a property
+            # of this element, NOT of the analysis being 2D or 3D -- a 3D field sampled from a
+            # single projected stain is a legitimate run.
+            if flat_z is None:
+                raise ValueError(
+                    f"sdata.images[{images!r}] has dims {tuple(leaf.dims)} and so carries no z; "
+                    f"a 3D run needs flat_z= (the depth to place it at), or a z-stack element "
+                    f"built with Analysis.zstack_image")
+            return [dict(index=0, z=float(flat_z),
+                         read=(lambda: np.asarray(leaf.data)),
+                         source=f'images[{images!r}] (2D, placed at z={float(flat_z):g})',
+                         image_key=images)]
         M = np.asarray(_get_tf(node, to_coordinate_system='global').to_affine_matrix(
             input_axes=('x', 'y', 'z'), output_axes=('x', 'y', 'z')), dtype=np.float64)
         if not (np.allclose(M[2, :2], 0.0) and np.allclose(M[:2, 2], 0.0)):
@@ -2071,7 +2175,7 @@ class Analysis(object):
                         element_name=None,
                         bandwidth=2.5, sampling_distance=1.0,
                         prune_coefficient=4.3, size_after_normalization=10,
-                        log_transform=True, n_samples=5, block_um=10,
+                        log_transform=True, n_samples=10, block_um=10,
                         seed=42, filter_is_gene=True, genes=None,
                         revert_image=True, intensity='luminance',
                         kernel='gaussian', gpu_device='cuda',
@@ -2593,7 +2697,7 @@ class Analysis(object):
             del zg.attrs['count_frame']
         return bin_adata
 
-    def downsample_vector(self, sdata=None, *, z, grid=None, images=None, auto_gpu=True,
+    def downsample_vector(self, sdata=None, *, z, grid=None, image_key=None, auto_gpu=True,
                           gpu_device='cuda', **kwargs):
         """Public entry point with automatic GPU/CPU dispatch.
 
@@ -2696,21 +2800,19 @@ class Analysis(object):
         if z not in (2, 3):
             raise ValueError(f'z must be 2 or 3 (the dimensionality of the analysis), got {z!r}')
         z = int(z)
-        if z == 3 and images is None:
-            raise ValueError(
-                "z=3 needs images=: the key of a 3D image element (c, z, y, x) in sdata.images. "
-                "A 2D image carries no depth, so it cannot say where along z the tissue is. Add "
-                "the z-stack first, e.g. sdata.images['morphology_zstack'] = "
-                "Analysis.zstack_image('.../morphology.ome.tif', like=sdata.images['morphology_focus'])")
-        if images is not None and not (isinstance(images, str) or
-                (isinstance(images, (list, tuple)) and images and
-                 all(isinstance(x, str) for x in images))):
-            raise TypeError(f'images= is the key of an element in sdata.images (or a list of '
-                            f'keys, one per stain), not {type(images).__name__} {images!r}; '
-                            f'add a z-stack file with Analysis.zstack_image first')
-        if z == 2 and images is not None:
-            raise ValueError('images= is only used with z=3; with z=2 the tissue mask comes '
-                             'from sdata.images[image_key]')
+        # image_key names ONE element of sdata.images and is the only image input. How many
+        # imaging planes are sampled is that element's own business: a plain 2D stain gives
+        # one, a z-stack built by Analysis.zstack_image gives its planes. That is independent
+        # of z, which is the dimensionality of the VECTOR FIELD -- a 3D field sampled from a
+        # single projected stain is a legitimate run.
+        if image_key is not None and not isinstance(image_key, str):
+            raise TypeError(
+                f'image_key= is the key of ONE element in sdata.images, not '
+                f'{type(image_key).__name__} {image_key!r}. To sample several imaging planes, '
+                f'stack them first with Analysis.zstack_image(..., sdata=sdata) and pass the '
+                f'key it returns.')
+        if image_key is not None:
+            kwargs['image_key'] = image_key
         self.n_dims = z
         grid = grid if grid is not None else getattr(self, '_count_grid', None)
         zg = self.dataset.zarr_group
@@ -2730,14 +2832,11 @@ class Analysis(object):
             if z != 2:
                 raise ValueError('the count backend field is a 2D blur raster: downsample it '
                                  'with z=2')
-            if kwargs.get('otsu_mult') is not None:
-                raise ValueError('otsu_mult is supported for the transcript backend only; the '
-                                 'count backend takes otsu_threshold')
             zg.attrs['n_dims'] = 2
             from ._count import select_vectors_from_image
             grid_um = float(zg.attrs.get('sampling_distance',
                             zg.attrs.get('bin_size_um', 1.0)))
-            sel_keys = ('n_samples_per_block', 'block_um', 'otsu_threshold',
+            sel_keys = ('n_samples_per_block', 'block_um', 'otsu_threshold', 'otsu_mult',
                         'norm_threshold_mult', 'vf_norm_percentile',
                         'lookup_chunk_h', 'seed',
                         'lookup_n_workers', 'lookup_ram_gb')
@@ -2759,19 +2858,19 @@ class Analysis(object):
         with _ctx:
             kwargs.setdefault('gpu_device', gpu_device)
             self._downsample_stats = self._downsample_vector_impl(
-                sdata=sdata, n_dims=z, images=images, **kwargs)
+                sdata=sdata, n_dims=z, **kwargs)
         return self._downsampled_adata()
 
     def _downsample_vector_impl(self, sdata=None, element_name=None,
                          bandwidth=2.5, sampling_distance=1.0, prune_coefficient=4.3,
                          kernel='gaussian', gpu_device='cuda',
                          size_after_normalization=10, log_transform=True,
-                         n_samples=5, block_um=10, seed=42,
+                         n_samples=None, block_um=10, seed=42,
                          filter_is_gene=True, genes=None,
                          chunked=False, sdata_dir=None,
                          image_key='he', otsu_threshold=None,
                          revert_image=True, intensity='luminance',
-                         n_dims=2, images=None, otsu_mult=None):
+                         n_dims=2, otsu_mult=None):
         """
         Select representative vectors from H&E-intensity-guided positions.
 
@@ -2798,8 +2897,10 @@ class Analysis(object):
         image_key : str, default 'he'
             Key under which the staining / morphology image (e.g. H&E or
             polyT) is stored in ``sdata.images``.
-        n_samples : int
-            Number of voxels to sample per ``block_um × block_um`` µm block.
+        n_samples : int, optional
+            Number of voxels to sample per ``block_um × block_um`` µm block. In 3D this is
+            per block OF EACH IMAGING PLANE, so the total grows with the number of planes;
+            the default follows the dimensionality — **10 for z=2, 5 for z=3**.
         block_um : float
             Block size in µm used to determine sampling density.
         revert_image : bool, default True
@@ -2818,11 +2919,10 @@ class Analysis(object):
         n_dims : {2, 3}, default 2
             Dimensionality of the analysis (``downsample_vector(z=...)``). ``2`` is the
             original path: one tissue mask from ``sdata.images[image_key]``, anchors on a
-            single plane, 2D KDE. ``3`` samples every plane of ``sdata.images[images]``
-            (see :meth:`_select_vectors_3d`). Recorded in the store as ``attrs['n_dims']``.
-        images : str, optional
-            ``n_dims=3`` only: key of the 3D image element in ``sdata.images`` (in every
-            tile's SpatialData when ``chunked=True``); see :meth:`_sdata_image_planes`.
+            single plane, 2D KDE. ``3`` builds a 3D field and samples every imaging plane
+            of ``sdata.images[image_key]`` (see :meth:`_select_vectors_3d`); a plain 2D
+            stain is simply one plane, placed at the middle of the molecules' z range.
+            Recorded in the store as ``attrs['n_dims']``.
         otsu_mult : float, optional
             Scale the automatically computed Otsu threshold by this factor
             (``None``, the default, keeps the Otsu value as computed). It scales
@@ -2840,6 +2940,12 @@ class Analysis(object):
         """
         from pathlib import Path as _Path
         import spatialdata as _sd
+
+        # n_samples is per block OF EACH IMAGING PLANE, so a 3D run with several planes
+        # multiplies it. The default therefore follows the dimensionality: 10 per block in 2D,
+        # 5 in 3D, which keeps the two in the same ballpark for a typical few-plane stack.
+        if n_samples is None:
+            n_samples = 10 if int(n_dims) == 2 else 5
 
         helper_kwargs = dict(
             element_name=element_name,
@@ -2867,13 +2973,15 @@ class Analysis(object):
         if not chunked and self.n_dims == 3:
             if sdata is None:
                 raise ValueError('chunked=False requires sdata.')
-            planes = self._sdata_image_planes(sdata, images)
+            planes = self._sdata_image_planes(
+                sdata, image_key, flat_z=self._transcripts_z_mid(sdata, element_name))
             if self.verbose:
-                print(f'downsample_vector (3D): {len(planes)} planes of images[{images!r}] at z '
+                print(f'downsample_vector (3D): {len(planes)} plane(s) of '
+                      f'images[{image_key!r}] at z '
                       f"{[round(pl['z'], 3) for pl in planes]}", flush=True)
             self.dataset.shape = None
             gx_he, gy_he, gz_he, normalized_vectors, vf_norm_all, genes, coordinate_offset, sample_stats = \
-                self._select_vectors_3d(planes, sdata, images,
+                self._select_vectors_3d(planes, sdata, image_key,
                                         otsu_threshold=otsu_threshold, otsu_mult=otsu_mult,
                                         **helper_kwargs)
             sample_stats['plane_z'] = [pl['z'] for pl in planes]
@@ -2893,6 +3001,13 @@ class Analysis(object):
         elif not chunked:
             if sdata is None:
                 raise ValueError('chunked=False requires sdata.')
+            if image_key in getattr(sdata, 'images', {}):
+                _leaf = self._element_leaf(sdata.images[image_key])
+                if 'z' in getattr(_leaf, 'dims', ()):
+                    raise ValueError(
+                        f"z=2 builds a 2D field from ONE image, but sdata.images[{image_key!r}] "
+                        f"is a z-stack ({_leaf.sizes.get('z')} planes). Pass the 2D stain it was "
+                        f"built from, or run with z=3 to sample every plane.")
 
             he_img = self._he_array_axis_aligned(
                 sdata, image_key=image_key,
@@ -2953,7 +3068,8 @@ class Analysis(object):
                 tile_planes_of = {}
                 for zp in zarr_paths:
                     s = _sd.read_zarr(zp, selection=('images',))
-                    tile_planes_of[zp] = (s, self._sdata_image_planes(s, images))
+                    tile_planes_of[zp] = (s, self._sdata_image_planes(
+                        s, image_key, flat_z=self._transcripts_z_mid(s, element_name)))
                 planes = tile_planes_of[zarr_paths[0]][1]
                 ref_z = np.array([pl['z'] for pl in planes])
                 for zp, (_, tp) in tile_planes_of.items():
@@ -3029,8 +3145,11 @@ class Analysis(object):
                     # the tile's own crop of the z-stack, placed by its own transform
                     he_img = None
                     gx, gy, gz, nvecs, vfn, chunk_genes, coord_off, stats = \
-                        self._select_vectors_3d(self._sdata_image_planes(chunk_sdata, images),
-                                                chunk_sdata, images,
+                        self._select_vectors_3d(
+                            self._sdata_image_planes(
+                                chunk_sdata, image_key,
+                                flat_z=self._transcripts_z_mid(chunk_sdata, element_name)),
+                            chunk_sdata, image_key,
                                                 plane_otsu=plane_otsu, otsu_mult=otsu_mult,
                                                 **helper_kwargs)
                 else:
@@ -3176,7 +3295,7 @@ class Analysis(object):
         self.dataset.zarr_group.attrs['otsu_mult'] = otsu_mult
         if self.n_dims == 3:
             self.dataset.zarr_group.attrs['image_planes'] = dict(
-                images=str(images), n_planes=int(sample_stats.get('n_planes', 0)),
+                images=str(image_key), n_planes=int(sample_stats.get('n_planes', 0)),
                 z=[float(v) for v in sample_stats.get('plane_z', [])])
 
         for key in ('coordinate_offset', 'coordinate_bounds',
@@ -4867,7 +4986,7 @@ class Analysis(object):
                       shapes_3d_key="ssaft_cell_boundaries_3d",
                       labels_3d_key="ssaft_cell_labels_3d", table_key="ssaft_cells",
                       column="cellman_annotation", nuclei_frame=None, tile=1024, pad_um=64.0,
-                      nuclei_z=None):
+                      nuclei_z=None, seed_rule="column_mode"):
         """Cut the cell-type map into single cells by a celltype-constrained watershed.
 
         The segmentation-free map says *what* each voxel is but not *which cell* it
@@ -4900,11 +5019,10 @@ class Analysis(object):
         * *markers* -- a marker only says where the water is poured: each nucleus centroid is one
           seed voxel, and its cell type is the map's label there. The seed's layer is the
           nucleus's own z (``nuclei_z``) when it is known and lands on a labelled voxel; otherwise
-          the labelled voxel of the nucleus's xy column nearest the middle of the column's
-          labelled run (the local tissue midline). A nucleus whose column is background on every
-          layer is ignored. One fixed layer for all nuclei would drop every nucleus where a tilted
-          or uneven section does not cross that layer -- two thirds of them on a Xenium section
-          spread over 60 µm in z.
+          ``seed_rule`` decides it from the nucleus's xy column. A nucleus whose column is
+          background on every layer is ignored. One fixed layer for all nuclei would drop every
+          nucleus where a tilted or uneven section does not cross that layer -- two thirds of them
+          on a Xenium section spread over 60 µm in z.
         * *flood* -- per cell type, the 3D watershed of the Euclidean distance to the seeds,
           confined to that cell type's voxels, computed in xy tiles of ``tile`` voxels with
           ``pad_um`` of overlap (each tile keeps its core) on ``ncores`` processes.
@@ -4995,13 +5113,22 @@ class Analysis(object):
         :param pad_um: 3D only: tile overlap, µm.
         :param nuclei_z: 3D only: each nucleus's z in µm (the transcripts' z frame), in the order
             of ``nuclei``; ``NaN`` where unknown. E.g. the median z of the transcripts inside each
-            nucleus (Xenium ``overlaps_nucleus``). Without it every seed sits on its column's
-            tissue midline.
+            nucleus (Xenium ``overlaps_nucleus``). Without it ``seed_rule`` places the seed.
+        :param seed_rule: 3D only: how a seed's layer is chosen when ``nuclei_z`` does not give
+            one. ``'column_mode'`` (default) takes the cell type that owns the most voxels of the
+            nucleus's column -- what a projection of the map down z shows there -- and puts the
+            seed at the middle voxel OF THAT TYPE. ``'midplane'`` is the older rule: the labelled
+            voxel nearest the geometric middle of the column's labelled run, whatever type lies
+            there. ``'midplane'`` picks the layer first and takes the type as a by-product, so a
+            thin sliver of a neighbour lying at the middle of the tissue captures the nucleus;
+            pass it only to reproduce a segmentation made before ``'column_mode'`` existed.
         :returns: The SpatialData with the elements added.
         """
         if nuclei is None:
             raise ValueError("nuclei= is required (array of µm coords, or a "
                              "shapes/points element key)")
+        if seed_rule not in ("column_mode", "midplane"):
+            raise ValueError(f"seed_rule must be 'column_mode' or 'midplane', got {seed_rule!r}")
         sdata = sdata if sdata is not None else getattr(
             self.dataset, '_original_input_data', None)
         if sdata is None:
@@ -5024,7 +5151,8 @@ class Analysis(object):
                 max_volume_um3=max_volume_um3, exclude_celltypes=exclude_celltypes,
                 transcripts=transcripts, shapes_key=shapes_key, shapes_3d_key=shapes_3d_key,
                 labels_3d_key=labels_3d_key, table_key=table_key, column=column,
-                nuclei_frame=nuclei_frame, tile=tile, pad_um=pad_um, nuclei_z=nuclei_z)
+                nuclei_frame=nuclei_frame, tile=tile, pad_um=pad_um, nuclei_z=nuclei_z,
+                seed_rule=seed_rule)
         return self._segment_cells_2d(
             sdata, nuclei, z=z, simplify=simplify, min_area_um2=min_area_um2,
             max_area_um2=max_area_um2, exclude_celltypes=exclude_celltypes,
@@ -5034,7 +5162,7 @@ class Analysis(object):
     def _segment_cells_3d(self, sdata, nuclei, *, simplify, min_area_um2, max_volume_um3,
                           exclude_celltypes, transcripts,
                           shapes_key, shapes_3d_key, labels_3d_key, table_key, column,
-                          nuclei_frame, tile, pad_um, nuclei_z=None):
+                          nuclei_frame, tile, pad_um, nuclei_z=None, seed_rule="column_mode"):
         """The 3D path of :meth:`segment_cells`."""
         import geopandas as gpd
         from joblib import Parallel, delayed
@@ -5080,18 +5208,44 @@ class Analysis(object):
             lab_ok = slab[vx[idx], vy[idx], k[ok]] >= 0
             vz[idx[lab_ok]] = k[ok][lab_ok]
             own[idx[lab_ok]] = True
-        # the rest: the labelled voxel of the column nearest the middle of its labelled run
+        # the rest: seed_rule reads the layer off the nucleus's xy column.
+        #
+        # 'column_mode' asks WHICH CELL TYPE first -- the one holding the most voxels of the
+        # column, i.e. what a projection of the map down z shows at that pixel -- and only then
+        # WHERE, at the middle voxel of that type's own voxels. The seed therefore carries the
+        # type by construction and can land neither on a minority sliver nor on a boundary.
+        #
+        # 'midplane' is the reverse and is kept only to reproduce older runs: it fixes the layer
+        # at the geometric middle of the column's labelled run and takes whatever type lies
+        # there. The middle is a property of the tissue's thickness, not of the nucleus or of the
+        # types, so a neighbour sandwiched at that depth captures the nucleus — a placenta
+        # nucleus that is fibroblast on 11 of its 14 labelled voxels became an endothelial cell
+        # off a three-voxel band, and the 4,996-voxel fibroblast body around it, left with no
+        # seed of its own type, was never cut out at all.
         rest = np.flatnonzero(inside & ~own)
         n_mid = 0
-        for c0 in range(0, len(rest), 200_000):
-            r = rest[c0:c0 + 200_000]
-            col = slab[vx[r], vy[r], :] >= 0                          # (n, Z)
+        chunk = max(1, min(200_000, 5_000_000 // max(K, 1)))          # cnt below is (chunk, K)
+        for c0 in range(0, len(rest), chunk):
+            r = rest[c0:c0 + chunk]
+            colv = slab[vx[r], vy[r], :]                              # (n, Z) labels, <0 = empty
+            col = (colv >= 0) & (colv < K)
             anyc = col.any(1)
-            lo = col.argmax(1)
-            hi = Zall - 1 - col[:, ::-1].argmax(1)
-            m = (lo + hi) // 2
-            dz = np.where(col, np.abs(np.arange(Zall)[None, :] - m[:, None]), Zall + 1)
-            vz[r[anyc]] = dz.argmin(1)[anyc]
+            if seed_rule == "midplane":
+                lo = col.argmax(1)
+                hi = Zall - 1 - col[:, ::-1].argmax(1)
+                m = (lo + hi) // 2
+                dz = np.where(col, np.abs(np.arange(Zall)[None, :] - m[:, None]), Zall + 1)
+                vz[r[anyc]] = dz.argmin(1)[anyc]
+            else:
+                nr = len(r)
+                cnt = np.bincount(np.repeat(np.arange(nr), col.sum(1)) * K
+                                  + colv[col].astype(np.int64),
+                                  minlength=nr * K).reshape(nr, K)
+                pick = cnt.argmax(1)                                  # the column's own cell type
+                msk = col & (colv == pick[:, None])
+                cs = np.cumsum(msk, axis=1)
+                tgt = ((cs[:, -1] - 1) // 2 + 1)[:, None]             # its middle voxel
+                vz[r[anyc]] = ((cs >= tgt) & msk).argmax(1)[anyc]
             n_mid += int(anyc.sum())
         cts = np.full(len(vx), -1, dtype=np.int32)
         ok = inside & (vz >= 0)
@@ -5237,8 +5391,11 @@ class Analysis(object):
         adata.uns['segment_cells'] = dict(
             n_dims=3, z_layers=[int(z0), int(z1)],
             z_um=[float(oz + z0 * sd_um), float(oz + z1 * sd_um)],
-            seeds="per nucleus: its own z (nuclei_z) when labelled there, else its column's "
-                  "labelled voxel nearest the tissue midline",
+            seeds=("per nucleus: its own z (nuclei_z) when labelled there, else "
+                   + ("the middle voxel of the commonest cell type in its column"
+                      if seed_rule == "column_mode" else
+                      "its column's labelled voxel nearest the tissue midline")),
+            seed_rule=seed_rule,
             n_seed_own_z=int((use & own).sum()), n_seed_column=int((use & ~own).sum()),
             obsm_spatial="voxel centroid, µm (x, y, z)", area_um2="area on the cell's seed layer",
             shapes_2d="each cell's outline on its seed layer",
@@ -5272,7 +5429,7 @@ class Analysis(object):
         n_bg = int((inside & ~use).sum())
         print(f"[segment_cells] labels['{labels_3d_key}'] {len(present)} cells in 3D from "
               f"{int(use.sum())}/{len(vx)} nuclei (seeds: {int((use & own).sum())} at the nucleus's own z, "
-              f"{int((use & ~own).sum())} on the column's tissue midline; {n_bg} on a background column "
+              f"{int((use & ~own).sum())} by seed_rule='{seed_rule}'; {n_bg} on a background column "
               f"ignored, {int((~inside).sum())} outside map"
               + (f", {drop_small} below {min_area_um2}µm² on every layer" if drop_small else "")
               + (f", {n_capped} trimmed to {max_volume_um3}µm³" if n_capped else "")

@@ -749,6 +749,7 @@ def _image_gray(image, revert):
 def select_vectors_from_image(analysis, grid, *, bin_size_um: float,
                               n_samples_per_block: int = 3, block_um: float = 10.0,
                               otsu_threshold: Optional[float] = None,
+                              otsu_mult: Optional[float] = None,
                               norm_threshold_mult: float = 2.0,
                               vf_norm_percentile: Optional[float] = 25.0,
                               lookup_chunk_h: int = 64, seed: int = 0,
@@ -772,6 +773,10 @@ def select_vectors_from_image(analysis, grid, *, bin_size_um: float,
     :type block_um: float
     :param otsu_threshold: fixed tissue-mask threshold; computed by Otsu when ``None``.
     :type otsu_threshold: float or None
+    :param otsu_mult: scale the Otsu value ssaft computes by this factor (``0.6`` lowers the
+        threshold and widens the mask). Only with ``otsu_threshold=None`` -- a threshold that
+        was given is used as given.
+    :type otsu_mult: float or None
     :param norm_threshold_mult: multiplier for the analytic ``vf_norm`` threshold when no percentile is used.
     :type norm_threshold_mult: float
     :param vf_norm_percentile: percentile of nonzero ``vf_norm`` used as the keep threshold; ``None`` uses the analytic form.
@@ -797,6 +802,11 @@ def select_vectors_from_image(analysis, grid, *, bin_size_um: float,
     upp = grid.um_per_px
     if otsu_threshold is None:
         otsu_threshold = float(threshold_otsu(he))
+        if otsu_mult is not None:
+            otsu_threshold *= float(otsu_mult)
+    elif otsu_mult is not None:
+        raise ValueError('otsu_mult scales the Otsu threshold ssaft computes; with '
+                         'otsu_threshold given there is none to scale — pass one or the other')
     mask = he > otsu_threshold
     ys, xs = np.where(mask)
     n_mask = len(ys)
