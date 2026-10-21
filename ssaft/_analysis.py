@@ -642,9 +642,11 @@ class Analysis(object):
             actual_depth = float(z_max - z_min) if 'z' in df.columns else 1
             
             z_threshold = 1.0
-            is_3d = ('z' in df.columns and 
-                    actual_depth > z_threshold and 
-                    df['z'].nunique() > 1)
+            # The span alone decides: a z that varies at all already spans more than one
+            # value, so counting distinct values adds nothing -- and counting them over a
+            # PREFIX of the rows (as this used to, for speed) calls a z-sorted file 2D
+            # because its first rows all sit on one plane. Measured on CosMx.
+            is_3d = 'z' in df.columns and actual_depth > z_threshold
             
             if width is None:
                 width = actual_width
@@ -699,9 +701,11 @@ class Analysis(object):
             actual_depth = float(z_max - z_min) if 'z' in df.columns else 1
             
             z_threshold = 1.0
-            is_3d = ('z' in df.columns and 
-                    actual_depth > z_threshold and 
-                    df['z'].nunique() > 1)
+            # The span alone decides: a z that varies at all already spans more than one
+            # value, so counting distinct values adds nothing -- and counting them over a
+            # PREFIX of the rows (as this used to, for speed) calls a z-sorted file 2D
+            # because its first rows all sit on one plane. Measured on CosMx.
+            is_3d = 'z' in df.columns and actual_depth > z_threshold
             
             if width is None:
                 width = actual_width
@@ -1049,7 +1053,8 @@ class Analysis(object):
         tz = tz_raw - z_min
 
         z_threshold = 1.0
-        is_3d = has_z and (tz_raw.max() - tz_raw.min()) > z_threshold and len(set(tz_raw[:10000])) > 1
+        # see _validate_input_data: the span is the whole test, and it is taken over every row
+        is_3d = has_z and (tz_raw.max() - tz_raw.min()) > z_threshold
         # the recorded dimensionality wins over the inference (see _prepare_grid)
         nd = n_dims if n_dims is not None else getattr(self, 'n_dims', None)
         if nd == 2:
