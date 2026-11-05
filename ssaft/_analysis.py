@@ -186,7 +186,69 @@ def _blob_labels(mask, first_id, out):
     return int(n)
 
 
-def _cap_label_volume(labels, seed_xyz, voxel_vol_um3, max_volume_um3, counts=None):
+def _all_celltype_seeds(slab, vx, vy, nidx, K, ex_ids, chunk=100_000):
+    """One cell per (nucleus column, cell type): every cell type of the column gets a seed.
+
+    The nucleus markers are a 2D segmentation of a 3D section, so they are not a faithful list of
+    nuclei -- nuclei at different depths of one xy position merge into a single marker, and others
+    are missed outright. With one seed per marker, a cell type the map found at that position but
+    not at the seed's own layer has no seed anywhere, and the flood, confined to each type's own
+    region, never cuts it out: the type is in the map and absent from the segmentation. Seeding
+    every type of the column keeps them. Nothing else changes -- the pour points are simply more
+    numerous, and the flood that follows is the same one.
+
+    All voxels of one type in one column SHARE a label, so that type yields one cell there rather
+    than one per voxel. Markers are first deduplicated by voxel column: this rule does not read a
+    marker's z, so two markers at one xy are the same pour point and cannot be told apart; they
+    make one set of cells, and how many fell there is reported as that cell's ``n_nuclei``.
+
+    Returns ``(seeds_xyz, seeds_ct, seeds_id, seed_nuc, seed_nnuc)``, all parallel and one row per
+    SEED VOXEL -- ``seeds_id`` repeats within a (column, type) group, which is what makes the
+    group one basin of the watershed.
+    """
+    Y = slab.shape[1]
+    nidx = np.asarray(nidx, dtype=np.int64)
+    empty = (np.zeros((0, 3), np.int64), np.zeros(0, np.int32), np.zeros(0, np.int32),
+             np.zeros(0, np.int64), np.zeros(0, np.int32))
+    if nidx.size == 0:
+        return empty
+    # one representative marker per voxel column, and how many markers fell on it
+    pix = vx[nidx] * np.int64(Y) + vy[nidx]
+    order = np.argsort(pix, kind="stable")
+    pix_s = pix[order]
+    first = np.r_[0, np.flatnonzero(pix_s[1:] != pix_s[:-1]) + 1]
+    rep = nidx[order[first]]
+    nrep = np.diff(np.r_[first, pix_s.size]).astype(np.int32)
+    ex = np.asarray(sorted(ex_ids), dtype=np.int64) if ex_ids else None
+
+    out, next_id = [], 1
+    for c0 in range(0, rep.size, chunk):
+        r, cn = rep[c0:c0 + chunk], nrep[c0:c0 + chunk]
+        colv = slab[vx[r], vy[r], :]                           # (n, Z) labels, <0 = background
+        good = (colv >= 0) & (colv < K)
+        if ex is not None:
+            good &= ~np.isin(colv, ex)
+        rows, zs = np.nonzero(good)
+        if rows.size == 0:
+            continue
+        ct = colv[rows, zs]
+        # group the column's voxels by (column, cell type); each group is one cell
+        key = rows.astype(np.int64) * K + ct
+        o = np.argsort(key, kind="stable")
+        key_s = key[o]
+        f = np.r_[0, np.flatnonzero(key_s[1:] != key_s[:-1]) + 1]
+        ids = (next_id + np.repeat(np.arange(f.size), np.diff(np.r_[f, key_s.size]))).astype(np.int32)
+        next_id += f.size
+        ro = rows[o]
+        out.append((np.c_[vx[r][ro], vy[r][ro], zs[o]], ct[o].astype(np.int32), ids,
+                    r[ro], cn[ro]))
+    if not out:
+        return empty
+    return tuple(np.concatenate([o[i] for o in out]) for i in range(5))
+
+
+def _cap_label_volume(labels, seed_xyz, voxel_vol_um3, max_volume_um3, counts=None,
+                      seeds_lab=None, seeds_pts=None):
     """Trim every cell to the voxels nearest its own seed, up to ``max_volume_um3``.
 
     The 3D counterpart of :func:`_cap_label_area`, and the right bound for a 3D run: a cap on each
@@ -224,8 +286,23 @@ def _cap_label_volume(labels, seed_xyz, voxel_vol_um3, max_volume_um3, counts=No
         labs.append(plane[a, b])
     x = np.concatenate(xs); y = np.concatenate(ys); z = np.concatenate(zs)
     lab = np.concatenate(labs).astype(np.int64)
-    d2 = ((x - seed_xyz[lab, 0]) ** 2 + (y - seed_xyz[lab, 1]) ** 2
-          + (z - seed_xyz[lab, 2]) ** 2)
+    if seeds_lab is None:
+        d2 = ((x - seed_xyz[lab, 0]) ** 2 + (y - seed_xyz[lab, 1]) ** 2
+              + (z - seed_xyz[lab, 2]) ** 2)
+    else:
+        # a cell may have SEVERAL seed voxels (seed_rule='all'): the distance is to the
+        # NEAREST of its own, so every seed sits at 0 and the trimming cannot take one of them.
+        # Only the over-cap labels are walked, and each holds at most one seed per layer.
+        d2 = np.empty(x.size, np.int64)
+        by_lab = {}
+        for sl, sp in zip(seeds_lab, seeds_pts):
+            by_lab.setdefault(int(sl), []).append(sp)
+        for lb in over:
+            m = lab == lb
+            pts = np.asarray(by_lab.get(int(lb), [seed_xyz[lb]]), dtype=np.int64)
+            d2[m] = ((x[m][:, None] - pts[None, :, 0]) ** 2
+                     + (y[m][:, None] - pts[None, :, 1]) ** 2
+                     + (z[m][:, None] - pts[None, :, 2]) ** 2).min(axis=1)
     order = np.lexsort((d2, lab))
     lab_s = lab[order]
     uniq, first, cnt = np.unique(lab_s, return_index=True, return_counts=True)
@@ -1018,7 +1095,8 @@ class Analysis(object):
 
         return vx, vy, vz
 
-    def _parse_transcripts(self, sdata, sampling_distance=1.0, filter_is_gene=True, n_dims=None):
+    def _parse_transcripts(self, sdata, sampling_distance=1.0, filter_is_gene=True, n_dims=None,
+                           element_name=None):
         """
         Extract transcript coordinates from SpatialData and compute grid indices.
 
@@ -1028,7 +1106,12 @@ class Analysis(object):
             Keys: gene_names, coordinate_offset, tx, ty, tz,
                   xc_g, yc_g, zc_g, is_3d, dim
         """
-        pts = sdata.points[list(sdata.points.keys())[0]]
+        # The SAME element _prepare_grid measured, chosen the same way: a SpatialData may hold one
+        # points element PER FIELD OF VIEW (spatialdata_io.cosmx), and taking "the first" would
+        # build the grid from the named FOV and then fill it with another one's transcripts.
+        element_name = self._pick_element(getattr(sdata, 'points', {}), element_name,
+                                          kind='points', param='element_name')
+        pts = sdata.points[element_name]
         if hasattr(pts, 'compute'):
             pts = pts.compute()
         if filter_is_gene and 'is_gene' in pts.columns:
@@ -1536,12 +1619,15 @@ class Analysis(object):
         return int(var.shape[dims.index('y')]), int(var.shape[dims.index('x')])
 
     @staticmethod
-    def _points_px_per_um(sdata):
+    def _points_px_per_um(sdata, element_name=None):
         """x/y scale of the points element's ``'global'`` transform, read as
-        :meth:`_select_vectors` reads it (the mask is counted in those pixels)."""
+        :meth:`_select_vectors` reads it (the mask is counted in those pixels).
+
+        ``element_name`` picks the element, as everywhere else: a SpatialData may hold one
+        points element per field of view, and their transforms need not agree."""
         from spatialdata.transformations import get_transformation as _get_tf
         for _etype, _ename, _elem in sdata.gen_elements():
-            if _etype != 'points':
+            if _etype != 'points' or (element_name is not None and _ename != element_name):
                 continue
             _tf = _get_tf(_elem, get_all=True).get('global', None)
             if _tf is not None and hasattr(_tf, 'scale'):
@@ -2082,8 +2168,7 @@ class Analysis(object):
 
     @staticmethod
     def _tile_z_range(tile_path):
-        """``(z_min, z_max)`` of a tile's transcripts (the first points element, as
-        :meth:`_parse_transcripts` reads it)."""
+        """``(z_min, z_max)`` of a tile's transcripts (its single points element)."""
         import spatialdata as _sd
         s = _sd.read_zarr(str(tile_path), selection=('points',))
         pts = s.points[list(s.points.keys())[0]]
@@ -2231,7 +2316,7 @@ class Analysis(object):
 
         meta = self._parse_transcripts(
             sdata, sampling_distance=sampling_distance,
-            filter_is_gene=filter_is_gene
+            filter_is_gene=filter_is_gene, element_name=element_name
         )
 
         ndim = 2 if vz == 1 else 3
@@ -2389,10 +2474,11 @@ class Analysis(object):
                                n_dims=3)
         vx, vy, vz = self.dataset.shape
         meta = self._parse_transcripts(sdata, sampling_distance=sampling_distance,
-                                       filter_is_gene=filter_is_gene, n_dims=3)
+                                       filter_is_gene=filter_is_gene, n_dims=3,
+                                       element_name=element_name)
         norm_threshold = kernel_peak(kernel_scale(bandwidth, 3, kernel), 3, kernel) * 2
 
-        x_scale, y_scale = self._points_px_per_um(sdata)
+        x_scale, y_scale = self._points_px_per_um(sdata, element_name)
         block_px = (block_um * x_scale) * (block_um * y_scale)
 
         # _select_vectors' support test -- a transcript within rp nodes (inf-norm) in x/y --
@@ -4991,7 +5077,7 @@ class Analysis(object):
                       shapes_3d_key="ssaft_cell_boundaries_3d",
                       labels_3d_key="ssaft_cell_labels_3d", table_key="ssaft_cells",
                       column="cellman_annotation", nuclei_frame=None, tile=1024, pad_um=64.0,
-                      nuclei_z=None, seed_rule="column_mode"):
+                      nuclei_z=None, seed_rule="majority"):
         """Cut the cell-type map into single cells by a celltype-constrained watershed.
 
         The segmentation-free map says *what* each voxel is but not *which cell* it
@@ -5119,21 +5205,35 @@ class Analysis(object):
         :param nuclei_z: 3D only: each nucleus's z in µm (the transcripts' z frame), in the order
             of ``nuclei``; ``NaN`` where unknown. E.g. the median z of the transcripts inside each
             nucleus (Xenium ``overlaps_nucleus``). Without it ``seed_rule`` places the seed.
-        :param seed_rule: 3D only: how a seed's layer is chosen when ``nuclei_z`` does not give
-            one. ``'column_mode'`` (default) takes the cell type that owns the most voxels of the
-            nucleus's column -- what a projection of the map down z shows there -- and puts the
-            seed at the middle voxel OF THAT TYPE. ``'midplane'`` is the older rule: the labelled
-            voxel nearest the geometric middle of the column's labelled run, whatever type lies
-            there. ``'midplane'`` picks the layer first and takes the type as a by-product, so a
-            thin sliver of a neighbour lying at the middle of the tissue captures the nucleus;
-            pass it only to reproduce a segmentation made before ``'column_mode'`` existed.
+        :param seed_rule: 3D only: which cell types of a nucleus's xy column get a seed, and on
+            which layer. ``'majority'`` (default) and ``'midplane'`` give the nucleus ONE seed;
+            ``'all'`` gives it one per cell type of its column.
+
+            ``'majority'`` takes the cell type that owns the most voxels of the column -- what a
+            projection of the map down z shows there -- and puts the seed at the middle voxel OF
+            THAT TYPE, so the seed carries the type by construction. When ``nuclei_z`` gives the
+            nucleus's own layer, that layer is used instead and this rule only fills the gaps.
+
+            ``'all'`` seeds EVERY cell type of the column, all of one type sharing one label so
+            that type yields one cell there. It is for markers that do not faithfully list the
+            nuclei -- a 2D segmentation of a 3D section merges nuclei at different depths and
+            misses others -- where one seed per marker leaves a cell type that the map found at
+            that xy, but not on the seed's layer, with no seed anywhere, so the flood never cuts
+            it out and the type is in the map and absent from the segmentation. It therefore
+            IGNORES ``nuclei_z``: a marker is one pour point or many, not both.
+
+            ``'midplane'`` is the oldest rule: the labelled voxel nearest the geometric middle of
+            the column's labelled run, whatever type lies there. It picks the layer first and
+            takes the type as a by-product, so a thin sliver of a neighbour lying at the middle
+            of the tissue captures the nucleus; pass it only to reproduce an older segmentation.
         :returns: The SpatialData with the elements added.
         """
         if nuclei is None:
             raise ValueError("nuclei= is required (array of µm coords, or a "
                              "shapes/points element key)")
-        if seed_rule not in ("column_mode", "midplane"):
-            raise ValueError(f"seed_rule must be 'column_mode' or 'midplane', got {seed_rule!r}")
+        if seed_rule not in ("majority", "midplane", "all"):
+            raise ValueError("seed_rule must be 'majority', 'all' or 'midplane', "
+                             f"got {seed_rule!r}")
         sdata = sdata if sdata is not None else getattr(
             self.dataset, '_original_input_data', None)
         if sdata is None:
@@ -5167,7 +5267,7 @@ class Analysis(object):
     def _segment_cells_3d(self, sdata, nuclei, *, simplify, min_area_um2, max_volume_um3,
                           exclude_celltypes, transcripts,
                           shapes_key, shapes_3d_key, labels_3d_key, table_key, column,
-                          nuclei_frame, tile, pad_um, nuclei_z=None, seed_rule="column_mode"):
+                          nuclei_frame, tile, pad_um, nuclei_z=None, seed_rule="majority"):
         """The 3D path of :meth:`segment_cells`."""
         import geopandas as gpd
         from joblib import Parallel, delayed
@@ -5202,6 +5302,12 @@ class Analysis(object):
         inside = (vx >= 0) & (vx < X) & (vy >= 0) & (vy < Y)
         vz = np.full(len(vx), -1, dtype=np.int64)
         own = np.zeros(len(vx), dtype=bool)
+        if nuclei_z is not None and seed_rule == "all":
+            # 'all' does not read a marker's z: it seeds the whole column. Taking the z
+            # here as well would make a marker both one pour point and many.
+            if self.verbose:
+                print("[segment_cells] seed_rule='all' ignores nuclei_z", flush=True)
+            nuclei_z = None
         if nuclei_z is not None:
             zz = np.asarray(nuclei_z, dtype=np.float64).ravel()
             if zz.shape[0] != len(vx):
@@ -5215,7 +5321,7 @@ class Analysis(object):
             own[idx[lab_ok]] = True
         # the rest: seed_rule reads the layer off the nucleus's xy column.
         #
-        # 'column_mode' asks WHICH CELL TYPE first -- the one holding the most voxels of the
+        # 'majority' asks WHICH CELL TYPE first -- the one holding the most voxels of the
         # column, i.e. what a projection of the map down z shows at that pixel -- and only then
         # WHERE, at the middle voxel of that type's own voxels. The seed therefore carries the
         # type by construction and can land neither on a minority sliver nor on a boundary.
@@ -5263,9 +5369,40 @@ class Analysis(object):
         seed_use = use & ~np.isin(cts, list(ex_ids)) if ex_ids else use
         if not seed_use.any() and ex_ids:
             raise ValueError("every nucleus sits on an excluded cell type; nothing would be segmented")
-        seeds_xyz = np.c_[vx[seed_use], vy[seed_use], vz[seed_use]]
-        seeds_ct = cts[seed_use]
-        seeds_id = np.arange(1, int(seed_use.sum()) + 1, dtype=np.int32)
+        if seed_rule == "all":
+            seeds_xyz, seeds_ct, seeds_id, seed_nuc, seed_nnuc = _all_celltype_seeds(
+                slab, vx, vy, np.flatnonzero(use), K, ex_ids)
+            if seeds_id.size == 0:
+                raise ValueError("every nucleus's column is background or an excluded cell type; "
+                                 "nothing would be segmented")
+        else:
+            seeds_xyz = np.c_[vx[seed_use], vy[seed_use], vz[seed_use]]
+            seeds_ct = cts[seed_use]
+            seeds_id = np.arange(1, int(seed_use.sum()) + 1, dtype=np.int32)
+            seed_nuc = np.flatnonzero(seed_use)
+            seed_nnuc = np.ones(seeds_id.size, np.int32)
+        # one row per seed VOXEL above; these are per LABEL, for the places that index by label id
+        # (the cap's origin, the layer the 2D outline is cut on, the cell type, the nucleus count).
+        # A label's seeds share its cell type, so `ct` needs no reduction; the layer is the median
+        # of the label's own seeds, which is the single seed in every rule but 'all'.
+        n_seed_lab = int(seeds_id.max()) + 1
+        lab_ct = np.full(n_seed_lab, -1, np.int32)
+        lab_ct[seeds_id] = seeds_ct
+        lab_nuc = np.zeros(n_seed_lab, np.int64)
+        lab_nuc[seeds_id] = seed_nuc
+        lab_nnuc = np.zeros(n_seed_lab, np.int32)
+        lab_nnuc[seeds_id] = seed_nnuc
+        if seed_rule == "all":
+            o = np.lexsort((seeds_xyz[:, 2], seeds_id))
+            ids_s = seeds_id[o]
+            f = np.r_[0, np.flatnonzero(ids_s[1:] != ids_s[:-1]) + 1]
+            n_per = np.diff(np.r_[f, ids_s.size])
+            med = o[f + (n_per - 1) // 2]
+            lab_seed_xyz = np.zeros((n_seed_lab, 3), np.int64)
+            lab_seed_xyz[ids_s[f]] = seeds_xyz[med]
+        else:
+            lab_seed_xyz = np.zeros((n_seed_lab, 3), np.int64)
+            lab_seed_xyz[seeds_id] = seeds_xyz
 
         # ---- 3D watershed in xy tiles
         pad = int(np.ceil(float(pad_um) / sd_um))
@@ -5282,10 +5419,11 @@ class Analysis(object):
 
         # ---- cap each cell's VOLUME: the seed voxel is the nearest one to itself, so what a cell
         # loses is its outside (see _cap_label_volume)
-        n_lab = int(seeds_id.max()) + 1
-        seed_xyz = np.zeros((n_lab, 3), np.int64)
-        seed_xyz[seeds_id] = seeds_xyz
-        n_capped = len(_cap_label_volume(labels, seed_xyz, sd_um ** 3, max_volume_um3))
+        n_lab = n_seed_lab
+        n_capped = len(_cap_label_volume(
+            labels, lab_seed_xyz, sd_um ** 3, max_volume_um3,
+            seeds_lab=(seeds_id if seed_rule == "all" else None),
+            seeds_pts=(seeds_xyz if seed_rule == "all" else None)))
 
         # ---- the excluded cell types: one object per connected piece, after the cap so no bound of
         # the segmented cells can reach them (ndimage.label walks the whole volume once per type)
@@ -5338,7 +5476,7 @@ class Analysis(object):
         planes = Parallel(n_jobs=max(1, min(int(self.ncores), Z)))(
             delayed(_plane_polygons)(labels[:, :, k], sd_um, ox, oy, simplify) for k in range(Z))
         seed_k = np.full(n_lab, -1, dtype=np.int64)
-        seed_k[seeds_id] = seeds_xyz[:, 2] - z0
+        seed_k[: n_seed_lab] = lab_seed_xyz[:, 2] - z0
         seed_k[is_blob] = cover_k[is_blob]
         recs, mid, area_mid = [], [], np.full(n_lab, np.nan)
         for k, polys in enumerate(planes):
@@ -5362,11 +5500,13 @@ class Analysis(object):
             sdata, labels, present, sd_um, ox, oy, oz, z0, transcripts=tx_key)
 
         ctid = np.full(n_lab, -1, dtype=np.int32)
-        ctid[seeds_id] = seeds_ct
+        ctid[: n_seed_lab] = lab_ct
         for lb, c in blob_ct.items():
             ctid[lb] = c
         n_nuclei = np.zeros(n_lab, np.int32)
-        n_nuclei[seeds_id] = 1                        # one nucleus per segmented cell, by construction
+        # one marker per segmented cell by construction -- except under 'all', where the
+        # markers that merged onto one voxel column are all credited to each cell of that column
+        n_nuclei[: n_seed_lab] = lab_nnuc
         if ex_ids:
             exn = use & np.isin(cts, list(ex_ids))    # the nuclei inside the untouched bodies
             if exn.any():
@@ -5398,7 +5538,7 @@ class Analysis(object):
             z_um=[float(oz + z0 * sd_um), float(oz + z1 * sd_um)],
             seeds=("per nucleus: its own z (nuclei_z) when labelled there, else "
                    + ("the middle voxel of the commonest cell type in its column"
-                      if seed_rule == "column_mode" else
+                      if seed_rule == "majority" else
                       "its column's labelled voxel nearest the tissue midline")),
             seed_rule=seed_rule,
             n_seed_own_z=int((use & own).sum()), n_seed_column=int((use & ~own).sum()),
@@ -5434,7 +5574,9 @@ class Analysis(object):
         n_bg = int((inside & ~use).sum())
         print(f"[segment_cells] labels['{labels_3d_key}'] {len(present)} cells in 3D from "
               f"{int(use.sum())}/{len(vx)} nuclei (seeds: {int((use & own).sum())} at the nucleus's own z, "
-              f"{int((use & ~own).sum())} by seed_rule='{seed_rule}'; {n_bg} on a background column "
+              f"{int((use & ~own).sum())} by seed_rule='{seed_rule}'"
+              + (f" -> {int(seeds_id.max())} cells, {seeds_id.size} seed voxels" if seed_rule == "all" else "")
+              + f"; {n_bg} on a background column "
               f"ignored, {int((~inside).sum())} outside map"
               + (f", {drop_small} below {min_area_um2}µm² on every layer" if drop_small else "")
               + (f", {n_capped} trimmed to {max_volume_um3}µm³" if n_capped else "")
