@@ -78,18 +78,22 @@ printf '\n[sandbox_workspace_write]\nnetwork_access = true\n' >> .codex/config.t
 
 ## Documentation
 
-Full documentation is in preparation and will be published on Read the Docs.
+The documentation lives in [`docs/`](docs) and is built with Sphinx (see
+[`.readthedocs.yaml`](.readthedocs.yaml)). It takes the pipeline one stage at a time under
+[`docs/pipeline/`](docs/pipeline) and gives one worked example per data modality:
 
-Until then, `notebooks/` holds one worked example per data modality. Each notebook starts with the commands
-that download its public dataset into `notebooks/data/`, and writes its results to `notebooks/outputs/`:
-
-| notebook | modality | map |
+| tutorial | modality | map |
 |---|---|---|
-| [`notebooks/tutorial_visiumhd_small_intestine.ipynb`](notebooks/tutorial_visiumhd_small_intestine.ipynb) | array-based spatial transcriptomics (Visium HD, mouse small intestine) | 2D |
-| [`notebooks/tutorial_xenium_kidney_3d.ipynb`](notebooks/tutorial_xenium_kidney_3d.ipynb) | imaging-based spatial transcriptomics (Xenium, mouse kidney) | 3D |
+| [`docs/tutorials/array.md`](docs/tutorials/array.md) | array-based spatial transcriptomics (Visium HD, mouse small intestine) | 2D |
+| [`docs/tutorials/imaging.md`](docs/tutorials/imaging.md) | imaging-based spatial transcriptomics (Xenium, mouse kidney) | 3D |
 
-For scRNA-seq — where no spatial mapping is involved and CeLLMan is used on its own — see
-[`CeLLMan/notebooks/TS_lung.ipynb`](CeLLMan/notebooks/TS_lung.ipynb).
+The notebook each one is written from is under [`docs/notebooks/`](docs/notebooks). It begins with
+the commands that download its public dataset, so the example can be run start to finish.
+
+[`notebooks/`](notebooks) is something else: the scripts that reproduce the figure panels of the
+paper, one directory per dataset. Each holds a `run_ssaft.py` for the run itself and numbered
+scripts for the panels that dataset contributes, reading nothing but the SSAF-T output and the
+files the original authors published.
 
 For how to phrase the prompt that starts an annotation run, see
 [`CeLLMan/CALLER_PROMPT_GUIDE.md`](CeLLMan/CALLER_PROMPT_GUIDE.md).

@@ -1190,6 +1190,13 @@ class Analysis(object):
                 _remove_array(self.dataset.zarr_group, name)
             self.dataset.zarr_group[name] = value
 
+        # The lattice step the grid was just built with, in the element's world units.
+        # Every reader of 'sampling_distance' (the cell-type map and label affines, and the
+        # world coordinates of the downsampled anchors) falls back to 1.0 when the store does
+        # not carry it, which silently misplaces a transcript-backend store built with any
+        # other step. The count backend records the same key from _count.py.
+        self.dataset.zarr_group.attrs['sampling_distance'] = float(sampling_distance)
+
         return vx, vy, vz
 
     def _parse_transcripts(self, sdata, sampling_distance=1.0, filter_is_gene=True, n_dims=None,
