@@ -1,11 +1,13 @@
-"""SSAF-T — Spatial Segmentation-free Agentic Framework for Transcriptomics.
+"""SSAF-T, the Spatial Segmentation-free Agentic Framework for Transcriptomics.
 
-Segmentation-free, multi-platform spatial cell-type mapping: transcript-level
-KDE vector field, per-pixel cell-type assignment (``import ssaft``).
+This package performs segmentation-free, multi-platform spatial cell-type mapping. It
+builds a kernel density estimate of the transcript field, assigns a cell type to every
+voxel of that field, and cuts cells out of the result. Import it as ``import ssaft``.
 
 The agentic annotation component ships as a separate repository, CeLLMan
-(https://github.com/pnucolab/CeLLMan), linked here as the ``CeLLMan/``
-submodule. It is driven by an LLM host, not imported from this package.
+(https://github.com/pnucolab/CeLLMan), which is linked here as the ``CeLLMan/``
+submodule. CeLLMan is driven by a large language model host and is not imported from
+this package.
 """
 
 from ._analysis import Analysis
@@ -26,5 +28,9 @@ except ImportError:
 
 
 def is_spatialdata_available():
-    """Check if SpatialData is available."""
+    """Report whether the optional ``spatialdata`` dependency could be imported.
+
+    :returns: ``True`` when ``spatialdata`` is installed and importable, ``False`` otherwise.
+    :rtype: bool
+    """
     return _SPATIALDATA_AVAILABLE

@@ -1,3 +1,26 @@
+"""The analysis object: every stage of the segmentation-free pipeline.
+
+:class:`Analysis` drives the whole pipeline over a :class:`~ssaft.Dataset`, from the
+raw input through to the cells. The stages are, in order, building the vector field,
+sampling anchors from it, mapping cell types onto it, filtering the resulting map, and
+cutting cells out of what remains.
+
+Two backends feed the same downstream code. A transcript platform, such as Xenium,
+MERSCOPE or CosMx, is estimated directly from the molecules, on the processor through
+the compiled extension or on the GPU through the Triton kernel. A count platform,
+such as Visium HD, Stereo-seq or StrataMap, is rasterized and blurred instead, by
+:func:`ssaft._count.compute_vf_blur`. From the anchors onwards the two paths are one.
+
+Three mappers are available and write the same arrays: the centroid correlation in
+:func:`ssaft._count.map_corr`, the Gaussian naive Bayes posterior in
+:func:`ssaft._gnb.map_gnb`, and the FICTURE-style factor model in
+:func:`ssaft._lda.map_lda`. The cell-type annotation itself is not performed here; it
+is produced by CeLLMan and read back in as an annotated h5ad.
+
+The compiled extension and spatialdata are both optional at import time. When either
+is missing, the module still imports and only the paths that need it fail, with a
+message saying so.
+"""
 import numcodecs
 from multiprocessing.pool import ThreadPool
 import pickle
@@ -55,12 +78,38 @@ try:
 except ImportError:
     _UTILS_AVAILABLE = False
     def check_avx512f():
+        """Report whether the processor supports AVX-512 foundation instructions.
+
+        This is the fallback definition, used when the compiled extension could not be
+        imported. It always reports that the instructions are unavailable.
+
+        :returns: ``False``.
+        :rtype: bool
+        """
         return False
     
     def calc_corrmap(*args, **kwargs):
+        """Stand in for the compiled correlation routine, which is not available.
+
+        This is the fallback definition, used when the compiled extension could not be
+        imported.
+
+        :param args: Accepted and ignored.
+        :param kwargs: Accepted and ignored.
+        :raises NotImplementedError: Always, naming the missing extension.
+        """
         raise NotImplementedError("C++ extension not available. Please build cellman properly.")
     
     def calc_kde(*args, **kwargs):
+        """Stand in for the compiled kernel density routine, which is not available.
+
+        This is the fallback definition, used when the compiled extension could not be
+        imported.
+
+        :param args: Accepted and ignored.
+        :param kwargs: Accepted and ignored.
+        :raises NotImplementedError: Always, naming the missing extension.
+        """
         raise NotImplementedError("C++ extension not available. Please build cellman properly.")
 
 try:
@@ -83,7 +132,7 @@ def _nest_rings(g):
     diagonally pinched into two pieces that genuinely are separate parts, so
     "everything but the largest is a hole" is wrong too.
 
-    Classify by nesting parity instead — a part inside an odd number of others
+    Classify by nesting parity instead: a part inside an odd number of others
     is a hole, and belongs to the smallest part that contains it.
     """
     from shapely.geometry import MultiPolygon, Polygon
@@ -320,7 +369,7 @@ def _cap_label_area(lab2d, seed_a, seed_b, voxel_area_um2, max_area_um2):
     voxel sits at distance 0 and is kept first, and the cells that ran away lose their outside,
     inwards, until they fit. Without this a nucleus sitting alone in a large region of its own
     celltype floods that whole region -- the watershed has nothing else to stop it, and on a
-    tissue edge or a sparse celltype that produces single "cells" of hundreds of µm².
+    tissue edge or a sparse celltype that produces single "cells" of hundreds of um^2.
 
     ``seed_a`` / ``seed_b`` give each label's seed position along axis 0 / axis 1 of ``lab2d``,
     indexed by label id. Voxels equally far from the seed are kept in index order. ``lab2d`` is
@@ -345,7 +394,7 @@ def _cap_label_area(lab2d, seed_a, seed_b, voxel_area_um2, max_area_um2):
 
 
 def _plane_polygons(lab_xy, sd_um, ox, oy, simplify=None):
-    """``[(label, polygon)]`` of one ``(x, y)`` label plane, in the map's µm frame.
+    """``[(label, polygon)]`` of one ``(x, y)`` label plane, in the map's um frame.
 
     Traced along voxel boundaries by :func:`spatialdata.to_polygons` (one chunk, so no seams),
     shell/hole nesting restored by :func:`_nest_rings`.
@@ -394,6 +443,17 @@ if check_avx512f():
 else:
     corr = lambda a, b: np.corrcoef(a, b)[0, 1]
     def calc_ctmap(x, Y, _):
+        """Correlate one vector against every row of a matrix, in pure NumPy.
+
+        This is the fallback definition, used when the compiled extension could not be
+        imported. A row of zero variance yields not-a-number rather than dividing by zero.
+
+        :param x: The vector to correlate, of shape ``(n,)``.
+        :param Y: The rows to correlate it against, of shape ``(k, n)``.
+        :param _: Accepted for signature parity with the compiled routine, and ignored.
+        :returns: The correlations, of shape ``(k,)``.
+        :rtype: numpy.ndarray
+        """
         mean_x = np.mean(x)
         mean_Y = np.mean(Y, axis=1)
         x_diff = x - mean_x
@@ -437,6 +497,27 @@ class Analysis(object):
     :type verbose: bool
     """
     def __init__(self, dataset, ncores=1, verbose=False):
+        """Bind the analysis to a dataset, fix the thread count, and reload prior results.
+
+        The requested number of cores is clamped to what the machine has. A value of zero or
+        below is taken as a count relative to that, so minus two means all cores but two. The
+        chosen number is then exported to the thread-pool environment variables that NumPy,
+        BLAS and numexpr read, and set on the dask pool, so that every library underneath
+        agrees rather than each spawning its own full set of threads.
+
+        Whatever the dataset's store already holds is loaded back onto the dataset, so that an
+        analysis reopened on an existing store continues where the last one stopped instead of
+        recomputing.
+
+        :param dataset: The dataset whose store this analysis reads and writes.
+        :type dataset: Dataset
+        :param ncores: Number of cores for parallel computation. When a value of zero or below
+            is given, that many cores are left free rather than used.
+        :type ncores: int
+        :param verbose: Whether to print progress messages during the analysis.
+        :type verbose: bool
+        :raises ValueError: If the resulting number of cores is not positive.
+        """
         self.dataset = dataset
         if not ncores > 0:
             ncores += multiprocessing.cpu_count()
@@ -565,10 +646,25 @@ class Analysis(object):
             self.dataset.transferred_cluster_correlations = self.dataset.zarr_group['transferred_cluster_correlations'][:]
 
     def _m(self, message):
+        """Print a progress message, but only when the analysis is verbose.
+
+        :param message: The message to print.
+        :type message: str
+        """
         if self.verbose:
             print(message, flush=True)
     
     def _load_kde(self):
+        """Load a previously computed vector field and its parameters onto the dataset.
+
+        The recorded bandwidth is the kernel's own scale, which for a compact kernel is its
+        support radius rather than a standard deviation, so only the peak formula depends on
+        which kernel wrote the field. The expression threshold is therefore derived through
+        :func:`ssaft._count.kernel_peak` using the kernel the store records, and the density
+        floor is twice that.
+
+        :raises AssertionError: If the store holds no vector field, or holds an incomplete one.
+        """
         assert 'kde_computed' in self.dataset.zarr_group, "KDE has not been computed!"
         assert all(self.dataset.zarr_group['kde_computed']), "KDE data is incomplete!"
         self.dataset.genes = list(self.dataset.zarr_group['genes'][:])
@@ -601,7 +697,7 @@ class Analysis(object):
         """Resolve one input element, refusing to guess when it is ambiguous.
 
         An explicit key is validated and returned. Otherwise the choice is made
-        only when it is unambiguous — exactly one candidate once ssaft's own
+        only when it is unambiguous, meaning exactly one candidate once ssaft's own
         outputs are excluded. With several candidates the caller must say which,
         because picking "the first" silently changes the result depending on the
         order elements happen to sit in.
@@ -884,12 +980,12 @@ class Analysis(object):
         return adata
 
     def _downsampled_world_xy(self):
-        """World-µm ``(N, 2)`` positions of the downsampled vectors.
+        """World-um ``(N, 2)`` positions of the downsampled vectors.
 
         The count backend records them directly (``downsampled_global_xy``); the
         transcript backend stores grid indices, so they are converted with the
         vector field's own ``coordinate_offset`` + ``sampling_distance``. Either
-        way the result lives in the SAME global µm frame as the staining image
+        way the result lives in the SAME global um frame as the staining image
         and the celltype-map labels, which is what makes the table overlay them.
         """
         zg = self.dataset.zarr_group
@@ -908,8 +1004,8 @@ class Analysis(object):
         """``(names, colors)`` for the celltype ids 0..K-1, both length K.
 
         Written by :func:`~ssaft._mapping_inputs.build_centroids_from_h5ad`.
-        K is ``centroids.shape[0]`` — every class the mapping can emit, including
-        the ones that never win a voxel — so the palette never depends on which
+        K is ``centroids.shape[0]``, which is every class the mapping can emit,
+        including the ones that never win a voxel, so the palette never depends on which
         classes happen to survive filtering. Stores built before these keys
         existed fall back to the celltype-index CSV, then to positional names.
         """
@@ -940,7 +1036,7 @@ class Analysis(object):
         """Re-fix the per-celltype palette WITHOUT re-running the mapping.
 
         Colour is a presentation choice, but it is stored once so every view
-        agrees — so changing it means updating that one place and re-rendering
+        agrees, so changing it means updating that one place and re-rendering
         what was derived from it. This rewrites
         ``attrs['cellman_celltype_colors']``, the annotated table's
         ``uns['cellman_annotation_colors']``, and (if a filtered map exists) the
@@ -1001,13 +1097,13 @@ class Analysis(object):
     def _write_downsampled_table(self, sdata, *, table_key='ssaft_downsampled_vectors'):
         """Write the annotated downsampled vectors into ``sdata.tables[table_key]``.
 
-        ``obs['cellman_annotation']`` is REBUILT from ``cluster_labels`` — not
+        ``obs['cellman_annotation']`` is REBUILT from ``cluster_labels`` and is not
         copied from the annotated h5ad. The two differ: the h5ad's ``Unknown`` is
         split per source cluster into ``unknown1..N``, so the h5ad may carry (say)
         27 distinct labels where the mapping uses 36 classes. Rebuilding keeps the
         categorical's categories index-aligned with the celltype ids, the rows of
         ``centroids``, the values of ``celltype_maps``, and
-        ``uns['cellman_annotation_colors']`` — one shared axis, nothing to drift.
+        ``uns['cellman_annotation_colors']``: one shared axis, nothing to drift.
 
         Vectors dropped from the mapping (``cluster_labels == -1``: Background /
         never-finalized labels) are EXCLUDED; they are background, not a class.
@@ -1047,8 +1143,9 @@ class Analysis(object):
 
         ``n_dims`` (default: ``self.n_dims``, set by :meth:`downsample_vector`) decides the
         grid's depth instead of the transcripts: ``2`` gives a single-plane grid even when
-        the transcripts carry z, ``3`` requires them to. ``None`` — a store downsampled
-        before the dimensionality was recorded — keeps inferring it from the z range.
+        the transcripts carry z, ``3`` requires them to. ``None``, which is what a store
+        downsampled before the dimensionality was recorded holds, keeps inferring it
+        from the z range.
 
         Returns
         -------
@@ -1183,8 +1280,27 @@ class Analysis(object):
 
         Parameters
         ----------
-        query_voxels : ndarray, shape (N, 2|3)  — grid-index coordinates
+        query_voxels : ndarray, shape (N, 2|3), grid-index coordinates
         meta : dict returned by ``_parse_transcripts``
+
+        genes : list[str], optional
+            Restrict the vectors to these genes. ``None`` keeps every gene in the panel.
+        bandwidth : float
+            Gaussian-equivalent kernel bandwidth in um. Each kernel's own scale is matched
+            to it on variance by :func:`ssaft._count.kernel_scale`.
+        sampling_distance : float
+            Lattice spacing in um, which is also the cell size of the search grid.
+        prune_coefficient : float
+            Truncation radius of the infinite-support kernels, in units of the bandwidth.
+            The compact kernels stop at their own support.
+        size_after_normalization : float
+            Total each vector is scaled to before the logarithm.
+        log_transform : bool
+            Whether ``log1p`` is applied after normalization.
+        kernel : str
+            One of :data:`ssaft._count.KDE_KERNELS`.
+        gpu_device : str
+            CUDA device string used when a GPU estimate is in effect.
 
         Returns
         -------
@@ -1246,11 +1362,12 @@ class Analysis(object):
         For multiscale, the highest-resolution level is returned.
 
         RGB(A) images stored channel-first ``(c, y, x)`` are transposed to
-        ``(y, x, c)``. Single-channel images — e.g. a fluorescence morphology
-        MIP stored as ``(1, y, x)`` or ``(y, x, 1)`` — are squeezed to 2-D and
+        ``(y, x, c)``. Single-channel images, for example a fluorescence morphology
+        maximum intensity projection stored as ``(1, y, x)`` or ``(y, x, 1)``, are
+        squeezed to two dimensions and
         replicated across 3 channels. Higher-bit-depth integer images (e.g.
         uint16 fluorescence) are contrast-stretched per image to 0-255 (99.9th
-        percentile → 255) rather than clipped, so tissue spans the dynamic
+        percentile to 255) rather than clipped, so tissue spans the dynamic
         range instead of saturating; uint8 RGB (H&E) is returned unchanged.
 
         The caller is responsible for ensuring that the H&E element in
@@ -1326,11 +1443,11 @@ class Analysis(object):
         transcripts global bounding box**.
 
         ``_select_vectors`` zooms this array to the transcripts-derived
-        VF grid and converts the resulting voxel indices to global µm
+        VF grid and converts the resulting voxel indices to global um
         via ``coordinate_offset + idx * sampling_distance``. That
         conversion is only correct if array index (row=0, col=0) maps
         to global (ty_min, tx_min) and (row=H, col=W) maps to
-        (ty_max, tx_max). For 90°-multiple rotations the array is
+        (ty_max, tx_max). For 90 degrees-multiple rotations the array is
         de-rotated losslessly with ``np.rot90`` and then cropped/padded
         to the transcripts bbox; for arbitrary rotations it falls back
         to ``spatialdata.rasterize`` at native pixel resolution onto
@@ -1339,7 +1456,7 @@ class Analysis(object):
         Parameters
         ----------
         target_um_per_px : float, optional
-            Only used by the rasterize fallback (non-90° rotation case).
+            Only used by the rasterize fallback (non-90 degrees rotation case).
             If ``None``, the native pixel size is auto-detected.
         revert_image : bool, default True
             Background polarity of the staining image. ``True`` for
@@ -1350,10 +1467,27 @@ class Analysis(object):
             background. Must match the value passed to the otsu / mask
             steps so padding is never mistaken for tissue.
         arr : ndarray, optional
-            Pixels to use instead of ``sdata.images[image_key]`` — one plane of
+            Pixels to use instead of ``sdata.images[image_key]``, such as one plane of
             a z-stack. The plane is placed with ``images[image_key]``'s own
             transform, so it has to share that image's pixel grid; the shape
             is checked.
+
+        sdata : spatialdata.SpatialData
+            The object holding the image and the molecules.
+        image_key : str
+            Key of the image element to read.
+        element_name : str, optional
+            Name of the points element whose extent the image is aligned to. It is resolved
+            automatically when ``None``.
+        sampling_distance : float
+            Lattice spacing in um, used when no target pixel size is given.
+        pad : bool
+            Whether to pad the image where the requested extent reaches past it, rather than
+            returning a smaller array.
+        gray_u8 : bool
+            Whether ``arr`` is already a single-channel uint8 plane, which is what the
+            per-plane path of the three-dimensional sampler hands in.
+
         """
         from spatialdata.transformations import get_transformation as _get_tf
         from spatialdata import get_extent as _get_extent
@@ -1646,17 +1780,17 @@ class Analysis(object):
 
         Accepts
 
-        * **one z-stack file** — a ``ZYX`` TIFF / OME-TIFF such as Xenium
+        * **one z-stack file**: a ``ZYX`` TIFF / OME-TIFF such as Xenium
           ``morphology.ome.tif``. Planes are read one at a time; ``z_step`` defaults to
           the OME ``PhysicalSizeZ``;
-        * **a folder of per-plane files** — e.g. a MERSCOPE ``images/`` folder with
+        * **a folder of per-plane files**: for example a MERSCOPE ``images/`` folder with
           ``mosaic_DAPI_z0.tif ... mosaic_PolyT_z6.tif``. The plane number comes from
           ``_z<N>`` in the name. When the folder holds several stains, pick one with a glob;
         * **a glob pattern** (``'.../mosaic_PolyT_z*.tif'``) or **a list of files**.
 
         Per-plane files record no spacing, so ``z_step`` is required for them. ``z`` of
         plane ``N`` is ``z_origin + N * z_step``, in the units of the transcripts' z
-        column (µm for Xenium; MERSCOPE ``global_z`` is a plane index, so its z_step is 1
+        column (um for Xenium; MERSCOPE ``global_z`` is a plane index, so its z_step is 1
         unless the loader converted it).
 
         :returns: ``(planes, z_step)`` with ``planes`` a list of
@@ -1671,6 +1805,29 @@ class Analysis(object):
         pat = re.compile(r'_z(\d+)(?:\.ome)?\.tiff?$', re.I)
 
         def _from_files(files, how):
+            """Turn a set of per-plane image files into plane records.
+
+            The plane number is taken from a ``_z<N>`` suffix in each file name when every file
+            carries one, and otherwise from the alphabetical order of the names. Two files
+            claiming the same number is an error rather than a silent reordering.
+
+            Per-plane files record no spacing. When none is supplied the spacing defaults to one,
+            so that a plane sits at its own number, which is exactly the unit MERSCOPE uses for
+            its ``global_z``. The planes and the molecules then line up with nothing to look up.
+            The price is geometric: x and y stay in micrometres while z counts planes, so the
+            kernel and every volume are stretched along z by the real spacing, which is 1.5
+            micrometres on MERSCOPE according to its ``dataorganization.csv``. A warning says so,
+            and an explicit spacing fixes it.
+
+            :param files: The per-plane image files.
+            :param how: A short phrase naming where the files came from, used in messages.
+            :type how: str
+            :returns: One record per plane, each carrying its index, its depth, a reader for the
+                whole plane, a reader for a window of it, and its source.
+            :rtype: list of dict
+            :raises FileNotFoundError: If no files were found.
+            :raises ValueError: If two files claim the same plane number.
+            """
             if not files:
                 raise FileNotFoundError(f'images={images!r}: no image files found')
             hits = [pat.search(_P(f).name) for f in files]
@@ -1696,6 +1853,19 @@ class Analysis(object):
             step = 1.0 if z_step is None else float(z_step)
 
             def _win(path, r0, r1, c0, c1):
+                """Read one rectangular window of a plane, without decoding the whole image.
+
+                The file is opened as a zarr array, and a pyramid is resolved to its full-resolution
+                level, so only the chunks the window touches are decoded.
+
+                :param path: Path to the image file.
+                :param r0: First row of the window.
+                :param r1: One past the last row of the window.
+                :param c0: First column of the window.
+                :param c1: One past the last column of the window.
+                :returns: The window.
+                :rtype: numpy.ndarray
+                """
                 store = tifffile.imread(path, aszarr=True)
                 try:
                     a = zarr.open(store, mode='r')
@@ -1764,6 +1934,19 @@ class Analysis(object):
         yax, xax = axes.index('Y'), axes.index('X')
 
         def _read(k, window=None, path=s):
+            """Read one plane, or a window of it, from a multi-page image file.
+
+            The slice along the depth axis selects the plane, and a window, when given, further
+            restricts the row and column axes, so that only the chunks it touches are decoded.
+
+            :param k: Index of the plane along the depth axis.
+            :type k: int
+            :param window: The window as first row, last row, first column and last column, or
+                ``None`` for the whole plane.
+            :param path: Path to the image file.
+            :returns: The plane, or the requested window of it.
+            :rtype: numpy.ndarray
+            """
             store = tifffile.imread(path, aszarr=True, level=0)
             try:
                 a = zarr.open(store, mode='r')
@@ -1838,12 +2021,12 @@ class Analysis(object):
 
         The molecules' ``z`` comes in one of two units, and the count follows it:
 
-        * **plane index** (MERSCOPE ``global_z`` is 0, 1, 2 ... one value per imaging plane) —
-          each plane is matched by its OWN NUMBER, so the count is exact: no slab, and the
+        * **plane index** (MERSCOPE ``global_z`` is 0, 1, 2 ... one value per imaging plane).
+          Each plane is matched by its OWN NUMBER, so the count is exact: no slab, and the
           physical spacing is not involved in it at all. ``z_step`` still has to be passed,
-          because it is what puts the planes in µm for everything downstream.
-        * **µm** (Xenium ``z_location`` is continuous) — a plane takes the molecules within
-          ``slab`` of its µm position, ``z_step`` by default, so the slabs tile the axis.
+          because it is what puts the planes in um for everything downstream.
+        * **um** (Xenium ``z_location`` is continuous). A plane takes the molecules within
+          ``slab`` of its um position, ``z_step`` by default, so the slabs tile the axis.
 
         Which one it is, is detected from the values (all integers within the plane numbers ->
         plane index) and reported; pass ``z_unit='plane'`` / ``'um'`` to force it.
@@ -1854,15 +2037,28 @@ class Analysis(object):
             unless ``element_name`` says otherwise.
         :param z: optional pre-selection, as in :meth:`zstack_image`; the census then describes
             only those planes, and counts the rest as outside.
-        :param z_step: µm between consecutive planes. Read from the OME ``PhysicalSizeZ`` of a
+        :param z_step: um between consecutive planes. Read from the OME ``PhysicalSizeZ`` of a
             stack file (Xenium); for per-plane files (MERSCOPE) it defaults to 1, which puts
             each plane at its own number -- the unit ``global_z`` already uses, so the two line
-            up without looking the spacing up. Pass the real µm (1.5 on MERSCOPE) when z
+            up without looking the spacing up. Pass the real um (1.5 on MERSCOPE) when z
             distances or volumes have to be physical.
         :param transcripts_z: the z values directly, instead of ``sdata``.
         :param z_unit: ``'plane'`` / ``'um'`` to override the detection.
-        :param slab: µm counted around each plane; ``z_step`` by default. Ignored for plane
+        :param slab: um counted around each plane; ``z_step`` by default. Ignored for plane
             indices, where the match is exact.
+
+        :param stain: Which plane series to stack when ``source`` is a folder holding more
+            than one, for example ``'DAPI'``. The series is never guessed, because which
+            stain the tissue mask is thresholded on changes the mask and so the anchors.
+        :type stain: str or None
+        :param z_origin: Depth of the first plane, in the unit the planes are placed in.
+        :type z_origin: float
+        :param element_name: Name of the points element holding the molecules. It is
+            resolved automatically when ``None``.
+        :type element_name: str or None
+        :param verbose: Whether to print the table of planes as it is built.
+        :type verbose: bool
+
         :returns: a :class:`pandas.DataFrame` indexed by the plane's own number, with its ``z``,
             the molecules it holds, that as a fraction of all of them, and the running total.
             ``df.attrs`` carries ``unit``, ``outside`` (molecules no kept plane holds) and
@@ -1934,7 +2130,7 @@ class Analysis(object):
 
         OPTIONAL. :meth:`downsample_vector` samples the element named by ``image_key=``,
         whatever it is: a plain 2D stain gives one tissue mask, this gives one per plane.
-        Use it when several planes are worth sampling — :meth:`zstack_planes` says which::
+        Use it when several planes are worth sampling, and :meth:`zstack_planes` says which::
 
             key = Analysis.zstack_image('.../morphology.ome.tif', sdata=sdata,
                                         like=sdata.images['morphology_focus'])
@@ -1952,11 +2148,11 @@ class Analysis(object):
 
         :param source: a ``ZYX`` stack file (Xenium ``morphology.ome.tif``), a folder of
             per-plane ``*_z<N>.tif`` files (MERSCOPE ``images/``), a glob pattern or a list
-            of files — see :meth:`_image_planes`.
+            of files. See :meth:`_image_planes`.
         :param sdata: store the element in ``sdata.images`` and return its key. Without it
             the element is returned and the caller stores it.
         :param key: the key to store it under; the default is the stain's (or the source
-            file's) name + ``_zstack`` — ``morphology.ome.tif`` -> ``morphology_zstack``,
+            file's) name + ``_zstack``, so ``morphology.ome.tif`` gives ``morphology_zstack``,
             ``stain='DAPI'`` -> ``DAPI_zstack``.
         :param stain: which stain to stack. **Required when ``source`` is a folder**, since
             a folder holds one plane series per stain and the choice decides the tissue
@@ -1978,6 +2174,11 @@ class Analysis(object):
         :param z_origin: z of plane 0 OF THE SOURCE, same units (not of the first kept plane).
         :param scale_factors: x/y pyramid factors, default ``[2, 2, 2]``; z is never
             downscaled, since each plane is an image of its own.
+
+        :param chunk: Chunk size along y and x of the stored element. The channel and depth
+            axes are always kept whole.
+        :type chunk: int
+
         :returns: an ``Image3DModel`` element ``(c, z, y, x)``. Plane ``k`` sits at
             ``z_origin + k * z_step`` in each coordinate system: SpatialData places pixel
             ``k``'s centre at ``k + 0.5``, which the z part of the transformation undoes.
@@ -1993,6 +2194,16 @@ class Analysis(object):
         planes, step, z_origin = Analysis._select_planes(planes, step, z, z_origin)
 
         def _lazy(src):
+            """Open one plane of a source lazily, as a dask-backed array.
+
+            The source string carries the file path and, for a multi-page file, the page index
+            after a marker. The plane is opened through zarr so that nothing is read until the
+            array is computed.
+
+            :param src: The source string of the plane.
+            :type src: str
+            :returns: The plane as a lazy array.
+            """
             path, _, k = src.partition('[Z=')
             store = tifffile.imread(path, aszarr=True, level=0)
             a = zarr.open(store, mode='r')
@@ -2094,7 +2305,7 @@ class Analysis(object):
 
         ``images`` may be a **list of keys**, one per stain: the planes of every element
         are pooled into one list with a unique ``index`` (so each stain plane is
-        thresholded and sampled on its own — the anchors of all stains are then pooled),
+        thresholded and sampled on its own, and the anchors of all stains are then pooled),
         and each entry carries its own ``image_key``. All the elements must share the
         pixel grid (built with the same ``like=``); their z axes need not coincide.
 
@@ -2150,6 +2361,16 @@ class Analysis(object):
         srcs = (getattr(node, 'attrs', None) or {}).get('ssaft_plane_sources')
         if srcs is not None and len(srcs) == leaf.sizes['z']:
             def _read(k):
+                """Read one plane from the original file the stack was built from.
+
+                This path is taken when the element records the sources of its planes, which lets the
+                full-resolution plane be read from its own file rather than from the element.
+
+                :param k: Index of the plane.
+                :type k: int
+                :returns: The plane, with a leading channel axis.
+                :rtype: numpy.ndarray
+                """
                 import tifffile
                 path, _, zk = str(srcs[k]).partition('[Z=')
                 with tifffile.TiffFile(path) as tf:
@@ -2161,6 +2382,15 @@ class Analysis(object):
                 return plane[None] if plane.ndim == 2 else plane
         else:
             def _read(k):
+                """Read one plane straight out of the image element.
+
+                This is the fallback used when the element records no plane sources.
+
+                :param k: Index of the plane.
+                :type k: int
+                :returns: The plane.
+                :rtype: numpy.ndarray
+                """
                 return np.asarray(leaf.isel(z=k).data)
         return [dict(index=k, z=float(zs[k]), read=(lambda k=k: _read(k)),
                      source=f'images[{images!r}][z={k}]', image_key=images)
@@ -2186,9 +2416,9 @@ class Analysis(object):
         """Collapse an (H, W, 3) RGB image to a single-channel intensity.
 
         ``intensity='luminance'`` uses the BT.601 perceptual weighting
-        (``0.299 R + 0.587 G + 0.114 B``) — correct for brightfield / H&E
+        (``0.299 R + 0.587 G + 0.114 B``), which is correct for brightfield / H&E
         photographs where the channels are correlated. ``intensity='max'``
-        uses the per-pixel channel maximum — correct for fluorescence
+        uses the per-pixel channel maximum, which is correct for fluorescence
         composite images (e.g. CosMx CellComposite), where the tissue
         signal may live almost entirely in one channel (e.g. blue DAPI
         nuclei) and the luminance weighting would crush it (blue is only
@@ -2230,8 +2460,8 @@ class Analysis(object):
         ----------
         he_imgs : list of ndarray (H, W, 3)  RGB images
         revert_image : bool, default True
-            ``True``  → invert (bright background, dark tissue; e.g. H&E).
-            ``False`` → no inversion (dark background, bright tissue; e.g. polyT).
+            ``True``  to invert (bright background, dark tissue; e.g. H&E).
+            ``False`` to no inversion (dark background, bright tissue; e.g. polyT).
         intensity : {'luminance', 'max'}, default 'luminance'
             How RGB is collapsed to intensity (see :meth:`_rgb_to_intensity`).
             ``'luminance'`` for brightfield/H&E; ``'max'`` for fluorescence
@@ -2271,7 +2501,7 @@ class Analysis(object):
                         kernel='gaussian', gpu_device='cuda',
 ):
         """
-        Mask → position selection → KDE → normalization for a single image/sdata.
+        Mask to position selection to KDE to normalization for a single image/sdata.
 
         Parameters
         ----------
@@ -2279,13 +2509,48 @@ class Analysis(object):
         sdata         : spatialdata.SpatialData
         otsu_threshold: float  threshold to apply (from _otsu_thresholding)
 
+        element_name : str, optional
+            Name of the points element holding the molecules. It is resolved automatically
+            when ``None``.
+        bandwidth : float
+            Gaussian-equivalent kernel bandwidth in um.
+        sampling_distance : float
+            Lattice spacing in um.
+        prune_coefficient : float
+            Truncation radius of the infinite-support kernels, in units of the bandwidth.
+        size_after_normalization : float
+            Total each vector is scaled to before the logarithm.
+        log_transform : bool
+            Whether ``log1p`` is applied after normalization.
+        n_samples : int
+            Number of positions sampled per block of the tissue mask.
+        block_um : float
+            Side of the sampling block in um.
+        seed : int
+            Seed of the random number generator used for sampling.
+        filter_is_gene : bool
+            Whether to drop the features the points element marks as not being genes, which
+            is how the control probes are excluded.
+        genes : list[str], optional
+            Restrict the vectors to these genes.
+        revert_image : bool
+            Whether the image has a bright background and dark tissue, so that it must be
+            inverted before thresholding.
+        intensity : str
+            How a colour image is reduced to one channel, either ``'luminance'`` or
+            ``'max'``.
+        kernel : str
+            One of :data:`ssaft._count.KDE_KERNELS`.
+        gpu_device : str
+            CUDA device string used when a GPU estimate is in effect.
+
         Returns
         -------
         gx_he, gy_he, gz_he : ndarray  voxel coords (local to this sdata)
         normalized_vectors  : ndarray (N, n_genes)
         vf_norm             : ndarray (N,)
         genes               : list[str]
-        coordinate_offset   : list[float]  [x_min, y_min, z_min] in µm
+        coordinate_offset   : list[float]  [x_min, y_min, z_min] in um
         sample_stats        : dict
         """
         import cv2
@@ -2449,8 +2714,8 @@ class Analysis(object):
         """3D counterpart of :meth:`_select_vectors`: one tissue mask per imaging plane.
 
         Every plane of the z-stack is an image of its own, so it is thresholded with its
-        own Otsu value (unless ``otsu_threshold`` is given) and sampled at the same density
-        — ``n_samples`` per ``block_um`` x ``block_um`` µm of ITS mask. The total therefore
+        own Otsu value (unless ``otsu_threshold`` is given) and sampled at the same density of
+        ``n_samples`` per ``block_um`` x ``block_um`` um of ITS mask. The total therefore
         grows with the number of planes, as a per-image rule should. An anchor sits on the
         grid plane nearest its image plane and its vector is the 3D KDE there, so the
         dictionary is built from the same kind of profile the 3D map is scored against; a
@@ -2493,6 +2758,17 @@ class Analysis(object):
         del cnt, xc, yc
 
         def _supported(gx, gy):
+            """Report whether a lattice position has any molecule within the kernel's reach.
+
+            The test is a lookup in the summed-area table of the molecule counts per lattice cell,
+            so the neighbourhood sum costs four reads whatever its size. A position with no
+            molecule in reach would give an all-zero vector and is skipped.
+
+            :param gx: Lattice index along x.
+            :param gy: Lattice index along y.
+            :returns: ``True`` where at least one molecule lies within reach.
+            :rtype: numpy.ndarray
+            """
             ya, yb = np.clip(gy - rp, 0, vy + 1), np.clip(gy + rp + 1, 0, vy + 1)
             xa, xb = np.clip(gx - rp, 0, vx + 1), np.clip(gx + rp + 1, 0, vx + 1)
             return (ii[yb, xb] - ii[ya, xb] - ii[yb, xa] + ii[ya, xa]) > 0
@@ -2641,7 +2917,7 @@ class Analysis(object):
         This is the COUNT-platform entry point (Stereo-seq / Visium HD /
         StrataMap): it rasterizes bin counts and Gaussian-blurs them into
         ``vf_normalized`` + ``vf_norm``, writing only the normalized field.
-        Transcript platforms do NOT call this — their field is computed per-chunk
+        Transcript platforms do NOT call this, because their field is computed per-chunk
         inside :meth:`map_celltypes`.
 
         Two independent resolutions (see :func:`ssaft._count.compute_vf_blur`):
@@ -2653,23 +2929,23 @@ class Analysis(object):
             ``bin_um`` grid using ``grid.origin``), or a pre-aggregated bin-level
             AnnData with ``obs['array_row'/'array_col']``.
         bin_um : float
-            **Blur raster** bin size in µm — the grid the Gaussian is computed on
+            **Blur raster** bin size in um, which is the grid the Gaussian is computed on
             (finer = more accurate blur). Ignored if ``grid`` is already gridded.
         sampling_distance : float, optional
-            **Output vector-field** grid spacing in µm. The blurred raster is
+            **Output vector-field** grid spacing in um. The blurred raster is
             decimated by ``round(sampling_distance / bin_um)`` so the stored vf can
             be coarser than the blur raster (fewer voxels on disk). Defaults to
             ``bin_um`` (output == raster).
         bandwidth_um : float, optional
-            Gaussian bandwidth (σ) in **µm** — the intuitive knob. Converted to
+            Gaussian bandwidth (sigma) in **um**, which is the intuitive knob. It is converted to
             bin units internally (``sigma_bin = bandwidth_um / bin_um``). Give
             EITHER ``bandwidth_um`` OR ``sigma_bin`` (bin units); ``bandwidth_um``
-            wins if both. Default: ``sigma_bin=1`` (bandwidth = ``bin_um`` µm).
+            wins if both. Default: ``sigma_bin=1`` (bandwidth = ``bin_um`` um).
         prune_coefficient : float, default 4.3
-            Gaussian kernel truncation radius in σ units: ``radius = ceil(
+            Gaussian kernel truncation radius in sigma units: ``radius = ceil(
             prune_coefficient * sigma_bin)`` bins (= ``prune_coefficient *
-            bandwidth`` µm). Default 4.3 (radius ≈ cell diameter);
-            lower (e.g. 3.0 ≈ 99.7% mass) truncates tighter and runs faster.
+            bandwidth`` um). Default 4.3 (radius approximately  cell diameter);
+            lower (e.g. 3.0 approximately  99.7% mass) truncates tighter and runs faster.
             Applies to the gaussian and (at the same relative height) the
             exponential; the compact kernels stop at their own support.
         kernel : {'gaussian', 'tophat', 'epanechnikov', 'exponential', 'linear', 'cosine'}, default 'gaussian'
@@ -2692,7 +2968,7 @@ class Analysis(object):
         panel : list[str], optional
             Gene panel to restrict to before rasterization.
         chunk_h, chunk_w : int
-            GPU **compute** tile (output rows × cols per blur pass). Large = fewer
+            GPU **compute** tile (output rows by cols per blur pass). Large = fewer
             kernel launches / less halo recomputation. Does NOT set the on-disk chunk.
         store_chunk : int or (h, w), default 32
             On-disk chunk shape of ``vf_normalized`` (gene axis always full). Small
@@ -2700,20 +2976,20 @@ class Analysis(object):
             tiles containing sampled voxels instead of full-width row bands. Keep
             ``chunk_h``/``chunk_w`` integer multiples of it (defaults are). ``None``
             makes the on-disk chunk match the compute tile instead.
-
-        :param sigma_bin: Gaussian bandwidth in bin units. Alternative to
-            ``bandwidth_um``; ignored when ``bandwidth_um`` is given. Defaults to 1.
-        :type sigma_bin: float or None
-        :param size_after_normalization: Target L1 scale each voxel vector is
-            normalized to before the optional log1p.
-        :type size_after_normalization: float
-        :param device: Torch device string used for the GPU blur (e.g. ``'cuda'``).
-        :type device: str
-        :param mode: Input-regime selector; ``'auto'`` detects count vs transcript
-            SpatialData, ``'transcript'`` forces the KDE-field producer branch.
-        :type mode: str
-        :param log_transform: If True, apply log1p to the normalized field.
-        :type log_transform: bool
+        sigma_bin : float or None
+            Gaussian bandwidth in bin units. This is an alternative to
+            ``bandwidth_um`` and is ignored when ``bandwidth_um`` is given. It
+            defaults to 1.
+        size_after_normalization : float
+            Target L1 scale each voxel vector is normalized to, before the optional
+            logarithm.
+        log_transform : bool
+            Whether to apply ``log1p`` to the normalized field.
+        device : str
+            Torch device string used for the blur, for example ``'cuda'``.
+        mode : str
+            Input-regime selector. ``'auto'`` detects count against transcript
+            SpatialData, and ``'transcript'`` forces the field-producer branch.
         """
         from ._count import compute_vf_blur
         from ._griddataset import GridDataset
@@ -2794,7 +3070,7 @@ class Analysis(object):
 
         Returns an :class:`anndata.AnnData` of the sampled voxels (``X`` =
         normalized_vectors, ``obsm['spatial']``, ``obs['vf_norm']``, ``var`` =
-        genes) — feed it to ``sc.pp.pca`` / ``sc.pp.neighbors`` / ``sc.tl.leiden``::
+        genes). Feed it to ``sc.pp.pca`` / ``sc.pp.neighbors`` / ``sc.tl.leiden``::
 
             adata = analysis.downsample_vector(sdata, ...)
             sc.pp.pca(adata); sc.pp.neighbors(adata)
@@ -2803,12 +3079,12 @@ class Analysis(object):
 
         Two modes, auto-detected:
 
-        * **count** — when ``grid`` is given (or omitted but a ``compute_vf`` grid
+        * **count**: when ``grid`` is given (or omitted but a ``compute_vf`` grid
           was remembered) AND the store already holds a blur ``vf_normalized``:
           voxels are sampled from the tissue image and *looked up* in that field
           (no KDE). Delegates to
           :func:`ssaft._count.select_vectors_from_image`.
-        * **transcript** — otherwise: voxels are sampled from the H&E tissue mask
+        * **transcript**: otherwise, voxels are sampled from the H&E tissue mask
           and KDE is computed at each (the original path below).
 
 
@@ -2839,17 +3115,19 @@ class Analysis(object):
             the store as ``attrs['n_dims']``; :meth:`map_celltypes` builds its field in the
             same dimension, so the dictionary and the voxels it scores never disagree.
 
-            * ``2`` — the original path: the tissue mask comes from the 2D image in
+            * ``2``: the original path, where the tissue mask comes from the 2D image in
               ``sdata.images[image_key]``, anchors sit on one plane and their vectors are
               a 2D KDE. Transcripts' z, if any, is ignored throughout.
-            * ``3`` — every plane of ``sdata.images[images]`` is thresholded and sampled on
+            * ``3``: every plane of ``sdata.images[images]`` is thresholded and sampled on
               its own and each anchor's vector is the 3D KDE at its plane (see
               :meth:`_select_vectors_3d`). Needs ``images``: a 2D image carries no depth,
               so it cannot say where along z the tissue is.
-        images : str, optional
-            ``z=3`` only. The key of a 3D image element ``(c, z, y, x)`` in
-            ``sdata.images`` — images are always read from the SpatialData, never from a
-            path. Add the z-stack to the SpatialData first, e.g.
+        image_key : str, optional
+            Key of the one image element the tissue mask is built from. It is resolved
+            automatically when ``None``. With ``z=2`` that element is a 2D staining
+            image; with ``z=3`` it is a 3D element ``(c, z, y, x)``, one plane of which
+            is thresholded and sampled at a time. Images are always read from the
+            SpatialData, never from a path. Add the z-stack to the SpatialData first, e.g.
             ``sdata.images['morphology_zstack'] = Analysis.zstack_image(
             '.../morphology.ome.tif', like=sdata.images['morphology_focus'])``. Each
             plane's z comes from the element's ``'global'`` transformation and must be in
@@ -2863,9 +3141,11 @@ class Analysis(object):
         gpu_device : str, default ``'cuda'``
             Torch device string, e.g. ``'cuda'``, ``'cuda:0'``, ``'cuda:1'``.
         **kwargs
-            All other ``downsample_vector`` parameters (chunked, sdata_dir,
-            n_samples, block_um, bandwidth, sampling_distance,
-            revert_image, ...).
+            Everything else is forwarded, unchanged, to the backend that runs:
+            :func:`ssaft._count.select_vectors_from_image` in the count regime and
+            :meth:`_downsample_vector_impl` in the transcript regime, where the full
+            list is documented. The ones asked for most often are chunked, sdata_dir,
+            n_samples, block_um, bandwidth and sampling_distance, plus:
 
             otsu_mult : float, optional
                 Scale the automatically computed Otsu threshold by this factor.
@@ -2887,6 +3167,7 @@ class Analysis(object):
                 such as CosMx CellComposite, where the tissue signal can sit
                 almost entirely in one channel (e.g. blue DAPI nuclei) and
                 luminance would crush it (blue weighted only 0.114).
+
         """
         if z not in (2, 3):
             raise ValueError(f'z must be 2 or 3 (the dimensionality of the analysis), got {z!r}')
@@ -2989,17 +3270,17 @@ class Analysis(object):
             Key under which the staining / morphology image (e.g. H&E or
             polyT) is stored in ``sdata.images``.
         n_samples : int, optional
-            Number of voxels to sample per ``block_um × block_um`` µm block. In 3D this is
+            Number of voxels to sample per ``block_um by block_um`` um block. In 3D this is
             per block OF EACH IMAGING PLANE, so the total grows with the number of planes;
-            the default follows the dimensionality — **10 for z=2, 5 for z=3**.
+            the default follows the dimensionality, being **10 for z=2 and 5 for z=3**.
         block_um : float
-            Block size in µm used to determine sampling density.
+            Block size in um used to determine sampling density.
         revert_image : bool, default True
             Background polarity of the staining image used to build the
             tissue mask (Otsu + mask + bbox padding).
-            ``True``  → bright background, dark tissue (e.g. H&E); the image
+            ``True``  to bright background, dark tissue (e.g. H&E); the image
             is inverted (``255 - gray``) before thresholding.
-            ``False`` → dark background, bright tissue (e.g. polyT); the
+            ``False`` to dark background, bright tissue (e.g. polyT); the
             grayscale is used directly with no inversion.
         intensity : {'luminance', 'max'}, default 'luminance'
             How the RGB staining image is collapsed to intensity for the
@@ -3019,11 +3300,41 @@ class Analysis(object):
             (``None``, the default, keeps the Otsu value as computed). It scales
             every per-image value: the one image in 2D, each tile store when
             ``chunked=True`` (so their median scales too), each plane in 3D. A
-            value below 1 lowers the threshold and widens the tissue mask — on the
+            value below 1 lowers the threshold and widens the tissue mask. On the
             mouse-kidney Xenium section ``0.6`` took the threshold from 59.0 to 35.4
             and the mask from 12.0% to 23.3% of the lattice, and the anchor count
             from 258,582 to 502,339. Cannot be combined with ``otsu_threshold``,
             which fixes the threshold outright.
+
+        element_name : str, optional
+            Name of the points element holding the molecules. It is resolved automatically
+            when ``None``.
+        bandwidth : float
+            Gaussian-equivalent kernel bandwidth in um.
+        sampling_distance : float
+            Lattice spacing in um.
+        prune_coefficient : float
+            Truncation radius of the infinite-support kernels, in units of the bandwidth.
+        kernel : str
+            One of :data:`ssaft._count.KDE_KERNELS`.
+        gpu_device : str
+            CUDA device string used when a GPU estimate is in effect.
+        size_after_normalization : float
+            Total each vector is scaled to before the logarithm.
+        log_transform : bool
+            Whether ``log1p`` is applied after normalization.
+        seed : int
+            Seed of the random number generator used for sampling.
+        filter_is_gene : bool
+            Whether to drop the features the points element marks as not being genes, which
+            is how the control probes are excluded.
+        genes : list[str], optional
+            Restrict the vectors to these genes.
+        chunked : bool
+            Whether the input is a directory of tiles to be processed one at a time rather
+            than a single object.
+        otsu_threshold : float, optional
+            A fixed tissue-mask threshold. It is computed by Otsu's method when ``None``.
 
         Returns
         -------
@@ -3407,20 +3718,20 @@ class Analysis(object):
 
         ``source`` is one of
 
-        * a ``{label: [genes]}`` dict — returned as is;
-        * ``celltype_markers.yaml`` (CeLLMan §10.3) — the agent-written panel, a TREE
+        * a ``{label: [genes]}`` dict, which is returned as is;
+        * ``celltype_markers.yaml`` (CeLLMan section 10.3), the agent-written panel, which is a TREE
           of the emitted labels and their ancestors, each node carrying only its OWN
           ``defining`` / ``required`` / ``supporting`` lists, already restricted to
           genes measured in the dataset;
-        * ``expert_judgment_annotation.csv`` — falls back to the ``key_markers``
-          column, a 3–5 gene *summary* of each decision. Usable, but thin: prefer the
+        * ``expert_judgment_annotation.csv``, which falls back to the ``key_markers``
+          column, a 3-5 gene *summary* of each decision. Usable, but thin: prefer the
           YAML when it exists.
 
         **The YAML tree is accumulated root-to-node.** The Cell-Ontology is normalized
-        delta-only — a child never repeats a marker an ancestor already carries — so a
+        delta-only, since a child never repeats a marker an ancestor already carries, so a
         celltype's real marker set is the union along the path from the root down to
         its node. ``glomerular endothelial cell`` therefore comes back as its own
-        ``Ehd3, Kdr, Icam2, …`` *plus* the ``endothelial cell`` markers above it. Every
+        ``Ehd3, Kdr, Icam2, ...`` *plus* the ``endothelial cell`` markers above it. Every
         node is returned, ancestors included, so an intermediate label a cluster was
         floored to resolves too.
 
@@ -3435,6 +3746,17 @@ class Analysis(object):
             out = {}
 
             def _walk(node, inherited):
+                """Walk the marker tree and record each label's genes, inherited ones included.
+
+                A node may be written either as a plain list of genes or as a mapping with the
+                defining, required and supporting slots and a set of children. Each label's genes are
+                its own together with everything its ancestors claim, because the ontology records
+                only the delta at each level.
+
+                :param node: The subtree to walk.
+                :param inherited: The genes every ancestor of this subtree claims.
+                :type inherited: set
+                """
                 for lab, entry in (node or {}).items():
                     if not isinstance(entry, dict):    # {label: [genes]} shorthand
                         own, kids = set(entry or []), {}
@@ -3466,14 +3788,14 @@ class Analysis(object):
 
     @staticmethod
     def read_marker_tree(source, *, max_degree=2):
-        """``(parents, own)`` — the hierarchy and the DELTA markers, from the same YAML.
+        """Return ``(parents, own)``: the hierarchy and the DELTA markers, from one YAML.
 
         :meth:`read_marker_genes` accumulates root-to-node because a celltype's real
         marker set includes its ancestors'. Anything reasoning about a parent/child pair
         needs the opposite: each node's OWN ``defining`` / ``required`` genes only. A
         child expresses its
-        parent's markers by inheritance — cortical TAL anchors carry more ``Umod``
-        than plain TAL ones — so an inherited gene is worthless as evidence for either
+        parent's markers by inheritance, and cortical TAL anchors carry more ``Umod``
+        than plain TAL ones, so an inherited gene is worthless as evidence for either
         side of a parent/child pair, and accumulating would hand every child its
         parent's whole set.
 
@@ -3481,7 +3803,7 @@ class Analysis(object):
         it is corroboration, not identity.
 
         A gene claimed by more than ``max_degree`` celltypes is dropped from all of
-        them — "this celltype and one close relative" still identifies, a gene shared
+        them, because "this celltype and one close relative" still identifies, while a gene shared
         five ways does not.
 
         Non-YAML sources carry no tree: ``parents`` comes back empty, so any caller that
@@ -3499,6 +3821,15 @@ class Analysis(object):
         parents, own = {}, {}
 
         def _walk(node, parent):
+            """Walk the marker tree and record each label's parent and its own genes.
+
+            Only the defining and required slots count as a label's own genes here. The supporting
+            slot is deliberately left out, because this tree is used to decide what distinguishes
+            a label from its siblings.
+
+            :param node: The subtree to walk.
+            :param parent: Label of the subtree's parent, or ``None`` at the root.
+            """
             for lab, entry in (node or {}).items():
                 lab = str(lab)
                 parents[lab] = parent
@@ -3520,6 +3851,13 @@ class Analysis(object):
         # the child clear the gate on evidence that says nothing about which of the
         # two it is.
         def _chain(lab):
+            """List a label's ancestors, from its parent upwards to the root.
+
+            :param lab: The label whose ancestors are wanted.
+            :type lab: str
+            :returns: The ancestor labels, nearest first.
+            :rtype: list
+            """
             out, cur = [], parents.get(lab)
             while cur is not None:
                 out.append(cur)
@@ -3537,7 +3875,7 @@ class Analysis(object):
         """The anchor prior, as a precomputed convolution when the anchors allow it.
 
         ``downsample_vectors`` are voxel indices, so anchors and voxels share one
-        lattice and the prior is exactly a convolution — computed once instead of a
+        lattice and the prior is exactly a convolution, computed once instead of a
         48-nearest-neighbour query per voxel (36 s of every 54 s chunk on the
         mouse-kidney store). If the anchors are ever off-lattice, or ``gridded_prior``
         is set False, the KD-tree version still stands.
@@ -3580,7 +3918,7 @@ class Analysis(object):
         """Ids of the annotation's ``unknown*`` / ``background`` classes, if any.
 
         ``map_celltypes`` always keeps these classes on the map so a voxel that
-        matches no real celltype still gets a stable id — the map then shows *where*
+        matches no real celltype still gets a stable id, so the map then shows *where*
         the annotation abstained. Hiding them is a display choice, so it belongs to
         :meth:`filter_celltypemaps` (``show_unknown=False``), not to the mapper:
         deciding a voxel's label and deciding whether that voxel survives are
@@ -3597,8 +3935,8 @@ class Analysis(object):
 
         Everything outside the UNION of the marker sets is dropped, so the mapping
         runs on a panel of only the genes the annotation actually leaned on. The
-        centroids keep one shared gene axis — required by both the correlation and
-        the GaussianNB backends — but that axis no longer carries the hundreds of
+        centroids keep one shared gene axis, which both the correlation and the
+        GaussianNB backends require, but that axis no longer carries the hundreds of
         genes that are flat across celltypes and only add noise to the metric.
         """
         mk = self.read_marker_genes(marker_genes)
@@ -3620,8 +3958,8 @@ class Analysis(object):
     def _marker_index_sets(self, marker_genes, gene_names_used, warn_few=True):
         """Per-celltype gene positions for the marker-restricted correlation.
 
-        ``gene_names_used`` is the gene axis the mapping actually runs on — after
-        the union restriction :meth:`_marker_gene_exclusions` applied — so the
+        ``gene_names_used`` is the gene axis the mapping actually runs on, after
+        the union restriction :meth:`_marker_gene_exclusions` applied, so the
         returned positions index a data chunk directly. See
         :mod:`ssaft._marker_corr` for why each celltype gets its own subset.
         """
@@ -3636,7 +3974,7 @@ class Analysis(object):
 
         Same resolution as :meth:`_marker_index_sets` but WITHOUT the
         ``MIN_MARKER_GENES`` fallback. That fallback exists so a 2-marker Pearson
-        cannot saturate at +/-1; here it would do real damage — a celltype whose
+        cannot saturate at +/-1; here it would do real damage, because a celltype whose
         only marker is a single gene (mouse-kidney ``mural cell``: ``Notch3``) would
         come back as "no markers", and the dictionary would then treat that one gene
         as somebody else's and replace it with the background rate, erasing the only
@@ -3662,179 +4000,208 @@ class Analysis(object):
 
         Two regimes, auto-detected from the store:
 
-        * **count** (blur ``vf_normalized`` present) — the field is read from
-          zarr and mapped by ``method``. No KDE.
-        * **transcript** (no precomputed field) — KDE is computed chunk-by-chunk
-          and mapped on the fly, dispatching to
-          :meth:`map_celltypes_gpu` (CUDA available and not ``force_cpu``) or
-          :meth:`map_celltypes_cpu`.
+        * **count** (blur ``vf_normalized`` present): the field is read from zarr and
+          mapped by ``method``. No KDE.
+        * **transcript** (no precomputed field): KDE is computed chunk by chunk and mapped
+          on the fly, dispatching to :meth:`map_celltypes_gpu` when CUDA is available and
+          ``force_cpu`` is not set, and to :meth:`map_celltypes_cpu` otherwise.
 
-        Both regimes support ``method='corr'`` (centroid Pearson correlation) and
-        ``method='gnb'`` (per-voxel Gaussian naive Bayes fitted on the labeled
-        ``normalized_vectors``). ``'gnb'`` is generative — every class keeps its own
-        region — so it preserves rare cell types the discriminative correlation
+        Both regimes support ``method='corr'``, the centroid Pearson correlation, and
+        ``method='gnb'``, a per-voxel Gaussian naive Bayes fitted on the labeled
+        ``normalized_vectors``. The naive Bayes model is generative, so every class keeps
+        its own region and it preserves rare cell types that the discriminative correlation
         argmax can drop.
 
         Parameters
         ----------
-        method : {'corr', 'gnb'}, default 'corr'
-            Mapping algorithm (both regimes). ``'corr'`` correlates each voxel's
-            vector with the centroids and takes the argmax. ``'gnb'`` fits a
-            :class:`~sklearn.naive_bayes.GaussianNB` (cuML on GPU, scikit-learn on
-            CPU) on the labeled ``normalized_vectors`` and predicts each voxel. Both
-            write the label raster to ``celltype_maps``, but the per-voxel score goes
-            to the volume matching its metric: ``'corr'`` -> ``max_correlations``
-            (filtered downstream by ``min_r``), ``'gnb'`` -> ``max_probabilities``
-            (filtered by ``min_p``). Both volumes can coexist — writing one leaves
-            the other method's score untouched, and ``mapping_method`` in the store
-            attrs records which one the current ``celltype_maps`` came from so
-            :meth:`filter_celltypemaps` picks the matching volume. Extra ``'gnb'``
-            options via ``map_kwargs`` (e.g. ``{'row_normalize': False,
-            'var_smoothing': 1e-9}``). On the transcript/imaging regime ``'gnb'`` uses
-            the CPU KDE producer with the (GPU) classifier. With ``marker_genes_path``
-            the GNB is instead fitted on the annotated h5ad with ``obs[column]`` as the
-            target, on the marker genes only, using scikit-learn.
-        map_kwargs : dict, optional
-            Extra kwargs forwarded to the count mapper
-            (:func:`ssaft._count.map_corr` /
-            :func:`ssaft._gnb.map_gnb`).
-        gpu_device : str, default ``'cuda'``
-            CUDA device used by the GPU path.
-        force_cpu : bool, default False
-            If True, run on CPU regardless of GPU availability (transcript KDE and
-            the ``'gnb'`` classifier both honor it).
-        save_vf : bool, default False
-            **Transcript regime only.** By default the imaging-based path
-            (Xenium / MERFISH) computes the KDE vector field chunk-by-chunk,
-            maps it on the fly, and DISCARDS the field (only ``celltype_maps`` /
-            ``max_correlations`` / ``vf_norm`` are persisted). When True, the
-            normalized field is also written to ``vf_normalized``
-            ``(n_genes_use, vx, vy, vz)`` in zarr (gene axis first, same
-            convention as the count backend), plus ``vf_normalized_genes`` naming
-            the gene axis. Ignored in the count regime — array-based data
-            (Visium HD / Stereo-seq) already stores ``vf_normalized`` at
-            ``compute_vf`` time. Note: this holds one extra CPU buffer of
-            ``n_genes_use × chunk_x × vy × vz`` floats per chunk and adds the
-            field's on-disk size, so enable it only when you need the field.
-        query_subchunk_size, gpu_target_bytes
-            Forwarded to :meth:`map_celltypes_gpu` (ignored on CPU).
-        Other parameters are shared by the transcript paths; see
-        :meth:`map_celltypes_cpu`.
+        sdata : spatialdata.SpatialData or None
+            Transcript SpatialData to map. It is required in the transcript regime and
+            unused in the count regime.
+        centroids : numpy.ndarray or None
+            Per-cluster centroid matrix. It falls back to the store's ``centroids``, or to
+            the ones built from the h5ad, when ``None``.
+        element_name : str or None
+            Name of the points element to parse from ``sdata``.
+        method : {'lda', 'gnb', 'corr'}, default 'lda'
+            Mapping algorithm, in both regimes.
 
-        :param sdata: Transcript SpatialData to map; required in the transcript
-            regime, unused in the count regime.
-        :type sdata: spatialdata.SpatialData or None
-        :param centroids: Per-cluster centroid matrix; falls back to the store's
-            ``centroids`` (or the h5ad-built ones) when None.
-        :type centroids: numpy.ndarray or None
-        :param h5ad: Annotated h5ad (row-aligned with ``normalized_vectors``). When
-            given, ``cluster_labels`` + ``centroids`` are (re)built from it before
-            mapping: vectors are grouped by the label string in ``obs[column]`` (one
-            class per label; ``Unknown`` split by ``obs[leiden_column]`` into
-            ``unknown1..N``; Background dropped). Required the first time — when the
-            store has no centroids/cluster_labels and no ``centroids`` array is passed.
-        :type h5ad: str or None
-        :param column: obs column with the final celltype label (h5ad build).
-        :type column: str
-        :param leiden_column: obs column with the original cluster id, used to split
-            ``Unknown`` when building from an h5ad.
-        :type leiden_column: str
-        :param cmap: palette fixing the per-celltype colours at build time; the
-            same palette is reused by the labels rendering and any legend.
-            ``None`` (default) = qualitative palette sized to the class count
-            (tab20 / scanpy 28 / scanpy 102), which stays legible for tens of
-            celltypes; a colormap name samples it continuously instead.
-        :type cmap: str or matplotlib.colors.Colormap or None
-        :param table_key: key of the annotated downsampled table written into
-            ``sdata.tables``.
-        :type table_key: str
-        :param element_name: Name of the points element to parse from ``sdata``.
-        :type element_name: str or None
-        :param exclude_gene_indices: Gene indices to drop before correlation.
-        :type exclude_gene_indices: list[int] or None
-        :param show_unknown: **Moved to** :meth:`filter_celltypemaps`. The mapper now
-            always keeps the annotation's ``unknown1..N`` classes on the map, so a
-            voxel that matches no real celltype gets a stable id and the map shows
-            *where* the annotation abstained; hiding them is a filter setting you can
-            change without re-mapping. Passing it here logs a notice and is otherwise
-            ignored.
-        :type show_unknown: bool or None
-            ``method='lda'`` reads the anchors for its dictionary instead: which genes a
-            celltype owns comes from the anchors themselves (see
-            :func:`ssaft._lda.build_factors`), so a celltype the YAML gives no marker —
-            8 of 18 on the mouse-kidney panel — still gets a discriminating row. The
-            sets resolved here are then only the axis ``celltype_marker_score`` is
-            measured on, for ``filter_celltypemaps(hsm_f=...)``.
+            ``'lda'`` scores each voxel's likelihood against per-cell-type factors learned
+            from the anchors, with a spatial anchor prior, and writes its score to
+            ``max_probabilities``, which is filtered downstream by ``min_p``. A cell type
+            without ontology markers still gets a discriminating row.
 
-            The scorer's own knobs go through ``map_kwargs``: ``cand_nats`` (default
-            ``1.0``) how far behind the best log-likelihood a class can be and still be
-            a candidate, ``prior_weight`` (``0.5``) the weight on the log anchor prior,
-            and ``prior_floor`` (``0.02``) the floor that keeps "no anchor in range"
-            from being a veto. See :class:`ssaft._lda.LDAScorer`.
-        :param marker_genes_path: Restrict the mapping to marker genes. ``None`` (default)
-            keeps the whole panel and behaves exactly as before. Otherwise a
-            ``{celltype: [genes]}`` dict, the CeLLMan ``celltype_markers.yaml`` (a tree
-            of the emitted labels and their ancestors, each node carrying its own
-            defining / required / supporting genes — preferred), or
-            ``expert_judgment_annotation.csv`` (its thinner ``key_markers`` column).
-            The YAML tree is accumulated root-to-node, so a celltype's marker set
-            includes every ancestor's (see :meth:`read_marker_genes`).
+            ``'corr'`` correlates each voxel's vector with the centroids and takes the
+            argmax.
+
+            ``'gnb'`` fits a :class:`~sklearn.naive_bayes.GaussianNB`, from cuML on the GPU
+            and scikit-learn on the processor, on the labeled ``normalized_vectors`` and
+            predicts each voxel.
+
+            All three write the label raster to ``celltype_maps``, but the per-voxel score
+            goes to the volume matching its metric: ``'corr'`` writes ``max_correlations``,
+            filtered downstream by ``min_r``, while ``'gnb'`` and ``'lda'`` write
+            ``max_probabilities``, filtered by ``min_p``. Both volumes can coexist, so
+            writing one leaves the other method's score untouched, and ``mapping_method``
+            in the store attributes records which one the current ``celltype_maps`` came
+            from, so that :meth:`filter_celltypemaps` picks the matching volume.
+
+            Extra ``'gnb'`` options are passed through ``map_kwargs``, for example
+            ``{'row_normalize': False, 'var_smoothing': 1e-9}``. In the transcript regime
+            ``'gnb'`` uses the processor-side KDE producer together with the classifier on
+            the GPU. With ``marker_genes_path`` the model is instead fitted on the
+            annotated h5ad with ``obs[column]`` as the target, on the marker genes only,
+            using scikit-learn.
+        exclude_gene_indices : list[int] or None
+            Gene indices to drop before correlation.
+        marker_genes_path : str or pathlib.Path or dict or None
+            Restrict the mapping to marker genes. ``None`` keeps the whole panel and
+            behaves exactly as before. Otherwise pass a ``{celltype: [genes]}`` dict, the
+            CeLLMan ``celltype_markers.yaml``, which is a tree of the emitted labels and
+            their ancestors with each node carrying its own defining, required and
+            supporting genes and is the preferred form, or
+            ``expert_judgment_annotation.csv``, whose ``key_markers`` column is thinner.
+            The YAML tree is accumulated from root to node, so a celltype's marker set
+            includes every ancestor's. See :meth:`read_marker_genes`.
 
             Three things then change, in both the count and the transcript regime:
 
-            * the gene axis is cut to the UNION of the marker sets, so centroids and
-              the GaussianNB are built from the genes the annotation leaned on instead
-              of the whole panel;
-            * ``method='corr'`` scores each celltype ONLY on its own markers instead of
-              the shared axis — the same Pearson, just a different gene count per
-              celltype (see :mod:`ssaft._marker_corr`, including why a celltype with
-              fewer than 3 on-panel markers falls back to the full axis);
-            * ``method='gnb'`` refits on the annotated h5ad itself with ``obs[column]``
-              as ground truth (scikit-learn ``GaussianNB``, see
-              :func:`ssaft._gnb.fit_gnb_h5ad`) when the h5ad is known — either passed
-              as ``h5ad=`` or remembered in the store from the centroid build.
+            * the gene axis is cut to the union of the marker sets, so the centroids and
+              the naive Bayes model are built from the genes the annotation leaned on
+              instead of from the whole panel;
+            * ``method='corr'`` scores each celltype only on its own markers instead of on
+              the shared axis. It is the same Pearson correlation, just with a different
+              gene count per celltype. See :mod:`ssaft._marker_corr`, including why a
+              celltype with fewer than three on-panel markers falls back to the full axis;
+            * ``method='gnb'`` refits on the annotated h5ad itself with ``obs[column]`` as
+              ground truth, through :func:`ssaft._gnb.fit_gnb_h5ad`, whenever the h5ad is
+              known, whether passed as ``h5ad`` or remembered in the store from the
+              centroid build.
 
-            Combined with ``exclude_gene_indices`` if both are given.
-        :type marker_genes_path: str or pathlib.Path or dict or None
-        :param bandwidth: KDE Gaussian bandwidth in µm (transcript regime).
-        :type bandwidth: float
-        :param sampling_distance: Vector-field grid spacing in µm.
-        :type sampling_distance: float
-        :param prune_coefficient: Kernel truncation radius in bandwidth units. The
-            gaussian's, and the exponential's at the same relative height; the
-            compact kernels stop at their own support.
-        :type prune_coefficient: float
-        :param kernel: KDE kernel, one of ``ssaft._count.KDE_KERNELS``:
-            ``'gaussian'`` (default), ``'tophat'``, ``'epanechnikov'``,
-            ``'exponential'``, ``'linear'`` or ``'cosine'``. ``bandwidth`` keeps the
-            SAME meaning for all of them: each kernel's own scale is derived from it
-            by variance matching (:func:`ssaft._count.kernel_scale`; e.g. the
-            Epanechnikov support ``H = bandwidth * sqrt(ndim + 4)``, 6.61 µm at the
-            default 2.5 in 3D), so they have the same width. The compact kernels
-            reach zero at their support instead of being truncated at
-            ``4.3 * bandwidth`` = 10.75 µm, so they touch ~3x fewer voxels per
-            transcript and run 2-3x faster; the smooth ones (Epanechnikov, linear,
-            cosine) give near-identical fields to the gaussian (per-voxel cosine
-            >= 0.99 on Xenium kidney and Visium HD). Transcript (KDE) regime only;
-            ignored by the count regime.
-        :type kernel: str
-        :param size_after_normalization: Target L1 scale of each voxel vector.
-        :type size_after_normalization: float
-        :param log_transform: If True, apply log1p to the normalized field.
-        :type log_transform: bool
-        :param overwrite: If True, remove and recreate existing zarr outputs.
-        :type overwrite: bool
+            ``method='lda'`` reads the anchors for its dictionary instead. Which genes a
+            celltype owns comes from the anchors themselves, as described under
+            :func:`ssaft._lda.build_factors`, so a celltype the YAML gives no marker, which
+            was 8 of 18 on the mouse kidney panel, still gets a discriminating row. The
+            sets resolved here are then only the axis that ``celltype_marker_score`` is
+            measured on, for ``filter_celltypemaps(hsm_f=...)``.
+
+            The scorer's own settings go through ``map_kwargs``: ``cand_nats``, by default
+            ``1.0``, is how far behind the best log-likelihood a class may be and still be
+            a candidate; ``prior_weight``, by default ``0.5``, is the weight on the log
+            anchor prior; and ``prior_floor``, by default ``0.02``, is the floor that keeps
+            the absence of an anchor from being a veto. See :class:`ssaft._lda.LDAScorer`.
+
+            This combines with ``exclude_gene_indices`` when both are given.
+        show_unknown : bool or None
+            Moved to :meth:`filter_celltypemaps`. The mapper now always keeps the
+            annotation's ``unknown1`` to ``unknownN`` classes on the map, so a voxel that
+            matches no real celltype gets a stable id and the map shows where the
+            annotation abstained. Hiding them is a filter setting that can be changed
+            without re-mapping. Passing it here logs a notice and is otherwise ignored.
+        bandwidth : float
+            KDE Gaussian bandwidth in um, in the transcript regime.
+        sampling_distance : float
+            Vector-field grid spacing in um.
+        prune_coefficient : float
+            Kernel truncation radius in units of the bandwidth. It applies to the Gaussian,
+            and to the exponential at the same relative height; the compact kernels stop at
+            their own support.
+        kernel : str
+            KDE kernel, one of :data:`ssaft._count.KDE_KERNELS`: ``'gaussian'``,
+            ``'tophat'``, ``'epanechnikov'``, ``'exponential'``, ``'linear'`` or
+            ``'cosine'``.
+
+            ``bandwidth`` keeps the same meaning for all of them, because each kernel's own
+            scale is derived from it by variance matching in
+            :func:`ssaft._count.kernel_scale`. The Epanechnikov support, for instance, is
+            ``bandwidth * sqrt(ndim + 4)``, which is 6.61 um at the default 2.5 in three
+            dimensions, so the kernels have the same width.
+
+            The compact kernels reach zero at their support instead of being truncated at
+            ``4.3 * bandwidth``, which is 10.75 um, so they touch about three times fewer
+            voxels per transcript and run two to three times faster. The smooth ones, being
+            the Epanechnikov, linear and cosine kernels, give fields nearly identical to the
+            Gaussian, with a per-voxel cosine similarity of 0.99 or better on Xenium kidney
+            and Visium HD. This applies to the transcript regime only and is ignored by the
+            count regime.
+        size_after_normalization : float
+            Target L1 scale of each voxel vector.
+        log_transform : bool
+            Whether to apply ``log1p`` to the normalized field.
+        overwrite : bool
+            Whether to remove and recreate the zarr outputs that already exist.
+        gpu_device : str, default ``'cuda'``
+            CUDA device used by the GPU path.
+        force_cpu : bool, default False
+            Whether to run on the processor regardless of GPU availability. Both the
+            transcript KDE and the naive Bayes classifier honour it.
+        query_subchunk_size : int or None
+            Voxels scored per device sub-chunk inside one slab of the streamed field. It is
+            sized from ``gpu_target_bytes`` when ``None``, and bounds the one temporary that
+            scales with the gene axis. It is forwarded to :meth:`map_celltypes_gpu` and
+            ignored on the processor.
+        gpu_target_bytes : int
+            Device memory budget for one sub-chunk's output buffer, in bytes. It applies to
+            the transcript regime, since the count regime sizes its own field band, and it
+            is ignored on the processor.
+        map_kwargs : dict, optional
+            Extra keyword arguments forwarded to the mapper that runs, which is
+            :func:`ssaft._count.map_corr`, :func:`ssaft._gnb.map_gnb` or
+            :func:`ssaft._lda.map_lda`.
+        save_vf : bool, default False
+            Transcript regime only. By default the imaging path, as used for Xenium and
+            MERFISH, computes the KDE vector field chunk by chunk, maps it on the fly and
+            discards the field, persisting only ``celltype_maps``, the score volume and
+            ``vf_norm``.
+
+            When ``True``, the normalized field is also written to ``vf_normalized``, with
+            shape ``(n_genes_use, vx, vy, vz)``, gene axis first, which is the same
+            convention the count backend uses, together with ``vf_normalized_genes`` naming
+            that axis.
+
+            It is ignored in the count regime, because array-based data such as Visium HD
+            and Stereo-seq already stores ``vf_normalized`` at ``compute_vf`` time. Note
+            that it holds one extra host buffer of ``n_genes_use by chunk_x by vy by vz``
+            floats per chunk and adds the field's size on disk, so enable it only when the
+            field is actually needed.
+        h5ad : str or None
+            Annotated h5ad, row-aligned with ``normalized_vectors``. When it is given,
+            ``cluster_labels`` and ``centroids`` are rebuilt from it before mapping: the
+            vectors are grouped by the label string in ``obs[column]``, with one class per
+            label, ``Unknown`` split by ``obs[leiden_column]`` into ``unknown1`` to
+            ``unknownN``, and Background dropped. It is required the first time, when the
+            store holds no centroids and no cluster labels and no ``centroids`` array is
+            passed.
+        column : str
+            The ``obs`` column holding the final celltype label, used when building from an
+            h5ad.
+        leiden_column : str
+            The ``obs`` column holding the original cluster id, used to split ``Unknown``
+            when building from an h5ad.
+        cmap : str or matplotlib.colors.Colormap or None
+            Palette fixing the per-celltype colours at build time. The same palette is
+            reused by the labels rendering and by any legend. ``None`` gives a qualitative
+            palette sized to the class count, drawn from tab20, then scanpy's 28-colour and
+            102-colour palettes, which stays legible for tens of celltypes. Passing a
+            colormap name samples it continuously instead.
+        table_key : str
+            Key of the annotated downsampled table written into ``sdata.tables``.
 
         Returns
         -------
         spatialdata.SpatialData
-            The map itself is written into the store (``celltype_maps`` + the score
-            volume for the chosen ``method`` — ``max_correlations`` for ``'corr'``,
-            ``max_probabilities`` for ``'gnb'`` — in zarr, and mirrored on
-            ``ds``). The returned SpatialData additionally carries
-            ``tables[table_key]`` — the downsampled vectors annotated with the
-            REBUILT celltype labels + the fixed colour palette. Feed it to
-            :meth:`filter_celltypemaps`, which adds the raster elements.
+            The map itself is written into the store, as ``celltype_maps`` plus the score
+            volume for the chosen method, which is ``max_correlations`` for ``'corr'`` and
+            ``max_probabilities`` for ``'gnb'`` and ``'lda'``, in zarr and mirrored on the
+            dataset. The returned SpatialData additionally carries ``tables[table_key]``,
+            the downsampled vectors annotated with the rebuilt celltype labels and the fixed
+            colour palette. Feed it to :meth:`filter_celltypemaps`, which adds the raster
+            elements.
+
+        See Also
+        --------
+        map_celltypes_cpu : the transcript path on the processor, which shares these
+            parameters.
+        map_celltypes_gpu : the transcript path on the GPU.
         """
         zg = self.dataset.zarr_group
         sdata = sdata if sdata is not None else getattr(
@@ -3987,6 +4354,44 @@ class Analysis(object):
             Only used to populate ``self.locations`` if not already set.
         centroids : ndarray (n_clusters, n_genes), optional
             Falls back to ``self.dataset.centroids``.
+
+        element_name : str, optional
+            Name of the points element holding the molecules. It is resolved automatically
+            when ``None``.
+        exclude_gene_indices : array-like, optional
+            Positions to drop from the gene axis before mapping.
+        marker_genes_path : str, optional
+            Path to the marker file the annotation wrote, used to restrict each celltype to
+            its own markers.
+        bandwidth : float
+            Gaussian-equivalent kernel bandwidth in um.
+        sampling_distance : float
+            Lattice spacing in um.
+        prune_coefficient : float
+            Truncation radius of the infinite-support kernels, in units of the bandwidth.
+        kernel : str
+            One of :data:`ssaft._count.KDE_KERNELS`.
+        size_after_normalization : float
+            Total each vector is scaled to before the logarithm.
+        log_transform : bool
+            Whether ``log1p`` is applied after normalization.
+        overwrite : bool
+            Whether to replace the map arrays already in the store.
+        save_vf : bool
+            Whether to persist the streamed field as ``vf_normalized`` instead of discarding
+            it once each slab has been mapped.
+        method : str
+            Which mapper to run: ``'corr'``, ``'gnb'`` or ``'lda'``.
+        gpu_device : str
+            CUDA device string used by the mapper that supports one.
+        force_cpu : bool
+            Whether to keep the mapper on the processor even when a device is available.
+        h5ad : str, optional
+            Annotated h5ad to build the mapping inputs from.
+        column : str
+            The ``obs`` column of that h5ad holding the final celltype label.
+        map_kwargs : dict, optional
+            Extra keyword arguments forwarded to the chosen mapper.
 
         Returns
         -------
@@ -4152,6 +4557,11 @@ class Analysis(object):
         score_key = score_key_for(method)
 
         def _safe_remove(name):
+            """Delete an array from the store if it is there, tolerating writer debris.
+
+            :param name: Name of the array to remove.
+            :type name: str
+            """
             if name in self.dataset.zarr_group:
                 _remove_array(self.dataset.zarr_group, name)
 
@@ -4385,16 +4795,16 @@ class Analysis(object):
         ``map_celltypes``) the filtered map is also written into it as two aligned
         raster elements and the SpatialData is returned:
 
-        * ``labels[labels_key]`` — the categorical raster; pixel value =
+        * ``labels[labels_key]``: the categorical raster, whose pixel value is
           ``celltype id + 1`` (0 = background / filtered out). Labels, not an
           image: that is what makes the raster addressable as categories
           (``aggregate``, label picking, region queries). A 3D map is written with
           every layer, ``(z, y, x)``.
-        * ``images[image_key]`` — an RGB rendering in the palette fixed at
+        * ``images[image_key]``: an RGB rendering in the palette fixed at
           ``map_celltypes`` time, for quick visual inspection; on a 3D map, of
           layer ``z``.
 
-        No table is written here — the celltype NAMES live once, in
+        No table is written here, because the celltype NAMES live once, in
         ``tables['ssaft_downsampled_vectors']`` from :meth:`map_celltypes`, whose
         categorical is index-aligned with these pixel values::
 
@@ -4410,7 +4820,7 @@ class Analysis(object):
         :type sdata: spatialdata.SpatialData or None
         :param min_p: minimum threshold of the posterior probability (default
             ``0``, i.e. keep every mapped voxel). Used when the store holds
-            ``max_probabilities`` — i.e. the map came from
+            ``max_probabilities``, that is when the map came from
             ``map_celltypes(method='lda'|'gnb')``; ignored for a correlation map.
 
             The default is 0 because the posterior answers "which of these
@@ -4419,11 +4829,11 @@ class Analysis(object):
             markers split the mass between them, so the same 0.9 discarded 12% of the
             mapped voxels on one panel and 56% on another. Raise it deliberately when
             you want only unambiguous calls, and read a failure as "the siblings are
-            not separable here", not as "nothing is there" — ``norm_f`` is the cut that
+            not separable here", not as "nothing is there". ``norm_f`` is the cut that
             answers the second question.
         :type min_p: float
         :param min_r: minimum threshold of the correlation (default ``0.6``). Used
-            when the store holds ``max_correlations`` — i.e. the map came from
+            when the store holds ``max_correlations``, that is when the map came from
             ``map_celltypes(method='corr')``, which is filtered on this and
             ``min_norm`` alone; ignored for an lda/gnb map.
         :type min_r: float
@@ -4441,7 +4851,7 @@ class Analysis(object):
             the voxel at all.
 
             Density differs between celltypes, so one ``min_norm`` is vacuous for one
-            celltype or lethal for another — on the mouse-kidney Xenium section the best
+            celltype or lethal for another. On the mouse-kidney Xenium section the best
             global cut kept 95% of the tubules and 59% of the fibroblasts. So each
             celltype is cut on its own scale: the half-sample-mode peak of its
             ``log10(vf_norm)``, times ``norm_f``
@@ -4471,9 +4881,9 @@ class Analysis(object):
             So each celltype is cut on its own scale: the peak of its
             ``celltype_marker_score`` distribution, located by the half-sample mode,
             times ``hsm_f``. Around 0.4 is where the trade stops paying on the crops
-            this was tuned on — below it recall barely moves while precision falls,
+            this was tuned on. Below it recall barely moves while precision falls,
             above it real cells start going (at 0.6, 20% of the reference glomerular
-            endothelium and pericytes were lost) — but the curve is flat enough
+            endothelium and pericytes were lost), but the curve is flat enough
             between 0.2 and 0.5 that the exact value matters little.
 
             Requires the store to carry ``celltype_marker_score``, which
@@ -4483,7 +4893,7 @@ class Analysis(object):
         :param show_unknown: Whether the annotation's ``unknown1..N`` classes stay on
             the filtered map. ``True`` (default) keeps them, so the map shows *where*
             the annotation abstained. ``False`` sends every voxel they won to
-            background — dropped, never reassigned to the runner-up: the mapping
+            background. They are dropped, never reassigned to the runner-up, because the mapping
             already said no real celltype fits, and promoting a runner-up would invent
             a call the annotation refused to make. This used to be a ``map_celltypes``
             argument; it lives here because it decides what survives, not what a voxel
@@ -4503,7 +4913,7 @@ class Analysis(object):
             the middle one, ``int(n_layers / 2)``. ``labels[labels_key]`` keeps every layer.
         :type z: int or None
         :param background: Colour the filtered-out voxels take in
-            ``images[image_key]``. Defaults to ``"white"`` — the RGB element has no
+            ``images[image_key]``. Defaults to ``"white"``, because the RGB element has no
             alpha channel, so background is painted, not left empty, and a figure is
             read on a white page. ``"black"`` restores the old look. The labels
             raster is unaffected: background stays pixel value 0 there.
@@ -4730,7 +5140,7 @@ class Analysis(object):
 
     def _celltype_map_affine(self, sdata, z=None):
         """``(map2d, sd_um, ox, oy)`` for the filtered map: the ``(y, x)`` label
-        raster plus the same µm affine :meth:`Dataset.write_celltype_map` writes,
+        raster plus the same um affine :meth:`Dataset.write_celltype_map` writes,
         so anything derived here overlays the rasters exactly."""
         data = np.asarray(self.dataset.filtered_celltype_maps)
         if data.ndim == 2:
@@ -4755,7 +5165,7 @@ class Analysis(object):
         The map is built from the INTRINSIC coordinates of whatever element ssaft
         was run on (``_validate_input_data`` reads ``df['x']`` straight off the
         points frame; the count backend uses ``obsm['spatial']``), and 'global'
-        carries no unit contract in SpatialData — it is µm on VisiumHD and mosaic
+        carries no unit contract in SpatialData, being um on VisiumHD and mosaic
         PIXELS on MERSCOPE. A marker element therefore may or may not already be in
         the map's frame, and neither 'always intrinsic' nor 'always global' is
         right:
@@ -4763,8 +5173,8 @@ class Analysis(object):
         =========  ==================  =================
         dataset    intrinsic           global
         =========  ==================  =================
-        VisiumHD   WSI pixels (2.5%)   µm (100%)
-        MERFISH    µm (99.1%)          pixels (0.0%)
+        VisiumHD   WSI pixels (2.5%)   um (100%)
+        MERFISH    um (99.1%)          pixels (0.0%)
         =========  ==================  =================
 
         (percentages = markers landing inside the map's own coordinate bounds.)
@@ -4843,6 +5253,15 @@ class Analysis(object):
             return xy
 
         def hit(v):
+            """Return the fraction of positions that land inside the cell-type map's bounds.
+
+            This is how the two candidate frames are compared: the frame in which more of the
+            markers fall on the map is the frame they were written in.
+
+            :param v: The positions to test, of shape ``(N, 2)``.
+            :returns: The fraction inside the bounds, between zero and one.
+            :rtype: float
+            """
             return float(((v[:, 0] >= x0) & (v[:, 0] <= x1) &
                           (v[:, 1] >= y0) & (v[:, 1] <= y1)).mean())
         h_int, h_glob = hit(xy), hit(xy_global)
@@ -4863,7 +5282,7 @@ class Analysis(object):
         """Aggregate a points element into a cell x gene count matrix.
 
         Each transcript falls in exactly one voxel of the ``labels`` raster, so the
-        raster performs the assignment in one pass — no point-in-polygon. Returns
+        raster performs the assignment in one pass, with no point-in-polygon test. Returns
         ``(csr_matrix, gene_names, n_assigned)``. Transcripts outside every cell are
         dropped (that is the segmentation saying they belong to no cell)."""
         from scipy.sparse import coo_matrix
@@ -4915,7 +5334,7 @@ class Analysis(object):
         Tried in order: the explicit ``bins`` argument (AnnData, GridDataset, or a
         table key of ``sdata``), the GridDataset ``compute_vf`` was run on, and
         finally a table of ``sdata``. The last step never guesses between several
-        candidates — ``uns['cellman']`` marks the count table a count-platform
+        candidates. ``uns['cellman']`` marks the count table a count-platform
         loader wrote, and ssaft's own tables are excluded, so anything still
         ambiguous is raised rather than picked.
         """
@@ -4968,16 +5387,16 @@ class Analysis(object):
 
         The array platforms (Visium HD, Stereo-seq, StrataMap) carry no molecule
         coordinates. Their localized signal is a bin x gene table whose
-        ``obsm['spatial']`` holds each bin's centre in the same µm frame as the
-        cell-type map, so the assignment is exactly the points path — read the
+        ``obsm['spatial']`` holds each bin's centre in the same um frame as the
+        cell-type map, so the assignment is exactly the points path: read the
         label under the bin centre, one raster lookup, no point-in-polygon. Only
         the accumulation differs: a molecule contributes 1, a bin contributes its
         whole count vector.
 
         A bin is never split; it belongs to the cell its centre falls in. That is
         harmless while the bin pitch is at or below the map's voxel size (Visium HD
-        2 µm bins on a 2 µm/px map), and the ratio is reported so a coarser bin
-        cannot pass unnoticed. Bins whose centre lands on background are dropped —
+        2 um bins on a 2 um/px map), and the ratio is reported so a coarser bin
+        cannot pass unnoticed. Bins whose centre lands on background are dropped, and
         that is the segmentation saying they belong to no cell.
 
         Unlike the points path the full panel is kept in ``var``, including genes
@@ -5030,7 +5449,7 @@ class Analysis(object):
         return X, list(map(str, tab.var_names)), int(X.sum())
 
     def _cells_global_affine(self, sdata):
-        """``(3, 3)`` affine carrying the cell-type map's µm frame into ``'global'``.
+        """``(3, 3)`` affine carrying the cell-type map's um frame into ``'global'``.
 
         The frame the nuclei were read in decides (:meth:`_nuclei_to_um` records it); for an
         array of markers, which carries no frame, the map's own (:meth:`Dataset._map_to_global_affine`).
@@ -5086,7 +5505,7 @@ class Analysis(object):
         * two cells of **different** cell types are separated by the boundary the
           cell-type map already found;
         * two cells of the **same** cell type are separated midway between their
-          nuclei — the map carries no information there.
+          nuclei, because the map carries no information there.
 
         Both fall out of running one watershed per cell type, confined to that type's
         own region::
@@ -5113,7 +5532,7 @@ class Analysis(object):
           ``seed_rule`` decides it from the nucleus's xy column. A nucleus whose column is
           background on every layer is ignored. One fixed layer for all nuclei would drop every
           nucleus where a tilted or uneven section does not cross that layer -- two thirds of them
-          on a Xenium section spread over 60 µm in z.
+          on a Xenium section spread over 60 um in z.
         * *flood* -- per cell type, the 3D watershed of the Euclidean distance to the seeds,
           confined to that cell type's voxels, computed in xy tiles of ``tile`` voxels with
           ``pad_um`` of overlap (each tile keeps its core) on ``ncores`` processes.
@@ -5130,7 +5549,7 @@ class Analysis(object):
           row per cell, transcripts counted by the 3D voxel they fall in (z clamped into the
           layers), ``obs`` with the cell type, ``volume_um3``, ``n_z``,
           ``max_plane_area_um2``, ``area_um2`` (seed layer) and ``seed_z_um``, ``obsm['spatial']`` the
-          voxel centroid in µm (x, y, z).
+          voxel centroid in um (x, y, z).
 
         ``min_area_um2`` drops a 3D cell whose largest layer is below it.
 
@@ -5155,15 +5574,15 @@ class Analysis(object):
         background, which eats the cell's outside inwards and always leaves the nucleus. Turn it
         on where a nucleus sitting alone in a wide region of its own celltype claims all of it --
         the watershed has no other cell there to stop it, so on a tissue edge or for a sparse
-        celltype a single "cell" can grow to hundreds of µm². In 3D the cap is applied per layer,
+        celltype a single "cell" can grow to hundreds of um^2. In 3D the cap is applied per layer,
         i.e. to the cross-sectional area, which is what ``area_um2`` reports. It is off by default
         because the honest size of a cell is the one the map and the neighbouring nuclei give it;
-        a cap is a correction to be chosen per dataset, not a default (100 µm² is a reasonable
-        starting point -- it is about a 11 µm disc).
+        a cap is a correction to be chosen per dataset, not a default (100 um^2 is a reasonable
+        starting point -- it is about a 11 um disc).
 
         Polygons trace voxel BOUNDARIES (:func:`spatialdata.to_polygons`): a contour through
         boundary voxel centres would inset every cell by half a voxel and lose 1-2 voxel
-        cells. Geometry is in the map's µm frame (so areas are µm²); the elements carry the
+        cells. Geometry is in the map's um frame (so areas are um^2); the elements carry the
         transformation of the frame the nuclei were read in, so they overlay the image, the
         nuclei and the transcripts in ``'global'``. The cell-type categorical is pinned to the
         celltype id order and the palette travels in ``uns[f'{column}_colors']``, so a render
@@ -5176,12 +5595,12 @@ class Analysis(object):
 
         :param sdata: SpatialData to read the nuclei from and write the cells into. Defaults to
             the one remembered from ``compute_vf`` / ``map_celltypes``.
-        :param nuclei: Marker positions: an ``(N, 2)`` array in the map's µm frame, or the key
+        :param nuclei: Marker positions: an ``(N, 2)`` array in the map's um frame, or the key
             of a shapes element (polygon centroids, e.g. Xenium ``'nucleus_boundaries'``) or a
             points element with ``x`` / ``y`` columns.
         :param z: 2D only: the map layer to segment. Giving it on a 3D store segments that one
             layer in 2D.
-        :param simplify: Douglas-Peucker tolerance in µm for the polygons (``None`` = exact).
+        :param simplify: Douglas-Peucker tolerance in um for the polygons (``None`` = exact).
         :param min_area_um2: Drop cells smaller than this (2D: the polygon; 3D: its largest
             layer). ``0`` keeps all.
         :param exclude_celltypes: Cell types (names or ids) NOT to cut into cells: each stays the
@@ -5201,8 +5620,8 @@ class Analysis(object):
         :param nuclei_frame: ``'intrinsic'`` / ``'global'`` to force the frame the nuclei are
             read in (default: the one that lands on the map).
         :param tile: 3D only: xy tile size, voxels.
-        :param pad_um: 3D only: tile overlap, µm.
-        :param nuclei_z: 3D only: each nucleus's z in µm (the transcripts' z frame), in the order
+        :param pad_um: 3D only: tile overlap, um.
+        :param nuclei_z: 3D only: each nucleus's z in um (the transcripts' z frame), in the order
             of ``nuclei``; ``NaN`` where unknown. E.g. the median z of the transcripts inside each
             nucleus (Xenium ``overlaps_nucleus``). Without it ``seed_rule`` places the seed.
         :param seed_rule: 3D only: which cell types of a nucleus's xy column get a seed, and on
@@ -5834,40 +6253,79 @@ class Analysis(object):
                           log_transform=True, overwrite=True,
                           gpu_device='cuda', query_subchunk_size=None,
                           gpu_target_bytes=int(1e9), save_vf=False, method='corr'):
-        """GPU equivalent of :meth:`map_celltypes_cpu` (single machine).
+        """GPU equivalent of :meth:`map_celltypes_cpu`, on a single machine.
 
-        Reads zarr state, KDE-computes the vector field chunk-by-chunk on
-        a CUDA device (Triton kernel + torch GEMM Pearson correlation),
-        and writes ``vf_norm``, ``celltype_maps``, ``max_correlations``.
+        The method reads the zarr state, computes the vector field chunk by chunk on a CUDA
+        device, using the Triton kernel and a torch matrix multiply for the Pearson
+        correlation, and writes ``vf_norm``, ``celltype_maps`` and the score volume.
 
-        Numerical equivalence vs the CPU path: not bit-identical; expected
-        per-voxel correlation diff <1e-5, with minor label flips possible
-        at decision boundaries (much less than 0.1% of voxels for
-        well-separated centroids).
+        It is built on a producer and consumer split. Field production, in
+        :meth:`_kde_field_iter_gpu`, is separated from the shared Pearson-max mapper
+        ``_pearson_max_gpu``, which is identical to the one the count path uses, and the
+        full normalized field can be teed to a tensorstore writer in the same streaming
+        pass. Correlations are computed in matrix-multiply batches, so they can differ from
+        an unbatched reduction by less than 1e-5.
+
+        The results are not bit-identical to the processor path. The expected per-voxel
+        difference in correlation is below 1e-5, with minor label flips possible at decision
+        boundaries, affecting far less than 0.1 percent of voxels for well separated
+        centroids.
+
+        ``method='gnb'`` has no GPU kernel for the density estimate, so it runs the
+        processor-side producer while the classifier itself still predicts on the GPU
+        through cuML. Only the estimation step is on the processor there.
 
         Parameters
         ----------
+        sdata : spatialdata.SpatialData
+            The object holding the molecules.
+        centroids : array-like, optional
+            Cluster centroids. They are read from the store when ``None``.
+        element_name : str, optional
+            Name of the points element holding the molecules. It is resolved automatically
+            when ``None``.
+        exclude_gene_indices : array-like, optional
+            Positions to drop from the gene axis before mapping.
+        marker_genes_path : str, optional
+            Path to the marker file the annotation wrote.
+        h5ad : str, optional
+            Annotated h5ad to build the mapping inputs from.
+        column : str
+            The ``obs`` column of that h5ad holding the final celltype label.
+        map_kwargs : dict, optional
+            Extra keyword arguments forwarded to the chosen mapper.
+        bandwidth : float
+            Gaussian-equivalent kernel bandwidth in um.
+        sampling_distance : float
+            Lattice spacing in um.
+        prune_coefficient : float
+            Truncation radius of the infinite-support kernels, in units of the bandwidth.
+        kernel : str
+            One of :data:`ssaft._count.KDE_KERNELS`.
+        size_after_normalization : float
+            Total each vector is scaled to before the logarithm.
+        log_transform : bool
+            Whether ``log1p`` is applied after normalization.
+        overwrite : bool
+            Whether to replace the map arrays already in the store.
         gpu_device : str, default ``'cuda'``
+            CUDA device used by this path.
         query_subchunk_size : int, optional
-            Voxel queries per Triton launch; auto-sized from
-            ``gpu_target_bytes / (n_genes_use * 4)`` when None.
+            Voxel queries per Triton launch. It is sized from
+            ``gpu_target_bytes / (n_genes_use * 4)`` when ``None``.
         gpu_target_bytes : int, default 1 GB
-            Target VRAM budget for the per-sub-chunk output buffer. Transcript regime
-            only — the count regime sizes its own field band (see
-            :func:`ssaft._lda.map_lda`) and takes its budget through
+            Target device memory budget for the per-sub-chunk output buffer. This applies
+            to the transcript regime only. The count regime sizes its own field band, as
+            described under :func:`ssaft._lda.map_lda`, and takes its budget through
             ``map_kwargs={'gpu_target_bytes': ...}``.
-        Other parameters are identical to :meth:`map_celltypes_cpu`.
+        save_vf : bool
+            Whether to persist the streamed field rather than discarding it slab by slab.
+        method : str
+            Which mapper to run: ``'corr'``, ``'gnb'`` or ``'lda'``.
 
-        Built on a producer/consumer split: KDE field production
-        (:meth:`_kde_field_iter_gpu`) is separated from the shared Pearson-max
-        mapper (``_pearson_max_gpu``, identical to the count path), with the full
-        normalized field optionally teed to a tensorstore writer (``save_vf``) in
-        the same streaming pass. Correlations are computed in matmul batches, so
-        they can differ from an unbatched reduction by <1e-5.
-
-        ``method='gnb'`` has no GPU-KDE kernel, so it runs the CPU KDE producer while the
-        GaussianNB classifier itself still predicts on the GPU (cuML); only the KDE step is
-        CPU here.
+        See Also
+        --------
+        map_celltypes_cpu : the same stage on the processor, with the same parameters.
         """
         if method == 'gnb':
             # no GPU KDE kernel for the gnb producer; lda stays here (its consumer is a
@@ -6025,13 +6483,13 @@ class Analysis(object):
                             want_full_field, query_subchunk_size, gpu_target_bytes,
                             on_batch=None):
         """PRODUCER. Yield, per output x-slab, a dict with the vf_norm plane, the
-        KEPT (vf_norm>threshold) voxels' local positions + normalized·log1p gene
+        KEPT (vf_norm>threshold) voxels' local positions + normalized.log1p gene
         vectors (GPU tensor), and the full normalized field (only if
         ``want_full_field``).
 
         ``on_batch(vecs, kx, ky, kz, vf_norm_kept, x0)`` streams instead of accumulating.
         Without it a chunk's kept vectors are held on the device and then concatenated,
-        which peaks at TWICE their size — the concatenation alone asked for another
+        which peaks at TWICE their size. The concatenation alone asked for another
         9 GB of a 31 GB card on a whole-transcriptome MERFISH store and died there.
         With it each sub-chunk is handed over and freed, so the peak is one sub-chunk
         (``query_subchunk_size`` rows) instead of a whole chunk, and the yielded
@@ -6193,11 +6651,14 @@ class Analysis(object):
                         gpu_device='cuda', query_subchunk_size=None,
                         gpu_target_bytes=int(1e9), chunk_start=None, chunk_end=None,
                         cx=None, create_arrays=True, attach=True):
-        """ORCHESTRATOR. Drive the KDE producer into the mapping consumer and/or a
-        tensorstore field writer in ONE pass. Covers all transcript combos:
-          map_celltypes save_vf=False → do_map=True,  save_vf=False (stream+map)
-          map_celltypes save_vf=True  → do_map=True,  save_vf=True  (map+store, 1 pass)
-          compute_vf(imaging)         → do_map=False, save_vf=True  (store only)
+        """Drive the KDE producer into the mapping consumer, and a field writer, in one pass.
+
+        This is the orchestrator of the transcript path. It covers every combination the
+        transcript regime needs::
+
+            map_celltypes, save_vf=False   do_map=True,  save_vf=False  (stream and map)
+            map_celltypes, save_vf=True    do_map=True,  save_vf=True   (map and store, one pass)
+            compute_vf on imaging data     do_map=False, save_vf=True   (store only)
         """
         import torch
         from ._mapping_gpu import _pearson_max_gpu
@@ -6279,6 +6740,11 @@ class Analysis(object):
                     _lda_on_gpu = False
 
         def _safe_remove(name):
+            """Delete an array from the store if it is there, tolerating writer debris.
+
+            :param name: Name of the array to remove.
+            :type name: str
+            """
             if name in zg:
                 _remove_array(zg, name)
 
@@ -6334,6 +6800,23 @@ class Analysis(object):
         _pend = {'i': [], 'c': [], 'm': [], 'x': [], 'y': [], 'z': []}
 
         def _lda_on_batch(vecs_t, kx, ky, kz, vfn_t, x0):
+            """Score one batch of the streamed field with the factor model, on the device.
+
+            The producer hands over batches of normalized vectors, and this converts them back to
+            a molecule-count scale and scores them immediately rather than accumulating them.
+            Concatenating the batches instead would double the memory they occupy, and that is
+            what runs the card out of memory. Only the resulting labels and scores are kept.
+
+            :param vecs_t: The batch's normalized vectors, on the device.
+            :param kx: Lattice index along x of each voxel, relative to the slab.
+            :param ky: Lattice index along y of each voxel.
+            :param kz: Lattice index along z of each voxel.
+            :param vfn_t: Density of each voxel, on the device.
+            :param x0: Lattice index of the slab's first column along x.
+            :returns: The labels as int32, the scores as float32, and the per-voxel marker level
+                as float32 when one is being computed, otherwise ``None``.
+            :rtype: tuple
+            """
             import torch
             _xy = np.stack([(kx + x0) * sampling_distance + _origin[0],
                             ky * sampling_distance + _origin[1]], 1)
@@ -6498,48 +6981,71 @@ class Analysis(object):
                                size_after_normalization=10, log_transform=True,
                                method='corr', marker_genes_path=None, h5ad=None,
                                column='cellman_annotation', leiden_column='leiden', cmap=None):
-        """
-        Initialize zarr arrays for a distributed ``map_celltypes_cpu`` run.
+        """Initialize the zarr arrays for a distributed ``map_celltypes_cpu`` run.
 
-        Must be called **once** on any single machine before launching
-        parallel workers.  After this returns, call
-        ``map_celltypes_partial`` on each worker with the returned
-        chunk info.
+        This must be called once, on a single machine, before any worker is launched. After
+        it returns, call :meth:`map_celltypes_partial` on each worker with the chunk
+        information it gives back.
 
         Parameters
         ----------
         sdata : spatialdata.SpatialData
+            The object holding the molecules.
         centroids : ndarray (n_clusters, n_genes), optional
-            Falls back to ``self.dataset.centroids``.
-        bandwidth, sampling_distance, prune_coefficient,
-        size_after_normalization, log_transform
-            Same as ``map_celltypes_cpu``; recorded so workers can use
-            identical values.
+            Cluster centroids. They fall back to ``self.dataset.centroids``.
+        element_name : str or None
+            Name of the points element to parse from ``sdata``.
+        exclude_gene_indices : list[int] or None
+            Gene indices to drop before correlation.
+        bandwidth : float
+            Gaussian-equivalent kernel bandwidth in um. It is recorded so that every worker
+            uses the same value.
+        sampling_distance : float
+            Lattice spacing in um, recorded for the workers.
+        prune_coefficient : float
+            Truncation radius of the infinite-support kernels, in units of the bandwidth,
+            recorded for the workers.
+        kernel : str
+            One of :data:`ssaft._count.KDE_KERNELS`, recorded for the workers.
+        size_after_normalization : float
+            Total each vector is scaled to before the logarithm, recorded for the workers.
+        log_transform : bool
+            Whether ``log1p`` is applied after normalization, recorded for the workers.
+        method : str
+            Which mapper the workers will run: ``'corr'``, ``'gnb'`` or ``'lda'``. It
+            decides which score volume is created.
+        marker_genes_path : str or pathlib.Path or dict or None
+            Restrict the mapping to marker genes. ``None`` keeps the whole panel and
+            behaves exactly as before. Otherwise pass a ``{celltype: [genes]}`` dict, the
+            CeLLMan ``celltype_markers.yaml``, whose defining, required and supporting
+            tiers are already restricted to the genes measured in the dataset and are all
+            unioned, which is the preferred form, or ``expert_judgment_annotation.csv``,
+            whose ``key_markers`` column is thinner.
 
-        :param element_name: Name of the points element to parse from ``sdata``.
-        :type element_name: str or None
-        :param exclude_gene_indices: Gene indices to drop before correlation.
-        :type exclude_gene_indices: list[int] or None
-        :param marker_genes_path: Restrict the mapping to marker genes. ``None`` (default)
-            keeps the whole panel and behaves exactly as before. Otherwise a
-            ``{celltype: [genes]}`` dict, the CeLLMan ``celltype_markers.yaml``
-            (defining / required / supporting per label, already restricted to genes
-            measured in the dataset; all three tiers are unioned — preferred), or
-            ``expert_judgment_annotation.csv``
-            (its thinner ``key_markers`` column). The gene axis is cut down to the UNION
-            of the marker sets and everything else is dropped, so the centroids are
-            built from the genes the annotation leaned on instead of the whole panel —
-            flat, non-discriminative genes stop diluting the correlation / likelihood.
-            Combined with ``exclude_gene_indices`` if both are given.
-        :type marker_genes_path: str or pathlib.Path or dict or None
+            The gene axis is cut down to the union of the marker sets and everything else
+            is dropped, so the centroids are built from the genes the annotation leaned on
+            rather than from the whole panel, which stops flat, non-discriminative genes
+            diluting the correlation or the likelihood. This combines with
+            ``exclude_gene_indices`` when both are given.
+        h5ad : str or None
+            Annotated h5ad to build the mapping inputs from, when the store does not
+            already hold them.
+        column : str
+            The ``obs`` column of that h5ad holding the final celltype label.
+        leiden_column : str
+            The ``obs`` column holding the original cluster identifier, used to split
+            ``Unknown``.
+        cmap : str or matplotlib.colors.Colormap or None
+            Palette used to fix the per-celltype colours. ``None`` gives a qualitative
+            palette sized to the class count.
 
         Returns
         -------
         dict
+            The chunk information the workers need, as
             ``{'cx': int, 'n_chunk': int, 'vx': int, 'vy': int, 'vz': int,
-               'bandwidth': float, 'sampling_distance': float,
-               'prune_coefficient': float, 'kernel': str,
-               'size_after_normalization': float, 'log_transform': bool}``
+            'bandwidth': float, 'sampling_distance': float, 'prune_coefficient': float,
+            'kernel': str, 'size_after_normalization': float, 'log_transform': bool}``.
         """
         # The classes come from the annotation, exactly as in map_celltypes. A distributed run
         # has to fix them BEFORE the workers start: each worker rebuilds the LDA factors from
@@ -6598,6 +7104,11 @@ class Analysis(object):
             raise ValueError('No common genes between input data and centroids.')
 
         def _safe_remove(name):
+            """Delete an array from the store if it is there, tolerating writer debris.
+
+            :param name: Name of the array to remove.
+            :type name: str
+            """
             if name in self.dataset.zarr_group:
                 _remove_array(self.dataset.zarr_group, name)
 
@@ -6657,58 +7168,79 @@ class Analysis(object):
                                   gpu_device=None, force_cpu=False,
                                   query_subchunk_size=None, gpu_target_bytes=int(1e9),
                                   method='corr', marker_genes_path=None, map_kwargs=None):
-        """
-        Process a contiguous range of X-axis chunks for a distributed run.
+        """Process a contiguous range of chunks along x, for a distributed run.
 
-        Call ``init_map_celltypes`` once first to create zarr arrays and
-        obtain the shared ``cx`` / ``n_chunk`` values.  Then call this
-        function on each worker with non-overlapping ``[chunk_start,
-        chunk_end)`` ranges.
+        Call :meth:`init_map_celltypes` once first, to create the zarr arrays and obtain the
+        shared chunk width and chunk count. Then call this method on each worker with
+        non-overlapping ranges.
 
-        Each worker runs on **GPU** when ``gpu_device`` is given and a CUDA
-        device is available (and ``force_cpu`` is False); otherwise it
-        falls back to the CPU implementation. GPU and CPU paths share the
-        same I/O contract — both write the zarr slices ``[x0:x1, :, :]``
-        for the chunks they own — so workers may even mix backends.
+        Each worker runs on the GPU when a device is given and CUDA is available, and
+        ``force_cpu`` is not set; otherwise it falls back to the processor implementation.
+        The two paths share the same input and output contract, since both write the zarr
+        slices of the chunks they own, so workers may even mix backends.
 
         Parameters
         ----------
         sdata : spatialdata.SpatialData
-            Used to populate ``self.locations`` via ``_prepare_grid``.
+            Used to populate the locations through ``_prepare_grid``.
         chunk_start : int
-            First chunk index to process (inclusive).
+            First chunk index to process, inclusive.
         chunk_end : int
-            Last chunk index to process (exclusive).
+            Last chunk index to process, exclusive.
         cx : int
-            Chunk width in voxels along the X axis.  **Must be the same
-            value across all workers.**  Obtain from
-            ``init_map_celltypes`` return value.
+            Chunk width in voxels along x. It must be the same value on every worker, and
+            comes from the return value of :meth:`init_map_celltypes`.
+        centroids : array-like, optional
+            Cluster centroids. They are read from the store when ``None``.
+        element_name : str, optional
+            Name of the points element holding the molecules. It is resolved automatically
+            when ``None``.
+        exclude_gene_indices : array-like, optional
+            Positions to drop from the gene axis before mapping.
+        bandwidth : float
+            Gaussian-equivalent kernel bandwidth in um. It must match the value
+            :meth:`init_map_celltypes` recorded.
+        sampling_distance : float
+            Lattice spacing in um, matching the recorded value.
+        prune_coefficient : float
+            Truncation radius of the infinite-support kernels, in units of the bandwidth,
+            matching the recorded value.
+        kernel : str
+            One of :data:`ssaft._count.KDE_KERNELS`, matching the recorded value.
+        size_after_normalization : float
+            Total each vector is scaled to before the logarithm, matching the recorded
+            value.
+        log_transform : bool
+            Whether ``log1p`` is applied after normalization, matching the recorded value.
         gpu_device : str, optional
-            CUDA device for this worker (e.g. ``'cuda:0'``). If None, the
-            worker uses the CPU path.
+            CUDA device for this worker, for example ``'cuda:0'``. When ``None`` the worker
+            uses the processor path.
         force_cpu : bool, default False
-            Force the CPU path even if ``gpu_device`` is given.
+            Whether to force the processor path even when a device is given.
+        query_subchunk_size : int, optional
+            Voxels scored per device sub-chunk. It is sized from ``gpu_target_bytes`` when
+            ``None``, and is ignored on the processor.
+        gpu_target_bytes : int
+            Device memory budget for one sub-chunk's output buffer, in bytes. It is ignored
+            on the processor.
         method : {'corr', 'lda'}, default 'corr'
-            Must match ``init_map_celltypes``: it decides which score volume the worker writes
-            (``max_correlations`` / ``max_probabilities``) and, for ``'lda'``, that the factors are
-            rebuilt from the store. Every worker reads the same store, so they build the same
-            factors and their slices join into the single-process result.
-        marker_genes_path, map_kwargs
-            As ``map_celltypes``. ``marker_genes_path`` is what makes ``'lda'`` write
-            ``celltype_marker_score``, so pass the same value to ``init_map_celltypes``.
-        query_subchunk_size, gpu_target_bytes
-            Forwarded to the GPU core (ignored on CPU).
-        bandwidth, sampling_distance, prune_coefficient,
-        size_after_normalization, log_transform, centroids,
-        element_name, exclude_gene_indices
-            Same as ``map_celltypes_cpu``.  Values must match those used
-            during ``init_map_celltypes``.
+            It must match :meth:`init_map_celltypes`, because it decides which score volume
+            the worker writes, and, for ``'lda'``, that the factors are rebuilt from the
+            store. Every worker reads the same store, so they build the same factors and
+            their slices join into the single-process result.
+        marker_genes_path : str, optional
+            As in :meth:`map_celltypes`. This is what makes ``'lda'`` write
+            ``celltype_marker_score``, so pass the same value to
+            :meth:`init_map_celltypes`.
+        map_kwargs : dict, optional
+            Extra keyword arguments forwarded to the chosen mapper, as in
+            :meth:`map_celltypes`.
 
         Returns
         -------
         None
-            Results are written to the zarr store slices
-            ``[x0:x1, :, :]`` for each processed chunk.
+            The results are written to the zarr store, into the slices of each processed
+            chunk.
         """
         use_gpu = False
         if gpu_device is not None and not force_cpu:

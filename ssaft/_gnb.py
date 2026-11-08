@@ -1,22 +1,24 @@
-"""Gaussian naive Bayes celltype mapping for ssaft.
+"""Gaussian naive Bayes celltype mapping.
 
-An alternative to the centroid-correlation mapper (:func:`ssaft._count.map_corr`).
-A :class:`~sklearn.naive_bayes.GaussianNB` (cuML on GPU, scikit-learn on CPU) is fitted on
-the labeled ``normalized_vectors`` — ALL of them, streamed via ``partial_fit`` so the full
-matrix is never resident — and every field voxel is classified by its posterior. Being
-GENERATIVE (one Gaussian per class), each class keeps a non-empty decision region, so GNB
-preserves rare cell types that the discriminative correlation argmax can squeeze out.
+This is an alternative to the centroid-correlation mapper
+(:func:`ssaft._count.map_corr`). A Gaussian naive Bayes classifier, from cuML on the
+GPU and from scikit-learn on the CPU, is fitted on the labeled
+``normalized_vectors``. All of them are used, streamed through ``partial_fit`` so
+that the full matrix is never resident, and every voxel of the field is then
+classified by its posterior. Because the model is generative, with one Gaussian per
+class, each class keeps a non-empty decision region. That is what preserves the rare
+cell types which the discriminative correlation argmax can squeeze out.
 
-Both regimes are supported, mirroring the correlation mapper:
+Both regimes are supported, mirroring the correlation mapper. On the count and blur
+path, :func:`map_gnb` reads the stored three-dimensional ``vf_normalized`` and
+classifies each voxel, which is the array-based counterpart of :func:`map_corr`. On
+the transcript and imaging path, ``_map_celltypes_cpu`` and ``_map_celltypes_gpu``
+fit a model here, on the subset of genes the two sides share, and score each kernel
+density chunk as it is produced.
 
-  * **count / blur** — :func:`map_gnb` reads the stored 3D ``vf_normalized`` and classifies
-    each voxel (the array-based counterpart of :func:`map_corr`).
-  * **transcript / imaging** — ``_map_celltypes_cpu`` / ``_map_celltypes_gpu`` fit a model
-    here (on the shared-gene subset) and score each KDE chunk on the fly (the KDE
-    counterpart, like the correlation transcript path).
-
-Vectors are row-normalized (mean-center + L2) before fit and predict — the same Pearson
-space the correlation mapper uses — so the two are directly comparable.
+Vectors are row-normalized, by mean-centering and then scaling to unit L2 norm,
+before both fit and predict. That is the same Pearson space the correlation mapper
+works in, so the two mappers are directly comparable.
 """
 import os
 
@@ -24,14 +26,36 @@ import numpy as np
 
 
 def _row_normalize(A, xp):
-    """Per-row mean-center + L2 (the corr Pearson space); ``A`` on ``xp`` (numpy/cupy)."""
+    """Mean-center each row and scale it to unit L2 norm.
+
+    This puts the rows in the same space the correlation mapper uses, so that a dot
+    product between two of them is a Pearson correlation. A row of zero norm is left
+    unscaled rather than divided by zero.
+
+    :param A: The matrix to normalize, with one observation per row.
+    :param xp: The array module that ``A`` belongs to, either numpy or cupy.
+    :returns: The normalized matrix, in the same array module.
+    """
     A = A - A.mean(axis=1, keepdims=True)
     n = xp.linalg.norm(A, axis=1, keepdims=True)
     return A / xp.where(n == 0, xp.asarray(1.0, dtype=A.dtype), n)
 
 
 def _resolve_backend(gpu_device, force_cpu):
-    """``(GaussianNB, xp, use_gpu, device_int)`` — cuML+cupy on GPU, else scikit-learn+numpy."""
+    """Choose the Gaussian naive Bayes implementation and array module to use.
+
+    The GPU pair of cuML and cupy is preferred, and the CPU pair of scikit-learn and
+    numpy is the fallback. The GPU is skipped when it is turned off by the caller, when
+    either GPU package is missing, or when no CUDA device is visible.
+
+    :param gpu_device: The device to use, either an integer or a string such as
+        ``'cuda:1'``. A string without an index means device zero.
+    :param force_cpu: Whether to skip the GPU even when it is available.
+    :type force_cpu: bool
+    :returns: A tuple of the classifier class, the array module, a flag saying whether
+        the GPU was chosen, and the integer device index, which is ``None`` on the CPU.
+    :rtype: tuple
+    """
     if not force_cpu:
         try:
             import cupy as cp
@@ -49,13 +73,27 @@ def _resolve_backend(gpu_device, force_cpu):
 
 def fit_gnb(zg, *, gpu_device='cuda', force_cpu=False, row_normalize=True,
             fit_chunk=100_000, var_smoothing=1e-9, gene_indices=None):
-    """Fit a GaussianNB on ALL labeled ``normalized_vectors`` (streamed; no subsample).
+    """Fit a Gaussian naive Bayes model on every labeled vector in the store.
 
-    :param zg: zarr group holding ``normalized_vectors`` (L, g) + ``cluster_labels`` (L,).
-    :param gene_indices: optional column subset of the vectors — used by the transcript
-        path so the classifier's genes match the KDE field's shared-gene axis.
-    :returns: ``(clf, classes, backend)`` where ``classes`` are the sorted celltype ids and
-        ``backend = (xp, use_gpu, device)`` for :func:`predict_gnb`.
+    The vectors are streamed in chunks and no subsample is taken.
+
+    :param zg: The zarr group holding ``normalized_vectors``, of shape ``(L, g)``, and
+        ``cluster_labels``, of shape ``(L,)``.
+    :param gpu_device: The device to fit on, passed to :func:`_resolve_backend`.
+    :param force_cpu: Whether to force the scikit-learn backend.
+    :type force_cpu: bool
+    :param row_normalize: Whether to put each vector in Pearson space before fitting.
+    :type row_normalize: bool
+    :param fit_chunk: Number of rows read per streaming step.
+    :type fit_chunk: int
+    :param var_smoothing: Variance smoothing passed to the classifier.
+    :type var_smoothing: float
+    :param gene_indices: An optional column subset of the vectors. The transcript path
+        sets it so that the classifier's genes match the shared gene axis of the kernel
+        density field.
+    :returns: A triple of the fitted classifier, the sorted celltype identifiers, and the
+        backend tuple ``(xp, use_gpu, device)`` that :func:`predict_gnb` expects.
+    :rtype: tuple
     """
     GNB, xp, use_gpu, dev = _resolve_backend(gpu_device, force_cpu)
     nv = zg['normalized_vectors']
@@ -65,6 +103,11 @@ def fit_gnb(zg, *, gpu_device='cuda', force_cpu=False, row_normalize=True,
     gi = None if gene_indices is None else np.asarray(gene_indices)
 
     def _run():
+        """Stream the labeled vectors through ``partial_fit`` and return the model.
+
+        :returns: The fitted classifier and the number of labeled rows it saw.
+        :rtype: tuple
+        """
         clf = GNB(var_smoothing=var_smoothing)
         cls_dev = xp.asarray(classes)
         n_used = 0
@@ -98,27 +141,46 @@ def fit_gnb(zg, *, gpu_device='cuda', force_cpu=False, row_normalize=True,
 def fit_gnb_h5ad(h5ad_path, *, gene_names, column='cellman_annotation',
                  leiden_column='leiden', row_normalize=True, fit_chunk=100_000,
                  var_smoothing=1e-9, verbose=True):
-    """Fit :class:`sklearn.naive_bayes.GaussianNB` on the annotation h5ad itself.
+    """Fit a Gaussian naive Bayes model on the annotated h5ad itself.
 
-    The ground truth is ``obs[column]`` — the labels CeLLMan finalized — not the
-    store's ``cluster_labels``, and the features are ``gene_names``, i.e. the marker
-    panel from ``celltype_markers.yaml`` rather than the whole matrix. Restricting the
-    features is the point: GaussianNB weights every gene equally, so hundreds of genes
-    that are flat across celltypes dilute the handful that actually separate them.
+    The ground truth is ``obs[column]``, meaning the labels CeLLMan finalized, rather
+    than the store's ``cluster_labels``. The features are ``gene_names``, meaning the
+    marker panel from ``celltype_markers.yaml`` rather than the whole matrix. Restricting
+    the features is the point: Gaussian naive Bayes weights every gene equally, so
+    hundreds of genes that are flat across celltypes would dilute the handful that
+    actually separate them.
 
-    Labels are resolved to celltype ids with the SAME rule the centroid builder uses
-    (:func:`ssaft._mapping_inputs._build_units`): one class per named label,
-    ``Unknown`` split per source cluster into ``unknown1..N``, Background dropped.
-    Ids therefore line up with ``celltype_names`` / ``centroids`` / the colour palette,
-    which is what keeps the written ``celltype_maps`` readable by everything else.
+    Labels are resolved to celltype identifiers by the same rule the centroid builder
+    uses, in :func:`ssaft._mapping_inputs._build_units`. There is one class per named
+    label, ``Unknown`` is split per source cluster into ``unknown1`` to ``unknownN``, and
+    Background is dropped. The identifiers therefore line up with ``celltype_names``,
+    with ``centroids`` and with the colour palette, which is what keeps the
+    ``celltype_maps`` that get written readable by everything else.
 
-    Always scikit-learn, never cuML: this fit runs once on the annotated cells (not per
-    voxel), so it is not the bottleneck, and the reference implementation is worth more
-    here than the GPU. Prediction still honours whatever backend the caller asks for.
+    This fit always uses scikit-learn and never cuML. It runs once on the annotated
+    cells rather than once per voxel, so it is not the bottleneck, and the reference
+    implementation is worth more here than the GPU. Prediction still honours whatever
+    backend the caller asks for.
 
-    :param h5ad_path: annotated h5ad written by CeLLMan.
-    :param gene_names: feature genes, in the exact order the voxel vectors carry them.
-    :returns: ``(clf, classes, backend)`` — same triple as :func:`fit_gnb`.
+    :param h5ad_path: The annotated h5ad written by CeLLMan.
+    :param gene_names: The feature genes, in the exact order the voxel vectors carry them.
+    :param column: The ``obs`` column holding the finalized labels.
+    :type column: str
+    :param leiden_column: The ``obs`` column holding the source cluster, used to split
+        ``Unknown``. A missing column is treated as a single cluster.
+    :type leiden_column: str
+    :param row_normalize: Whether to put each cell in Pearson space before fitting.
+    :type row_normalize: bool
+    :param fit_chunk: Number of cells read per streaming step.
+    :type fit_chunk: int
+    :param var_smoothing: Variance smoothing passed to the classifier.
+    :type var_smoothing: float
+    :param verbose: Whether to print a summary of the fit.
+    :type verbose: bool
+    :returns: The same triple as :func:`fit_gnb`.
+    :rtype: tuple
+    :raises ValueError: If the label column is absent, if any marker gene is missing from
+        the h5ad, or if no callable celltype is present.
     """
     import anndata as ad
     from sklearn.naive_bayes import GaussianNB
@@ -179,15 +241,30 @@ def fit_gnb_h5ad(h5ad_path, *, gene_names, column='cellman_annotation',
 
 
 def predict_gnb(clf, classes, V, backend, *, row_normalize=True, batch=20_000):
-    """Classify ``(n, g)`` vectors ``V`` (numpy) -> ``(labels int32 celltype ids, conf float32)``.
+    """Classify a matrix of vectors and return celltype identifiers and confidences.
 
-    ``conf`` is the top-class posterior probability. ``classes`` maps the argmax index back
-    to the celltype id (both cuML and scikit-learn keep ``classes_`` sorted, matching).
+    The confidence is the posterior probability of the top class. The ``classes`` array
+    maps the index of the argmax back to the celltype identifier; both cuML and
+    scikit-learn keep ``classes_`` sorted, so the two agree.
 
-    Predicted in ``batch``-row sub-chunks: ``GaussianNB.predict_proba`` builds an
-    ``(n, n_genes)`` array per class, so scoring a whole KDE/field chunk (hundreds of
-    thousands of voxels x thousands of genes) at once OOMs the GPU. ``batch`` bounds the
-    transient; lower it if a card is small.
+    Prediction proceeds in sub-chunks of ``batch`` rows. ``GaussianNB.predict_proba``
+    builds an array of shape ``(n, n_genes)`` for every class, so scoring a whole field
+    chunk at once, which can be hundreds of thousands of voxels by thousands of genes,
+    exhausts GPU memory. The batch size bounds that transient, and can be lowered on a
+    small card.
+
+    :param clf: The fitted classifier.
+    :param classes: The sorted celltype identifiers the classifier was fitted on.
+    :param V: The vectors to classify, of shape ``(n, g)``, as a numpy array.
+    :param backend: The backend triple returned by the fit.
+    :param row_normalize: Whether to put each vector in Pearson space before predicting.
+        This must match what was done during the fit.
+    :type row_normalize: bool
+    :param batch: Number of rows scored per sub-chunk.
+    :type batch: int
+    :returns: A pair of arrays, the celltype identifiers as int32 and the top posterior
+        probabilities as float32.
+    :rtype: tuple of numpy.ndarray
     """
     xp, use_gpu, dev = backend
     n = int(V.shape[0])
@@ -195,6 +272,12 @@ def predict_gnb(clf, classes, V, backend, *, row_normalize=True, batch=20_000):
         return np.empty(0, np.int32), np.empty(0, np.float32)
 
     def _one(Vb):
+        """Score one sub-chunk of rows and bring the result back to the host.
+
+        :param Vb: The rows of this sub-chunk.
+        :returns: The argmax class index and the top posterior probability per row.
+        :rtype: tuple of numpy.ndarray
+        """
         Vx = xp.asarray(np.ascontiguousarray(Vb), dtype=xp.float32)
         if row_normalize:
             Vx = _row_normalize(Vx, xp)
@@ -209,6 +292,11 @@ def predict_gnb(clf, classes, V, backend, *, row_normalize=True, batch=20_000):
         return np.asarray(best), np.asarray(conf, dtype=np.float32)
 
     def _loop():
+        """Score every sub-chunk in turn and concatenate the results.
+
+        :returns: The argmax class index and the top posterior probability for all rows.
+        :rtype: tuple of numpy.ndarray
+        """
         bs, cs = [], []
         for s in range(0, n, batch):
             b, c = _one(V[s:s + batch])
@@ -229,25 +317,53 @@ def map_gnb(analysis, *, centroids=None, gpu_device='cuda', force_cpu=False,
             var_smoothing=1e-9, fit_chunk=100_000, overwrite=True,
             gene_indices=None, h5ad=None, column='cellman_annotation',
             gene_names=None):
-    """Map the count/blur field to celltypes with GaussianNB (the GNB counterpart of
-    :func:`map_corr`).
+    """Map the count and blur field to celltypes with Gaussian naive Bayes.
 
-    Fits on the labeled ``normalized_vectors`` then classifies every ``vf_normalized`` voxel
-    with ``vf_norm > threshold``. The label raster has the same layout as the correlation
-    mapper (``celltype_maps``), but the score is a posterior probability, so it is written to
-    ``max_probabilities`` (not ``max_correlations``) and ``filter_celltypemaps`` thresholds it
-    with ``min_p``. Any ``max_correlations`` left by a previous ``corr`` run is dropped.
+    This is the counterpart of :func:`map_corr`. The model is fitted on the labeled
+    ``normalized_vectors`` and then every ``vf_normalized`` voxel whose ``vf_norm``
+    exceeds the threshold is classified.
 
-    :param centroids: accepted for signature parity with :func:`map_corr`; unused (GNB fits
-        its own per-class Gaussians from the labeled vectors).
-    :param gene_indices: positions into the store's gene axis to keep; ``None`` = all.
-        Set by ``map_celltypes(marker_genes_path=...)`` to the marker panel, so the
-        classifier is not diluted by genes no celltype was called on.
-    :param h5ad: annotated h5ad to fit on (:func:`fit_gnb_h5ad`, scikit-learn, ground
-        truth ``obs[column]``). ``None`` falls back to the store's labeled
-        ``normalized_vectors``, which encode the same labels.
-    :param gene_names: names of the kept genes, in ``gene_indices`` order; required
-        with ``h5ad`` so the h5ad columns can be matched to the field's gene axis.
+    The label raster has the same layout as the one the correlation mapper writes, under
+    ``celltype_maps``, but the score is a posterior probability. It is therefore written
+    to ``max_probabilities`` rather than ``max_correlations``, and ``filter_celltypemaps``
+    thresholds it with ``min_p``. Any ``max_correlations`` left behind by an earlier
+    correlation run is dropped.
+
+    :param analysis: The analysis whose dataset and store are read and written.
+    :param centroids: Accepted for signature parity with :func:`map_corr` and otherwise
+        unused, because the model fits its own per-class Gaussians from the labeled
+        vectors.
+    :param gpu_device: The device to use for the fit and the prediction.
+    :param force_cpu: Whether to force the scikit-learn backend.
+    :type force_cpu: bool
+    :param chunk_h: Number of raster rows processed per step.
+    :type chunk_h: int
+    :param vf_norm_threshold: Density below which a voxel is left unmapped. Resolved from
+        the store when ``None``.
+    :param row_normalize: Whether to put the vectors in Pearson space.
+    :type row_normalize: bool
+    :param var_smoothing: Variance smoothing passed to the classifier.
+    :type var_smoothing: float
+    :param fit_chunk: Number of rows read per streaming step of the fit.
+    :type fit_chunk: int
+    :param overwrite: Whether to replace existing map arrays in the store.
+    :type overwrite: bool
+    :param gene_indices: Positions into the store's gene axis to keep, where ``None``
+        keeps all of them. ``map_celltypes(marker_genes_path=...)`` sets this to the
+        marker panel so that the classifier is not diluted by genes no celltype was
+        called on.
+    :param h5ad: An annotated h5ad to fit on instead, through :func:`fit_gnb_h5ad`, which
+        takes ``obs[column]`` as ground truth and always uses scikit-learn. Passing
+        ``None`` falls back to the store's labeled ``normalized_vectors``, which encode
+        the same labels.
+    :param column: The ``obs`` column holding the labels, used with ``h5ad``.
+    :type column: str
+    :param gene_names: Names of the kept genes, in the order of ``gene_indices``. This is
+        required with ``h5ad`` so that the h5ad columns can be matched to the field's gene
+        axis.
+    :returns: Whatever ``_write_maps`` returns after writing the label raster and the
+        posterior scores into the store.
+    :raises ValueError: If ``h5ad`` is given without ``gene_names``.
     """
     from tqdm.auto import tqdm
     from ._count import _write_maps

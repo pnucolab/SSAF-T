@@ -1,24 +1,25 @@
-"""Gene-panel selection for count-based spatial data: HVG ∪ Cell-Ontology markers.
+"""Gene-panel selection for count-based spatial data.
 
-The vector field for a count platform is built over a chosen gene panel. That panel
-is the union of
+The vector field for a count platform is built over a chosen gene panel, and that
+panel is the union of two sources. The first is data driven: the highly variable genes
+found by the seurat_v3 method on a coarse-bin subsample, less a denylist of technical
+genes. The second is knowledge driven: the marker genes of the Cell-Ontology module
+for the sample's species and organ, fetched through the read-only slim-index REST API.
 
-  * data-driven **HVGs** (seurat_v3 on a coarse-bin subsample, minus a
-    technical-gene denylist), and
-  * **marker genes** from the Cell-Ontology knowledge-graph module for the sample's
-    (species, organ), fetched via the read-only slim-index REST API.
+The knowledge graph is reached only through that REST endpoint, never through a raw
+neo4j bolt connection. The server URL is resolved in a fixed order of precedence: the
+``server_url`` argument, then the ``CELLONTO_SERVER_URL`` environment variable, then
+the ``CELLONTO_API`` environment variable kept for backward compatibility, and finally
+:data:`DEFAULT_ONTOLOGY_SERVER`. That is the same public read-only server, in the same
+order, that ``CeLLMan/scripts/helper.py`` uses, so the panel and the annotator can
+never disagree about whether the knowledge graph exists. Setting any of those sources
+to an empty string, or to ``none``, disables the knowledge graph explicitly.
 
-The KG is reached ONLY through the REST slim-index endpoint (never raw neo4j bolt).
-The server URL resolves as ``server_url`` arg > ``CELLONTO_SERVER_URL`` env >
-``CELLONTO_API`` env (back-compat) > :data:`DEFAULT_ONTOLOGY_SERVER` — the same
-public read-only server, and the same precedence, that
-``Agentic-Annotation/scripts/helper.py`` uses, so the panel and the annotator never
-disagree about whether the KG exists. Setting any of them to an empty string /
-``none`` disables the KG explicitly. When the KG is disabled or unreachable, the
-panel degrades to **HVG-only** (the pipeline never dies on a missing KG) — note that
-KG markers missing from the panel become *off-panel* at annotation time, which is
-exactly what the HVG ∪ KG union exists to prevent, so a degraded panel is worth
-noticing rather than ignoring.
+When the knowledge graph is disabled or unreachable the panel degrades to the highly
+variable genes alone, so the pipeline never fails on a missing knowledge graph. That
+degradation is worth noticing rather than ignoring: a marker gene missing from the
+panel is off-panel at annotation time, which is exactly what taking the union of the
+two sources exists to prevent.
 """
 
 from __future__ import annotations
@@ -50,38 +51,71 @@ _DENY_HUMAN_RE = re.compile(
 
 
 def _denier(species: str):
-    """Return a predicate ``g -> bool`` marking technical genes to drop."""
+    """Return a predicate that marks technical genes to drop from the panel.
+
+    The returned predicate takes a gene symbol and returns ``True`` when that gene should
+    be excluded. Which rules apply depends on the species: human symbols are matched
+    against mitochondrial, ribosomal and haemoglobin prefixes, against ``MALAT1`` and
+    against a regular expression covering unnamed and antisense loci, while mouse symbols
+    are matched against the mouse equivalents of those prefixes, against predicted
+    ``Gm`` genes and against ``Rik`` cDNA clone names.
+
+    :param species: Species name. Anything that names human selects the human rules, and
+        everything else selects the mouse rules.
+    :type species: str
+    :returns: A predicate taking a gene symbol and returning ``True`` when it is technical.
+    :rtype: callable
+    """
     sp = (species or "").lower()
     if sp.startswith("human") or sp == "hs" or sp == "homo_sapiens":
         def _denied(g: str) -> bool:
+            """Report whether a human gene symbol is technical and should be dropped.
+
+            :param g: The gene symbol to test.
+            :type g: str
+            :returns: ``True`` when the symbol is mitochondrial, ribosomal, haemoglobin,
+                ``MALAT1``, or an unnamed or antisense locus.
+            :rtype: bool
+            """
             return (g.startswith(_DENY_HUMAN_PREFIX) or g == "MALAT1"
                     or bool(_DENY_HUMAN_RE.search(g)))
         return _denied
     def _denied(g: str) -> bool:
+        """Report whether a mouse gene symbol is technical and should be dropped.
+
+        :param g: The gene symbol to test.
+        :type g: str
+        :returns: ``True`` when the symbol is mitochondrial, ribosomal, haemoglobin, a
+            predicted ``Gm`` gene, or a ``Rik`` cDNA clone name.
+        :rtype: bool
+        """
         return (g.startswith(_DENY_MOUSE_PREFIX) or bool(re.match(r"Gm\d", g))
                 or g.endswith("Rik"))
     return _denied
 
 
 def resolve_server(server_url: Optional[str] = None) -> Optional[str]:
-    """Resolve the Cell-Ontology REST base URL by priority.
+    """Resolve the Cell-Ontology REST base URL in order of precedence.
 
-    ``server_url`` argument > ``CELLONTO_SERVER_URL`` env > ``CELLONTO_API`` env
-    (back-compat) > :data:`DEFAULT_ONTOLOGY_SERVER`. Unset therefore means *the
-    public server*, matching ``helper.py``'s ``_resolve_server`` — the annotator
-    connects by default, so the panel must too, otherwise the KG markers it will
-    later look for are silently absent from the vector field.
-    ``CELLONTO_SERVER_URL`` is the canonical name; ``CELLONTO_API`` is kept for
-    older setups. The FIRST source that is set wins (so an env var can be
-    overridden by the argument, and a set-but-empty value is not skipped).
+    The order is the ``server_url`` argument, then the ``CELLONTO_SERVER_URL`` environment
+    variable, then the ``CELLONTO_API`` environment variable, and finally
+    :data:`DEFAULT_ONTOLOGY_SERVER`. Leaving every source unset therefore means the public
+    server, which matches the behaviour of ``_resolve_server`` in ``helper.py``. The
+    annotator connects by default, so the panel must connect by default too; otherwise the
+    marker genes the annotator will later look for are silently absent from the vector
+    field.
 
-    Returns ``None`` only when the KG is explicitly disabled — the first source
-    that is set holds ``''`` / ``none`` / ``off`` / ``null`` / ``false``; callers
-    then run HVG-only.
+    ``CELLONTO_SERVER_URL`` is the canonical variable name and ``CELLONTO_API`` is kept for
+    older setups. The first source that is set wins, which means an environment variable
+    can be overridden by the argument and a value that is set but empty is not skipped.
 
-    :param server_url: explicit base URL; takes priority over the environment
-        variables. Pass ``'none'`` (or ``''``) to force HVG-only.
+    :param server_url: An explicit base URL, which takes priority over the environment
+        variables. Pass ``'none'`` or an empty string to force a panel of highly variable
+        genes only.
     :type server_url: str or None
+    :returns: The resolved base URL with any trailing slash removed, or ``None`` when the
+        first source that is set disables the knowledge graph.
+    :rtype: str or None
     """
     for v in (server_url,
               os.environ.get("CELLONTO_SERVER_URL"),
@@ -94,7 +128,16 @@ def resolve_server(server_url: Optional[str] = None) -> Optional[str]:
 
 
 def _clean(g: str) -> str:
-    """Normalize a marker symbol to match ``var_names`` (drop -/_ suffixes)."""
+    """Normalize a marker symbol so that it can match an entry in ``var_names``.
+
+    Everything from the first hyphen or underscore onwards is discarded, which strips the
+    suffixes that marker records sometimes carry.
+
+    :param g: The marker symbol to normalize.
+    :type g: str
+    :returns: The symbol up to its first hyphen or underscore.
+    :rtype: str
+    """
     return g.split("-")[0].split("_")[0]
 
 
@@ -103,26 +146,32 @@ def fetch_ontology_markers(species: str, organ: str,
                            slots: Iterable[str] = ("R", "S", "N", "DF"),
                            timeout: float = 60.0,
                            verbose: bool = True) -> set:
-    """Fetch the marker-gene set for a module from the slim-index REST API.
+    """Fetch the marker-gene set of one module from the slim-index REST API.
 
-    Collects genes from the requested term slots (Required / Supporting /
-    Negative / Defining by default). Returns an empty set (with a warning) when
-    the KG is disabled / unreachable / the module is missing — the caller then
-    proceeds HVG-only. The default server (:func:`resolve_server`) is the public
-    read-only one, so no configuration is needed for the KG to be used.
+    Genes are collected from the requested term slots, which by default are the required,
+    supporting, negative and defining slots. When the knowledge graph is disabled, is
+    unreachable, or does not hold the requested module, the function warns and returns an
+    empty set, and the caller then proceeds with highly variable genes alone. The default
+    server resolved by :func:`resolve_server` is the public read-only one, so no
+    configuration is needed for the knowledge graph to be used.
 
-    :param species: species name for the ontology module.
+    :param species: Species name of the ontology module.
     :type species: str
-    :param organ: organ name for the ontology module.
+    :param organ: Organ name of the ontology module.
     :type organ: str
-    :param server_url: KG REST base URL; resolved via :func:`resolve_server` when ``None``.
+    :param server_url: Base URL of the REST API. Resolved by :func:`resolve_server` when
+        ``None``.
     :type server_url: str or None
-    :param slots: term slots to collect genes from (e.g. Required / Supporting / Negative / Defining).
+    :param slots: Term slots to collect genes from, by default the required, supporting,
+        negative and defining slots.
     :type slots: Iterable[str]
-    :param timeout: HTTP request timeout in seconds.
+    :param timeout: Timeout of the HTTP request, in seconds.
     :type timeout: float
-    :param verbose: print progress and warnings.
+    :param verbose: Whether to print progress and warnings.
     :type verbose: bool
+    :returns: The normalized marker symbols, or an empty set when the knowledge graph could
+        not be consulted.
+    :rtype: set
     """
     url = resolve_server(server_url)
     if url is None:
@@ -158,24 +207,27 @@ def fetch_ontology_markers(species: str, organ: str,
 def select_hvg(adata: AnnData, n_top_genes: int = DEFAULT_HVG_N,
                n_sub: int = DEFAULT_HVG_SUB, species: str = "mouse",
                seed: int = 0, verbose: bool = True) -> set:
-    """Top-``n_top_genes`` HVGs (seurat_v3 on a subsample), minus the denylist.
+    """Select the top highly variable genes, less the technical-gene denylist.
 
-    ``adata`` should be a coarse-bin aggregation (denser bins give a cleaner
-    variance estimate than fine/sparse bins). Falls back to all genes if the
-    matrix has fewer than ``n_top_genes`` genes.
+    Selection uses the seurat_v3 method on a random subsample of the rows. The input
+    should be a coarse-bin aggregation, because dense bins give a cleaner variance
+    estimate than fine and therefore sparse ones. When the matrix holds no more genes than
+    the number requested, every gene that survives the denylist is returned instead.
 
-    :param adata: bins used for HVG selection (coarse-bin aggregation recommended).
+    :param adata: Bins used for selection. A coarse-bin aggregation is recommended.
     :type adata: AnnData
-    :param n_top_genes: number of highly variable genes to select.
+    :param n_top_genes: Number of highly variable genes to select.
     :type n_top_genes: int
-    :param n_sub: number of bins subsampled for the variance estimate.
+    :param n_sub: Number of bins subsampled for the variance estimate.
     :type n_sub: int
-    :param species: species name, used to pick the technical-gene denylist.
+    :param species: Species name, used to pick the technical-gene denylist.
     :type species: str
-    :param seed: RNG seed for the subsample.
+    :param seed: Seed of the random number generator used for the subsample.
     :type seed: int
-    :param verbose: print the selected HVG count.
+    :param verbose: Whether to print the number of genes selected.
     :type verbose: bool
+    :returns: The selected gene symbols.
+    :rtype: set
     """
     denied = _denier(species)
     if adata.n_vars <= n_top_genes:
@@ -198,26 +250,40 @@ def select_gene_panel(adata: AnnData, species: str, organ: str, *,
                       slots: Iterable[str] = ("R", "S", "N", "DF"),
                       seed: int = 0, verbose: bool = True
                       ) -> Tuple[List[str], List[str]]:
-    """Build the gene panel = HVG ∪ (ontology markers present in ``adata``).
+    """Build the gene panel as the union of highly variable genes and in-data markers.
 
-    Parameters
-    ----------
-    adata : AnnData
-        Bins used for HVG selection (coarse-bin aggregation recommended). If
-        ``hvg`` is given it is used verbatim and HVG is not recomputed here.
-    species, organ : str
-        Cell-Ontology module to fetch markers for.
-    server_url : str, optional
-        KG REST base URL. Priority arg > ``CELLONTO_SERVER_URL`` env >
-        ``CELLONTO_API`` env > the public default (:func:`resolve_server`), so the
-        KG is used without any configuration. Pass ``'none'`` for HVG-only.
+    The marker side of the union is restricted to the ontology markers that actually occur
+    in ``adata``, and the whole panel is intersected with ``adata.var_names``, so every
+    returned symbol is present in the data.
 
-    Returns
-    -------
-    panel : list[str]
-        Sorted union of HVG and in-data ontology markers.
-    ontology_markers : list[str]
-        Sorted ontology markers that are present in ``adata`` (subset of panel).
+    :param adata: Bins used for selecting highly variable genes. A coarse-bin aggregation
+        is recommended. When ``hvg`` is given it is used as it stands and nothing is
+        recomputed here.
+    :type adata: AnnData
+    :param species: Species name of the Cell-Ontology module to fetch markers for.
+    :type species: str
+    :param organ: Organ name of the Cell-Ontology module to fetch markers for.
+    :type organ: str
+    :param hvg: A precomputed set of highly variable genes.
+    :type hvg: set, optional
+    :param hvg_n: Number of highly variable genes to select when computing them here.
+    :type hvg_n: int
+    :param n_hvg_sub: Number of bins subsampled for the variance estimate.
+    :type n_hvg_sub: int
+    :param server_url: Base URL of the REST API, resolved by :func:`resolve_server`, so
+        that the knowledge graph is used without any configuration. Pass ``'none'`` for a
+        panel of highly variable genes only.
+    :type server_url: str, optional
+    :param slots: Term slots to collect marker genes from.
+    :type slots: Iterable[str]
+    :param seed: Seed of the random number generator used for the subsample.
+    :type seed: int
+    :param verbose: Whether to print progress.
+    :type verbose: bool
+    :returns: A pair. The first element is the sorted panel, being the union of the highly
+        variable genes and the in-data ontology markers. The second is the sorted list of
+        in-data ontology markers, which is a subset of the panel.
+    :rtype: tuple of (list of str, list of str)
     """
     if hvg is None:
         hvg = select_hvg(adata, n_top_genes=hvg_n, n_sub=n_hvg_sub,

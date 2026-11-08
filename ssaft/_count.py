@@ -1,14 +1,14 @@
-"""Count-data vector-field backend for ssaft.
+"""The vector-field backend for count data.
 
-For count platforms the KDE-equivalent vector field is built by **rasterizing bin
-counts onto a grid and GPU Gaussian-blurring** it (:func:`compute_vf_blur`),
-persisting only ``vf_normalized`` + ``vf_norm`` to the zarr store. Voxels are
-then sampled from the tissue image and *looked up* in that field
-(:func:`select_vectors_from_image`) — the count analogue of the transcript path's
-KDE-at-sampled-points. Cluster centroids are mapped over the field by correlation
-(:func:`map_corr`).
+For a count platform the field equivalent to a kernel density estimate is built by
+rasterizing the bin counts onto a grid and blurring that raster on the GPU, which
+:func:`compute_vf_blur` does. Only ``vf_normalized`` and ``vf_norm`` are persisted to
+the zarr store. Voxels are then sampled from the tissue image and looked up in that
+field by :func:`select_vectors_from_image`, which is the count analogue of estimating
+the density at sampled points on the transcript path. Cluster centroids are finally
+mapped over the field by correlation, in :func:`map_corr`.
 
-All functions take the ``Analysis`` instance so they can read/write
+Every function here takes the ``Analysis`` instance, so that it can read and write
 ``analysis.dataset.zarr_group`` and honour ``analysis.verbose``.
 """
 
@@ -24,10 +24,31 @@ try:
     from tqdm.auto import tqdm
 except Exception:  # noqa: BLE001
     def tqdm(x, **k):
+        """Stand in for ``tqdm.auto.tqdm`` when the package is not installed.
+
+        The argument is returned unchanged, so a wrapped iterable still iterates and simply
+        shows no progress bar.
+
+        :param x: The iterable that would have been wrapped.
+        :param k: Keyword arguments, accepted and ignored.
+        :returns: The iterable, unchanged.
+        """
         return x
 
 
 def _gaussian_kernel_1d(sigma_bin, device, prune_coefficient=4.3):
+    """Build the separable one-dimensional Gaussian taps for a blur on the GPU.
+
+    The kernel is truncated at ``prune_coefficient`` standard deviations and normalized to
+    sum to one, so that the blur preserves total mass.
+
+    :param sigma_bin: Standard deviation of the Gaussian, in raster bins.
+    :param device: The torch device to build the taps on.
+    :param prune_coefficient: Truncation radius, in units of the standard deviation.
+    :returns: A triple holding the taps shaped for a convolution along x, the taps shaped
+        for a convolution along y, and the truncation radius in bins.
+    :rtype: tuple
+    """
     import torch
     radius = int(np.ceil(prune_coefficient * sigma_bin))
     k = torch.arange(-radius, radius + 1, dtype=torch.float32, device=device)
@@ -36,15 +57,28 @@ def _gaussian_kernel_1d(sigma_bin, device, prune_coefficient=4.3):
 
 
 def _radial_kernel_2d(sigma_bin, kernel, device, prune_coefficient=4.3):
-    """Dense radial ``kernel`` on the bin raster, sum-normalized.
+    """Build a dense radial kernel on the bin raster, normalized to sum to one.
 
-    ``sigma_bin`` is the gaussian-equivalent sigma in bins; the kernel's own scale is
-    derived from it by 2D variance matching (:func:`kernel_scale`), e.g. the
-    Epanechnikov support ``H = sigma_bin * sqrt(6)``. Returned as a single
-    ``(1, 1, 2r+1, 2r+1)`` kernel because only the gaussian is separable -- the other
-    radial kernels need the full square of taps, one cuDNN launch. At the default
-    sigma_bin=1 the compact kernels span 5x5 to 7x7 taps against the gaussian's
-    2x11=22; the exponential's long tail takes 13x13.
+    ``sigma_bin`` is the Gaussian-equivalent standard deviation in bins, and the kernel's
+    own scale is derived from it by matching the variance in two dimensions, through
+    :func:`kernel_scale`. For the Epanechnikov kernel, for instance, that gives a support
+    radius of ``sigma_bin`` times the square root of six.
+
+    The result is returned as a single square kernel rather than a separable pair,
+    because only the Gaussian is separable. The other radial kernels need the full square
+    of taps, which is one cuDNN launch. At the default standard deviation of one bin the
+    compact kernels span five by five to seven by seven taps against the Gaussian's two
+    passes of eleven, while the exponential's long tail takes thirteen by thirteen.
+
+    :param sigma_bin: Gaussian-equivalent standard deviation, in raster bins.
+    :param kernel: Name of the kernel to build.
+    :type kernel: str
+    :param device: The torch device to build the kernel on.
+    :param prune_coefficient: Truncation radius of the infinite-support kernels, in units
+        of their own scale.
+    :returns: A pair holding the kernel shaped for a two-dimensional convolution and its
+        radius in bins.
+    :rtype: tuple
     """
     import torch
     scale = kernel_scale(sigma_bin, 2, kernel)
@@ -59,6 +93,20 @@ def _radial_kernel_2d(sigma_bin, kernel, device, prune_coefficient=4.3):
 
 
 def _iter_spatial_chunks(n_R, chunk_h, radius):
+    """Yield row bands together with the padded range each one needs.
+
+    The padded range extends the band by the kernel radius on both sides, clipped to the
+    raster, so that a truncated convolution is exact over the interior rows the caller
+    keeps.
+
+    :param n_R: Number of raster rows.
+    :type n_R: int
+    :param chunk_h: Height of each band, in rows.
+    :type chunk_h: int
+    :param radius: Kernel radius in rows.
+    :type radius: int
+    :returns: An iterator of ``(r0, r1, padded_r0, padded_r1)`` tuples.
+    """
     for r0 in range(0, n_R, chunk_h):
         r1 = min(r0 + chunk_h, n_R)
         yield r0, r1, max(0, r0 - radius), min(n_R, r1 + radius)
@@ -66,24 +114,44 @@ def _iter_spatial_chunks(n_R, chunk_h, radius):
 
 def _rasterize_blur_tile_gpu(Xt, Rt, Ct, rp0, rp1, cp0, cp1, n_G,
                              kx_g, ky_g, radius, device, dtype):
-    """Scatter one (row band × col band) TILE of pre-sliced bins onto a GPU tensor
-    and separable-Gaussian-blur it.
+    """Scatter one tile of pre-sliced bins onto the GPU and blur it.
 
-    ``Xt``/``Rt``/``Ct`` are ALREADY the bins of this tile (raster row in
-    ``[rp0, rp1)`` AND raster col in ``[cp0, cp1)`` — the caller slices the
-    column-sorted band with ``searchsorted``, so no boolean re-scan happens here).
-    Only the nonzero coo inside the tile is transferred (no dense CPU array), and
-    the conv runs in ``dtype`` (fp32). ``kx_g``/``ky_g`` are the per-gene expanded
-    kernels, built ONCE by the caller (constant across tiles).
+    The count arrays passed in are already the bins of this tile, meaning those whose
+    raster row lies in the padded row range and whose raster column lies in the padded
+    column range. The caller slices the column-sorted band with a binary search, so no
+    boolean rescan happens here. Only the nonzero entries inside the tile are
+    transferred, so no dense array is built on the host, and the convolution runs in the
+    requested precision. The expanded per-gene kernels are built once by the caller,
+    because they are constant across tiles.
 
-    The tile carries a ``±radius`` halo on every side (the caller sets ``rp0/rp1``
-    and ``cp0/cp1`` accordingly), so the truncated separable Gaussian is EXACT for
-    the interior output rows/cols the caller keeps — the halo rows/cols absorb the
-    zero-padded edge effect and are discarded. Bounds GPU memory to
-    ``n_G × (band_h + 2r) × (band_w + 2r)`` regardless of the full raster size.
+    The tile carries a halo of one kernel radius on every side, which is why the caller
+    sets the padded ranges. The truncated separable Gaussian is therefore exact for the
+    interior rows and columns the caller keeps, while the halo absorbs the effect of the
+    zero padding at the edge and is then discarded. GPU memory is bounded by the number
+    of genes times the padded tile area, whatever the size of the full raster.
 
-    With ``ky_g=None`` the kernel is treated as a RADIAL 2D one (every kernel but the
-    gaussian) and applied in a single dense conv; the halo logic is unchanged."""
+    Passing no kernel for the y axis means the kernel is a radial two-dimensional one,
+    which is every kernel but the Gaussian, and it is applied in a single dense
+    convolution. The halo logic is unchanged.
+
+    :param Xt: Counts of this tile's bins, as a sparse matrix of bins by genes.
+    :param Rt: Raster row of each of this tile's bins.
+    :param Ct: Raster column of each of this tile's bins.
+    :param rp0: First padded row of the tile.
+    :param rp1: One past the last padded row of the tile.
+    :param cp0: First padded column of the tile.
+    :param cp1: One past the last padded column of the tile.
+    :param n_G: Number of genes.
+    :type n_G: int
+    :param kx_g: Per-gene kernel for the convolution along x, or the full radial kernel.
+    :param ky_g: Per-gene kernel for the convolution along y, or ``None`` for a radial one.
+    :param radius: Kernel radius in bins.
+    :type radius: int
+    :param device: The torch device to compute on.
+    :param dtype: Precision of the convolution.
+    :returns: The blurred tile, of shape genes by padded rows by padded columns.
+    :rtype: torch.Tensor
+    """
     import torch
     import torch.nn.functional as F
     h = rp1 - rp0
@@ -108,6 +176,16 @@ def _rasterize_blur_tile_gpu(Xt, Rt, Ct, rp0, rp1, cp0, cp1, n_G,
 
 
 def _l1_normalize_log1p(blurred_gpu, scale=10.0, eps=1e-12):
+    """Normalize each voxel to a fixed total, then apply ``log1p``, in place.
+
+    :param blurred_gpu: The blurred field, of shape genes by rows by columns. It is
+        modified in place.
+    :param scale: The total each voxel is scaled to before the logarithm.
+    :param eps: Floor applied to the total, so that an empty voxel does not divide by zero.
+    :returns: A pair holding the transformed field and the per-voxel total before scaling,
+        which is the density ``vf_norm``.
+    :rtype: tuple
+    """
     import torch
     vf_norm = blurred_gpu.sum(dim=0)
     blurred_gpu.div_(torch.clamp(vf_norm, min=eps).unsqueeze(0)).mul_(scale)
@@ -116,20 +194,30 @@ def _l1_normalize_log1p(blurred_gpu, scale=10.0, eps=1e-12):
 
 
 def _tensorstore_array(group_dir, name, shape, chunks):
-    """Open a store array as a tensorstore zarr-v3 array whose metadata MIRRORS
-    the zarr-python writer EXACTLY (float32, bytes+zstd level 0, ``default``
-    '/'-separated chunk keys, fill 0.0) so the on-disk store is read-back-identical
-    and any zarr-v3 reader (zarr-python, the downstream sparse gather) sees no
-    difference. Works for the 3D count field ``(n_G, R, C)`` and the 4D transcript
-    field ``(n_G, vx, vy, vz)`` alike.
+    """Open a store array through tensorstore, mirroring the zarr writer's metadata.
 
-    Routing the large ``vf_normalized`` write through tensorstore's C++
-    multithreaded async pipeline is ~4.7× faster than the single-event-loop
-    zarr-python writer (~2.6× end-to-end since async writes overlap the next tile's
-    GPU work) — the write is the dominant cost. Values are bit-identical (same zstd
-    codec; lossless). Returns ``None`` if tensorstore is not installed, the store is
-    not a local directory, or ``CELLMAN_NO_TENSORSTORE`` is set — the caller then
-    falls back to the zarr-python writer.
+    The metadata is written to match the zarr-python writer exactly: float32 elements, a
+    bytes codec followed by zstd at level zero, default chunk keys separated by slashes,
+    and a fill value of zero. The store on disk is therefore identical on read-back, and
+    any zarr version 3 reader, whether zarr-python or the downstream sparse gather, sees
+    no difference. The function works for the three-dimensional count field and the
+    four-dimensional transcript field alike.
+
+    Routing the large write of ``vf_normalized`` through the multithreaded asynchronous
+    pipeline of tensorstore is about 4.7 times faster than the single-event-loop
+    zarr-python writer, and about 2.6 times faster end to end, because the asynchronous
+    writes overlap the next tile's GPU work. The write is the dominant cost. The values
+    are bit-identical, since the codec is the same and is lossless.
+
+    :param group_dir: Directory of the zarr group, or ``None`` when the store is not a
+        local directory.
+    :param name: Name of the array within the group.
+    :type name: str
+    :param shape: Shape of the array.
+    :param chunks: Chunk shape of the array.
+    :returns: The opened tensorstore array, or ``None`` when tensorstore is not installed,
+        the store is not a local directory, or ``CELLMAN_NO_TENSORSTORE`` is set, in which
+        case the caller falls back to the zarr-python writer.
     """
     if group_dir is None:
         return None
@@ -157,19 +245,29 @@ def _tensorstore_array(group_dir, name, shape, chunks):
 
 
 class _SlabWriter:
-    """Write x-slabs ``arr[x0:x1, ...]`` of existing store arrays through tensorstore, asynchronously.
+    """Write slabs of existing store arrays through tensorstore, asynchronously.
 
-    The per-voxel map outputs (vf_norm, celltype_maps, the score and marker volumes) are written
-    one x-slab at a time; through zarr-python that is one event-loop thread (~35 MB/s on this
-    storage), which made writing a 3D map take longer than computing it. The arrays are opened
-    as they are on disk (zarr.json read, not re-declared), so dtype, fill value and codecs are
-    the store's own and the bytes are identical. Up to ``max_inflight`` slab writes overlap the
-    next slab's GPU work; ``flush()`` waits for all of them. Falls back to plain zarr-python
-    assignment when tensorstore is unavailable, the store is not a local directory, or
-    ``CELLMAN_NO_TENSORSTORE`` is set.
+    The per-voxel outputs of mapping, namely the density, the cell-type map, the score
+    and the marker volumes, are written one slab at a time along x. Through zarr-python
+    that is a single event-loop thread, which reaches about 35 megabytes per second on
+    this storage and made writing a three-dimensional map take longer than computing it.
+
+    The arrays are opened as they already are on disk, by reading their metadata rather
+    than redeclaring it, so the element type, the fill value and the codecs are the
+    store's own and the bytes written are identical. Up to ``max_inflight`` slab writes
+    overlap the next slab's GPU work, and :meth:`flush` waits for all of them.
+
+    The class falls back to plain zarr-python assignment when tensorstore is unavailable,
+    when the store is not a local directory, or when ``CELLMAN_NO_TENSORSTORE`` is set.
     """
 
     def __init__(self, zg, max_inflight=8):
+        """Prepare the writer, deciding whether tensorstore can be used.
+
+        :param zg: The zarr group holding the arrays that will be written.
+        :param max_inflight: Largest number of slab writes allowed to be outstanding at once.
+        :type max_inflight: int
+        """
         self.zg, self.max_inflight = zg, int(max_inflight)
         self.gd = _store_group_dir(zg)
         self.ts = None
@@ -182,6 +280,20 @@ class _SlabWriter:
         self.arrays, self.inflight = {}, []
 
     def __call__(self, name, x0, x1, arr):
+        """Write one slab of an array, asynchronously where possible.
+
+        The source buffer is copied before the call returns, so the caller may reuse it
+        immediately, while the commit itself stays asynchronous. Once more than
+        ``max_inflight`` commits are outstanding, the oldest is waited on.
+
+        :param name: Name of the array in the group.
+        :type name: str
+        :param x0: First index of the slab along x.
+        :type x0: int
+        :param x1: One past the last index of the slab along x.
+        :type x1: int
+        :param arr: The data to write.
+        """
         if self.ts is None:
             self.zg[name][x0:x1, ...] = arr
             return
@@ -198,18 +310,25 @@ class _SlabWriter:
             self.inflight.pop(0).result()
 
     def flush(self):
+        """Wait for every outstanding write to commit."""
         for f in self.inflight:
             f.result()
         self.inflight.clear()
 
 
 def remove_array(zg, name):
-    """Delete ``zg[name]`` even when a killed writer left debris in it.
+    """Delete an array from a zarr group, even when a killed writer left debris.
 
-    tensorstore leaves ``*.__lock`` files behind when its process dies mid-write, and on NFS a file
-    still open on a lost host lingers as ``.nfs*``; zarr's own delete then stops on the first key it
-    cannot remove. Fall back to removing the directory, and if even that leaves something (a
-    silly-renamed file), move the array aside so the name is free for the new one.
+    tensorstore leaves lock files behind when its process dies in the middle of a write,
+    and on a network file system a file still open on a lost host lingers under a hidden
+    name. The delete offered by zarr then stops on the first key it cannot remove. This
+    function falls back to removing the directory, and if even that leaves something
+    behind, such as a silly-renamed file, it moves the array aside so that the name is
+    free for the new one.
+
+    :param zg: The zarr group holding the array.
+    :param name: Name of the array to remove.
+    :type name: str
     """
     import shutil
     import time
@@ -230,7 +349,13 @@ def remove_array(zg, name):
 
 
 def _store_group_dir(zg):
-    """Local directory holding ``zg``'s arrays, or None for a non-directory store."""
+    """Return the on-disk directory of a zarr group, if it has one.
+
+    :param zg: The zarr group.
+    :returns: The directory path, or ``None`` when the group is not backed by a local
+        directory.
+    :rtype: str or None
+    """
     root = getattr(getattr(zg, "store", None), "root", None)
     if root is None:
         return None
@@ -238,14 +363,12 @@ def _store_group_dir(zg):
 
 
 def _tensorstore_open_read(group_dir, name):
-    """Open an existing array for READING through tensorstore, or None.
+    """Open an existing store array through tensorstore for reading.
 
-    The writer already routes through tensorstore; the readers did not, and on a big
-    count field that is where the whole mapping run goes. zarr-python decodes chunk by
-    chunk on one thread (~0.3-0.8 GiB/s on this store); tensorstore's C++ pipeline
-    decodes them in parallel (~1.7 GiB/s) and hands back an identical array. Returns
-    None -- caller falls back to zarr-python -- when tensorstore is missing, the store
-    is not a local directory, or ``CELLMAN_NO_TENSORSTORE`` is set.
+    :param group_dir: Directory of the zarr group, or ``None``.
+    :param name: Name of the array within the group.
+    :type name: str
+    :returns: The opened array, or ``None`` when tensorstore cannot or should not be used.
     """
     if group_dir is None or os.environ.get("CELLMAN_NO_TENSORSTORE"):
         return None
@@ -263,31 +386,66 @@ def _tensorstore_open_read(group_dir, name):
 
 
 def iter_field_bands(zg, row_bands, *, name="vf_normalized", prefetch=True):
-    """Yield ``(r0, r1, block)`` for each requested row band of a 3D count field.
+    """Yield each requested row band of a three-dimensional count field.
 
-    ``row_bands`` is the list of ``(r0, r1)`` the caller actually wants, so bands with
-    no signal are never touched. The NEXT band's read is started before the current one
-    is handed over, which hides the read behind the caller's GPU work -- the two are on
-    different engines, and the read is otherwise ~60% of a mapping run.
+    ``row_bands`` is the list of bands the caller actually wants, so bands with no signal
+    are never touched. The next band's read is started before the current one is handed
+    over, which hides the read behind the caller's GPU work, since the two run on
+    different engines and the read is otherwise about 60 percent of a mapping run.
 
-    ``block`` is ``(n_G, r1 - r0, n_C)`` float32, exactly what ``zg[name][:, r0:r1, :]``
-    returns; only how it got there changes.
+    The block handed over is exactly what slicing the array by that band returns, of
+    shape genes by band rows by columns and of dtype float32. Only how it got there
+    changes.
+
+    :param zg: The zarr group holding the field.
+    :param row_bands: The bands to read, as ``(r0, r1)`` pairs.
+    :param name: Name of the field array in the group.
+    :type name: str
+    :param prefetch: Whether to start the next band's read before handing over the
+        current one.
+    :type prefetch: bool
+    :returns: An iterator of ``(r0, r1, block)`` tuples.
     """
     A = _tensorstore_open_read(_store_group_dir(zg), name)
     z = zg[name]
     if A is not None:
         def start(b):
+            """Start the read of one band through tensorstore and return its future.
+
+            :param b: The band, as an ``(r0, r1)`` pair.
+            :returns: A future that will hold the band.
+            """
             r0, r1 = b
             return A[:, r0:r1, :].read()          # future; the C++ pool does the work
         def finish(f):
+            """Wait for a tensorstore read and return the band as an array.
+
+            :param f: The future returned by the matching start function.
+            :returns: The band, of shape genes by band rows by columns.
+            :rtype: numpy.ndarray
+            """
             return np.asarray(f.result())
     else:
         from concurrent.futures import ThreadPoolExecutor
         pool = ThreadPoolExecutor(1)              # zarr-python releases the GIL in zstd
         def start(b):
+            """Start the read of one band on a worker thread and return its future.
+
+            This is the fallback used when tensorstore is unavailable. zarr-python releases the
+            interpreter lock inside zstd, so one worker thread is enough to overlap the read.
+
+            :param b: The band, as an ``(r0, r1)`` pair.
+            :returns: A future that will hold the band.
+            """
             r0, r1 = b
             return pool.submit(lambda: np.asarray(z[:, r0:r1, :]))
         def finish(f):
+            """Wait for a worker-thread read and return the band.
+
+            :param f: The future returned by the matching start function.
+            :returns: The band, of shape genes by band rows by columns.
+            :rtype: numpy.ndarray
+            """
             return f.result()
     bands = list(row_bands)
     if not bands:
@@ -306,11 +464,23 @@ def iter_field_bands(zg, row_bands, *, name="vf_normalized", prefetch=True):
 
 
 def band_rows_for_budget(n_G, n_C, chunk_h, *, budget_bytes, align=32):
-    """Rows per band that keep ONE band under ``budget_bytes`` on the device.
+    """Choose how many raster rows fit one band within a memory budget.
 
-    A band is uploaded whole, so its size -- not the number of signal voxels -- is what
-    decides whether the run fits in VRAM. Rounded down to a multiple of the store's row
-    chunk so a band still reads whole chunks, and never below one.
+    :param n_G: Number of genes.
+    :type n_G: int
+    :param n_C: Number of raster columns.
+    :type n_C: int
+    :param chunk_h: The requested number of rows, which is only ever reduced.
+    :type chunk_h: int
+    :param budget_bytes: Memory budget for one band, in bytes.
+    :type budget_bytes: int
+    :param align: The result is rounded down to a multiple of this, so that a band stays
+        aligned to the store's chunk grid and no interior write becomes a
+        read-modify-write. A budget too small for even one aligned band is honoured
+        instead of the alignment.
+    :type align: int
+    :returns: The number of rows per band, never below one.
+    :rtype: int
     """
     per_row = int(n_G) * int(n_C) * 4
     fit = max(1, int(budget_bytes) // max(per_row, 1))
@@ -319,7 +489,22 @@ def band_rows_for_budget(n_G, n_C, chunk_h, *, budget_bytes, align=32):
 
 
 def _tensorstore_vf(group_dir, n_G, out_R, out_C, sh, sw):
-    """Thin wrapper naming the 3D count ``vf_normalized`` shape and chunking."""
+    """Open the vector-field array for writing through tensorstore.
+
+    :param group_dir: Directory of the zarr group, or ``None`` when the store is not a
+        local directory.
+    :param n_G: Number of genes, which is the first axis of the field.
+    :type n_G: int
+    :param out_R: Number of output rows.
+    :type out_R: int
+    :param out_C: Number of output columns.
+    :type out_C: int
+    :param sh: Chunk height on disk, in rows.
+    :type sh: int
+    :param sw: Chunk width on disk, in columns.
+    :type sw: int
+    :returns: The opened array, or ``None`` when tensorstore cannot or should not be used.
+    """
     return _tensorstore_array(group_dir, "vf_normalized",
                               (n_G, out_R, out_C), (n_G, sh, sw))
 
@@ -363,11 +548,13 @@ _COSINE_VAR = {
 
 
 def resolve_kernel(kernel):
-    """Canonical kernel name from ``kernel`` (case-insensitive).
+    """Normalize a kernel name and check that it is one this package implements.
 
-    Accepts the six names in :data:`KDE_KERNELS` and, for stores and callers that
-    predate them, any unambiguous prefix (``'gauss'``, ``'epa'``). Raises
-    ``ValueError`` for anything else, so a typo cannot fall through to a default.
+    :param kernel: The kernel name, in any case.
+    :type kernel: str
+    :returns: The canonical name, as it appears in :data:`KDE_KERNELS`.
+    :rtype: str
+    :raises ValueError: If the name is not one of the supported kernels.
     """
     k = str(kernel).strip().lower()
     if k in KDE_KERNELS:
@@ -379,16 +566,32 @@ def resolve_kernel(kernel):
 
 
 def kernel_code(kernel):
-    """Integer id of ``kernel`` for the compiled and Triton KDEs (its index in KDE_KERNELS)."""
+    """Return the integer identifier of a kernel, as the compiled code expects it.
+
+    :param kernel: The kernel name.
+    :type kernel: str
+    :returns: The index of that kernel in :data:`KDE_KERNELS`.
+    :rtype: int
+    """
     return KDE_KERNELS.index(resolve_kernel(kernel))
 
 
 def kernel_scale(bandwidth, ndim, kernel='gaussian'):
-    """Gaussian-equivalent ``bandwidth`` -> the kernel's own scale, matched on per-axis variance.
+    """Convert a Gaussian bandwidth to another kernel's own scale, matching variance.
 
-    ``ndim`` is the grid's dimensionality (2 or 3; 1 is accepted for completeness):
-    the same width needs a different scale in 3D, since a radial kernel's variance
-    per axis depends on how much of its mass sits at large r.
+    Each kernel is parameterized by its own scale: the standard deviation for the
+    Gaussian, the support radius for a compact kernel, and the decay length for the
+    exponential. Matching the per-axis variance of the two profiles in the given number
+    of dimensions gives a fixed multiple of the bandwidth for each kernel, so that every
+    kernel smooths over the same width.
+
+    :param bandwidth: The Gaussian bandwidth, in whatever unit the field is measured in.
+    :param ndim: Number of dimensions the kernel acts over.
+    :type ndim: int
+    :param kernel: The kernel whose scale is wanted.
+    :type kernel: str
+    :returns: That kernel's own scale, in the same unit as the bandwidth.
+    :rtype: float
     """
     k = resolve_kernel(kernel); d = int(ndim); h = float(bandwidth)
     if k == 'gaussian':
@@ -405,10 +608,19 @@ def kernel_scale(bandwidth, ndim, kernel='gaussian'):
 
 
 def kernel_reach(scale, kernel='gaussian', prune_coefficient=4.3):
-    """Truncation radius of ``kernel`` at its own ``scale``, in the same units.
+    """Return the radius beyond which a kernel contributes nothing.
 
-    The compact kernels reach zero on their own at ``scale``, so
-    ``prune_coefficient`` applies only to the gaussian and the exponential.
+    A compact kernel reaches exactly its own scale. The Gaussian and the exponential are
+    infinite, so they are truncated at ``prune_coefficient`` times their scale, the
+    exponential being cut at the same relative height as the Gaussian.
+
+    :param scale: The kernel's own scale.
+    :param kernel: The kernel name.
+    :type kernel: str
+    :param prune_coefficient: Truncation radius of the infinite-support kernels, in units
+        of their scale.
+    :returns: The reach, in the same unit as the scale.
+    :rtype: float
     """
     k = resolve_kernel(kernel)
     if k in _COMPACT_KERNELS:
@@ -419,24 +631,31 @@ def kernel_reach(scale, kernel='gaussian', prune_coefficient=4.3):
 
 
 def kernel_search_cells(reach, sampling_distance, kernel='gaussian'):
-    """Neighbour-search radius, in grid cells, of the cell-list KDEs (C and Triton alike).
+    """Return how many cells of the lattice a kernel of this reach can span.
 
-    Query and molecule are each binned by ``floor``, so a molecule within ``reach``
-    can sit ``floor(reach / sd) + 1`` cells away. The gaussian and exponential keep
-    the historical ``floor(reach / sd)``: what that misses is their tail below ~1e-4
-    of the peak, and the gaussian's fields stay what they have always been. A
-    compact kernel still carries real weight at its edge (all of it for the
-    tophat), so it gets the extra cell and its whole support.
+    This is the half-width of the neighbourhood a cell-list search must visit.
+
+    :param reach: The kernel's reach.
+    :param sampling_distance: The lattice spacing, which is also the cell size.
+    :param kernel: The kernel name.
+    :type kernel: str
+    :returns: The half-width, in cells.
+    :rtype: int
     """
     extra = 1 if resolve_kernel(kernel) in _COMPACT_KERNELS else 0
     return int(np.floor(float(reach) / float(sampling_distance) + 1e-12)) + extra
 
 
 def kernel_norm(scale, ndim, kernel='gaussian'):
-    """Integral of the unnormalized profile ``f(r / scale)`` over R^ndim (so ``K = f / norm``).
+    """Return the normalization constant that makes a kernel integrate to one.
 
-    Closed forms; the gaussian and exponential integrals are the untruncated ones,
-    as the compiled KDE has always used for the gaussian.
+    :param scale: The kernel's own scale.
+    :param ndim: Number of dimensions the kernel acts over.
+    :type ndim: int
+    :param kernel: The kernel name.
+    :type kernel: str
+    :returns: The constant the unnormalized profile must be divided by.
+    :rtype: float
     """
     k = resolve_kernel(kernel); d = int(ndim); s = float(scale)
     unit_ball = {1: 2.0, 2: np.pi, 3: 4.0 * np.pi / 3.0}[d]
@@ -456,7 +675,16 @@ def kernel_norm(scale, ndim, kernel='gaussian'):
 
 
 def kernel_profile(u, kernel='gaussian'):
-    """Unnormalized radial profile ``f(u)`` at ``u = r / scale`` (numpy; zero outside the support)."""
+    """Evaluate a kernel's unnormalized profile at a scaled radius.
+
+    Every profile equals one at the origin, so the peak of the normalized kernel is the
+    reciprocal of :func:`kernel_norm`.
+
+    :param u: Radius divided by the kernel's own scale.
+    :param kernel: The kernel name.
+    :type kernel: str
+    :returns: The profile value, which is zero beyond the kernel's support.
+    """
     k = resolve_kernel(kernel)
     u = np.asarray(u, dtype=np.float64)
     if k == 'gaussian':
@@ -476,35 +704,56 @@ def kernel_profile(u, kernel='gaussian'):
 
 
 def epanechnikov_support(bandwidth, ndim):
-    """Gaussian bandwidth -> Epanechnikov support radius, matched on VARIANCE.
+    """Convert a Gaussian bandwidth to an Epanechnikov support radius, by variance.
 
-    The spherical Epanechnikov ``K(r) ∝ 1 - (r/H)^2`` on the ball of radius ``H`` has
-    per-axis variance ``H^2 / (ndim + 4)``; a gaussian of bandwidth ``h`` has ``h^2``.
-    Equating them gives
+    The spherical Epanechnikov kernel, which is proportional to one minus the squared
+    scaled radius on the ball of radius H, has a per-axis variance of H squared divided by
+    the number of dimensions plus four. A Gaussian of bandwidth h has a per-axis variance
+    of h squared. Equating the two gives H as h times the square root of the number of
+    dimensions plus four, which is 2.236 times h in one dimension, 2.449 in two and 2.646
+    in three.
 
-        H = h * sqrt(ndim + 4)          (2.236 h in 1D, 2.449 h in 2D, 2.646 h in 3D)
+    This function is kept for callers that predate :func:`kernel_scale`, which generalizes
+    it to every kernel.
 
-    Kept for callers that predate :func:`kernel_scale`, which generalizes it.
+    :param bandwidth: The Gaussian bandwidth.
+    :param ndim: Number of dimensions the kernel acts over.
+    :type ndim: int
+    :returns: The Epanechnikov support radius.
+    :rtype: float
     """
     return kernel_scale(bandwidth, ndim, 'epanechnikov')
 
 
 def kernel_peak(scale, ndim, kernel='gaussian'):
-    """Peak of ONE molecule's kernel = ``1 / V_eff``, the pipeline's ``expression_threshold``.
+    """Return the peak of one molecule's kernel, which is the expression threshold.
 
-    ``scale`` is the kernel's OWN scale in the units ``vf_norm`` is measured in
-    (gaussian sigma, the support radius of a compact kernel, the exponential's decay
-    length -- convert with :func:`kernel_scale`, never pass the gaussian bandwidth here).
-    Every profile is 1 at the origin, so the peak is ``1 / kernel_norm``:
+    The peak is the reciprocal of the kernel's effective volume, and it is the quantity
+    the pipeline calls ``expression_threshold``.
 
-        gaussian       1 / (sqrt(2*pi) * sigma) ** ndim
-        epanechnikov   3/(4H) [1D]   2/(pi H^2) [2D]   15/(8 pi H^3) [3D]
+    The scale must be the kernel's own scale, in the units ``vf_norm`` is measured in:
+    the standard deviation for a Gaussian, the support radius for a compact kernel, or the
+    decay length for the exponential. Convert with :func:`kernel_scale`, and never pass a
+    Gaussian bandwidth here. Every profile equals one at the origin, so the peak is simply
+    the reciprocal of :func:`kernel_norm`. For a Gaussian that is one over the
+    ``ndim`` power of the standard deviation times the square root of two pi, and for the
+    Epanechnikov it is three over four H in one dimension, two over pi H squared in two,
+    and fifteen over eight pi H cubed in three.
 
-    Everything downstream is anchored on this one number: ``norm_threshold`` is
-    2x it (a voxel holding less than two molecules' worth of evidence), and the
-    LDA count reconstruction multiplies the density back up by ``V_eff = 1/peak``.
-    Both come out wrong -- silently, by a factor of ~2 at the default bandwidth --
-    if the gaussian formula is applied to another kernel's field.
+    Everything downstream is anchored on this one number. The density floor
+    ``norm_threshold`` is twice it, meaning a voxel holding less than two molecules' worth
+    of evidence, and the count reconstruction of the LDA mapper multiplies the density
+    back up by its reciprocal. Both come out wrong, silently and by about a factor of two
+    at the default bandwidth, if the Gaussian formula is applied to another kernel's
+    field.
+
+    :param scale: The kernel's own scale, in the units of the field.
+    :param ndim: Number of dimensions the kernel acts over.
+    :type ndim: int
+    :param kernel: The kernel name.
+    :type kernel: str
+    :returns: The peak density of a single molecule.
+    :rtype: float
     """
     return float(1.0 / kernel_norm(scale, ndim, kernel))
 
@@ -516,65 +765,67 @@ def compute_vf_blur(analysis, bin_adata, *, sigma_bin: float = 1.0,
                     size_after_normalization: float = 10.0,
                     store_chunk=32,
                     device: str = "cuda") -> None:
-    """Rasterize ``bin_adata`` counts and GPU-blur into ``vf_normalized`` (zarr).
+    """Rasterize bin counts and blur them on the GPU into the normalized field.
 
-    Two independent resolutions:
-      * ``bin_size_um`` — the **blur raster** grid the Gaussian is computed on
-        (finer = more accurate blur; σ in bins = ``sigma_bin``, bandwidth =
-        ``sigma_bin * bin_size_um`` µm).
-      * ``sampling_distance`` — the **output vector-field** grid spacing. The
-        blurred field is point-sampled (decimated) by ``stride =
-        round(sampling_distance / bin_size_um)``, giving a coarser vf than the raster
-        (fewer voxels on disk) while the blur itself stays raster-accurate.
-        Defaults to ``bin_size_um`` (stride 1 = output == raster).
+    Two independent resolutions are involved. The bin size is the spacing of the raster
+    the blur is computed on, where finer means a more accurate blur; the standard
+    deviation is given in bins, so the bandwidth is that standard deviation times the bin
+    size. The sampling distance is the spacing of the output field. The blurred field is
+    point-sampled, that is decimated, by the ratio of the two rounded to an integer,
+    giving a coarser field than the raster and so fewer voxels on disk, while the blur
+    itself stays raster-accurate. The sampling distance defaults to the bin size, which
+    makes the output the raster.
 
-    Writes ``vf_normalized`` ``(n_G, out_R, out_C)`` and ``vf_norm``
-    ``(out_R, out_C)`` at ``sampling_distance`` spacing (+ metadata,
-    ``backend='blur'``). Only the normalized field is persisted (never the raw 4D vf).
+    The function writes ``vf_normalized``, of shape genes by output rows by output
+    columns, and ``vf_norm``, of shape output rows by output columns, both at the
+    sampling distance, together with metadata recording that the backend was the blur one.
+    Only the normalized field is persisted; the raw field never is.
 
-    ``store_chunk`` decouples the on-disk chunk shape of ``vf_normalized`` from the
-    GPU compute tile (``chunk_h`` × ``chunk_w``). The compute tile stays large for
-    GPU efficiency; the store is written in small SQUARE spatial tiles (gene axis
-    always full) so a sparse voxel gather (``select_vectors_from_image`` /
-    ``downsample_vector``) decodes only the tiles that actually contain a sampled
-    voxel instead of whole full-width row bands. Give an int (square side) or a
-    ``(h, w)`` tuple; ``None`` makes the on-disk chunk match the compute tile. For
-    alignment (no read-modify-write on interior writes) ``chunk_h`` and ``chunk_w``
-    should be integer multiples of the store tile (the defaults 64/512 vs 32 are).
+    The on-disk chunk shape is decoupled from the GPU compute tile. The compute tile stays
+    large for GPU efficiency, while the store is written in small square spatial tiles,
+    with the gene axis always whole, so that a sparse voxel gather decodes only the tiles
+    that actually contain a sampled voxel rather than whole full-width row bands. For the
+    writes to stay aligned, and so avoid a read-modify-write on interior writes, the
+    compute tile dimensions should be integer multiples of the store tile, as the defaults
+    are.
 
-    :param analysis: the ``Analysis`` instance (provides ``dataset`` and ``verbose``).
+    :param analysis: The ``Analysis`` instance, which provides the dataset and the
+        verbosity setting.
     :type analysis: Analysis
-    :param bin_adata: bin-count AnnData with ``obs['array_row']`` / ``obs['array_col']``.
+    :param bin_adata: Bin-level counts carrying ``obs['array_row']`` and
+        ``obs['array_col']``.
     :type bin_adata: AnnData
-    :param sigma_bin: Gaussian sigma in raster bins.
+    :param sigma_bin: Gaussian standard deviation, in raster bins.
     :type sigma_bin: float
-    :param chunk_h: GPU compute tile height in output rows.
+    :param chunk_h: Height of the GPU compute tile, in output rows.
     :type chunk_h: int
-    :param chunk_w: GPU compute tile width in output columns.
+    :param chunk_w: Width of the GPU compute tile, in output columns.
     :type chunk_w: int
-    :param bin_size_um: blur raster grid spacing in microns.
+    :param bin_size_um: Spacing of the blur raster, in micrometres.
     :type bin_size_um: float
-    :param sampling_distance: output vector-field grid spacing in microns; defaults to ``bin_size_um``.
+    :param sampling_distance: Spacing of the output field, in micrometres. It defaults to
+        the bin size.
     :type sampling_distance: float
-    :param prune_coefficient: truncation radius of the infinite-support kernels in
-        units of sigma (gaussian; the exponential is cut at the same relative height).
+    :param prune_coefficient: Truncation radius of the infinite-support kernels, in units
+        of the standard deviation. The exponential is cut at the same relative height as
+        the Gaussian.
     :type prune_coefficient: float
-    :param kernel: one of :data:`KDE_KERNELS` -- ``'gaussian'`` (default),
-        ``'tophat'``, ``'epanechnikov'``, ``'exponential'``, ``'linear'``,
-        ``'cosine'``. ``sigma_bin`` keeps the same meaning for all of them: each
-        kernel's own scale is derived from it by variance matching
-        (:func:`kernel_scale`, e.g. the Epanechnikov support ``H = sigma_bin *
-        sqrt(6)`` bins), so they smooth over the same width. Only the gaussian is
-        separable; the others run as one dense conv, whose cost grows with the
-        SQUARE of the radius while the gaussian's separable pair grows linearly.
-        Below ``sigma_bin`` about 6 a compact kernel's smaller radius still wins
-        (~0.8x at 1-4 for the Epanechnikov); above it the gaussian pulls ahead.
+    :param kernel: One of :data:`KDE_KERNELS`, namely the Gaussian, tophat, Epanechnikov,
+        exponential, linear or cosine kernel. The standard deviation keeps the same
+        meaning for all of them, because each kernel's own scale is derived from it by
+        variance matching in :func:`kernel_scale`, so that they smooth over the same
+        width. Only the Gaussian is separable; the others run as one dense convolution,
+        whose cost grows with the square of the radius while the Gaussian's separable pair
+        grows linearly. Below a standard deviation of about six bins, a compact kernel's
+        smaller radius still wins, taking about 0.8 times as long for the Epanechnikov
+        between one and four bins, and above it the Gaussian pulls ahead.
     :type kernel: str
-    :param size_after_normalization: L1 scale applied before ``log1p``.
+    :param size_after_normalization: The total each voxel is scaled to before ``log1p``.
     :type size_after_normalization: float
-    :param store_chunk: on-disk spatial chunk (int square side, ``(h, w)`` tuple, or ``None`` to match the compute tile).
+    :param store_chunk: On-disk spatial chunk, given as an integer square side, a pair of
+        height and width, or ``None`` to match the compute tile.
     :type store_chunk: int or tuple or None
-    :param device: torch device string.
+    :param device: Torch device string.
     :type device: str
     """
     import torch
@@ -735,6 +986,19 @@ def compute_vf_blur(analysis, bin_adata, *, sigma_bin: float = 1.0,
 
 
 def _image_gray(image, revert):
+    """Reduce a staining image to a single grey channel, inverting it when asked.
+
+    A colour image is converted with the usual luminance weights, after being moved to
+    channel-last order and cut down to three channels. Inverting is what a bright-field
+    image needs before the tissue mask is thresholded.
+
+    :param image: The staining image.
+    :param revert: Whether the image has a bright background and dark tissue, so that it
+        must be inverted.
+    :type revert: bool
+    :returns: The grey image, as float64.
+    :rtype: numpy.ndarray
+    """
     arr = np.asarray(image)
     if arr.ndim == 3:
         if arr.shape[0] in (3, 4) and arr.shape[-1] not in (3, 4):
@@ -755,40 +1019,53 @@ def select_vectors_from_image(analysis, grid, *, bin_size_um: float,
                               lookup_chunk_h: int = 64, seed: int = 0,
                               lookup_n_workers: Optional[int] = None,
                               lookup_ram_gb: float = 32.0) -> np.ndarray:
-    """Sample voxels from the tissue image (Otsu mask) and look them up in the
-    precomputed ``vf_normalized`` field into ``normalized_vectors`` (count downsample).
+    """Sample voxels inside the tissue mask and look them up in the stored field.
 
-    Pixels are mapped to world µm via ``grid.affine_px_to_um`` (folds each
-    platform's transpose/flip), then to grid bins via ``grid.origin`` + ``bin_size_um``.
+    The tissue mask comes from thresholding the staining image by Otsu's method, voxels
+    are sampled within it, and their vectors are read out of the precomputed
+    ``vf_normalized`` field into ``normalized_vectors``. This is the count platform's
+    counterpart of the transcript path's downsampling.
 
-    :param analysis: the ``Analysis`` instance (provides ``dataset`` and ``verbose``).
+    Pixels are mapped to world micrometres through the grid's own affine, which folds in
+    each platform's transposition and flipping, and then to lattice bins through the
+    grid's origin and bin size.
+
+    :param analysis: The ``Analysis`` instance, which provides the dataset and the
+        verbosity setting.
     :type analysis: Analysis
-    :param grid: raster/image grid with ``image``, ``origin``, ``um_per_px``, ``affine_px_to_um``, ``he_revert``.
+    :param grid: The raster and image grid, carrying the image, the origin, the pixel
+        size, the affine from pixels to micrometres and the mask polarity.
     :type grid: object
-    :param bin_size_um: grid bin spacing in microns.
+    :param bin_size_um: Spacing of the lattice, in micrometres.
     :type bin_size_um: float
-    :param n_samples_per_block: pixels sampled per ``block_um`` square.
+    :param n_samples_per_block: Number of pixels sampled per square block.
     :type n_samples_per_block: int
-    :param block_um: sampling block size in microns.
+    :param block_um: Side of the sampling block, in micrometres.
     :type block_um: float
-    :param otsu_threshold: fixed tissue-mask threshold; computed by Otsu when ``None``.
+    :param otsu_threshold: A fixed threshold for the tissue mask. It is computed by Otsu's
+        method when ``None``.
     :type otsu_threshold: float or None
-    :param otsu_mult: scale the Otsu value ssaft computes by this factor (``0.6`` lowers the
-        threshold and widens the mask). Only with ``otsu_threshold=None`` -- a threshold that
-        was given is used as given.
+    :param otsu_mult: Factor applied to the threshold this package computes, where 0.6
+        lowers it and so widens the mask. It applies only when no explicit threshold was
+        given, because a threshold that was given is used as given.
     :type otsu_mult: float or None
-    :param norm_threshold_mult: multiplier for the analytic ``vf_norm`` threshold when no percentile is used.
+    :param norm_threshold_mult: Multiplier for the analytic density threshold, used when
+        no percentile is given.
     :type norm_threshold_mult: float
-    :param vf_norm_percentile: percentile of nonzero ``vf_norm`` used as the keep threshold; ``None`` uses the analytic form.
+    :param vf_norm_percentile: Percentile of the nonzero densities to use as the keep
+        threshold. Passing ``None`` uses the analytic form instead.
     :type vf_norm_percentile: float or None
-    :param lookup_chunk_h: retained for API compatibility; no longer sizes the read.
+    :param lookup_chunk_h: Retained for compatibility and no longer used to size the read.
     :type lookup_chunk_h: int
-    :param seed: RNG seed for pixel sampling.
+    :param seed: Seed of the random number generator used for pixel sampling.
     :type seed: int
-    :param lookup_n_workers: worker count for the parallel tile lookup; defaults to ``analysis.ncores``.
+    :param lookup_n_workers: Number of workers for the parallel tile lookup. It defaults
+        to the analysis's core count.
     :type lookup_n_workers: int or None
-    :param lookup_ram_gb: RAM budget bounding concurrent tile decodes.
+    :param lookup_ram_gb: Memory budget bounding how many tiles are decoded at once.
     :type lookup_ram_gb: float
+    :returns: The sampled voxel positions, as lattice indices.
+    :rtype: numpy.ndarray
     """
     from skimage.filters import threshold_otsu
     zg = analysis.dataset.zarr_group
@@ -859,6 +1136,16 @@ def select_vectors_from_image(analysis, grid, *, bin_size_um: float,
     n_workers = max(1, min(n_workers, len(uniq), ram_cap))
 
     def _lookup_tile(i):
+        """Read one raster tile and gather every sampled voxel that falls inside it.
+
+        The sampled voxels were sorted by tile beforehand, so this reads the tile once and
+        fills the rows of ``normalized_vectors`` belonging to it.
+
+        :param i: Index of the tile within the list of occupied tiles.
+        :type i: int
+        :returns: The number of voxels filled from this tile.
+        :rtype: int
+        """
         s, e = int(starts[i]), int(ends[i])
         key = int(uniq[i])
         rt, ct = key // n_col_tiles, key % n_col_tiles
@@ -929,11 +1216,13 @@ SCORE_KEYS = {"corr": "max_correlations", "gnb": "max_probabilities",
 
 
 def score_key_for(method):
-    """``'corr'|'gnb'|'lda'`` -> the score volume name that method writes.
+    """Return the name of the score volume a given mapping method writes.
 
-    ``gnb`` and ``lda`` share ``max_probabilities``: both produce a posterior, so both
-    are thresholded with ``min_p``. Which of the two wrote the live map is recorded
-    separately in ``zg.attrs['mapping_method']``.
+    :param method: The mapping method, such as the correlation, the naive Bayes or the
+        LDA one.
+    :type method: str
+    :returns: Either ``'max_correlations'`` or ``'max_probabilities'``.
+    :rtype: str
     """
     try:
         return SCORE_KEYS[method]
@@ -943,20 +1232,45 @@ def score_key_for(method):
 
 
 def _other_score_key(score_key):
-    """The score volume name NOT written by the method that writes ``score_key``."""
+    """Return the score volume the other family of mapping methods writes.
+
+    :param score_key: One of the two score volume names.
+    :type score_key: str
+    :returns: The other one.
+    :rtype: str
+    """
     return ("max_probabilities" if score_key == "max_correlations"
             else "max_correlations")
 
 
 def _write_maps(zg, ds, M, Rc, sd, *, overwrite=True, set_ds_attrs=True,
                 score_key="max_correlations", method=None):
-    """Write the label raster + its per-voxel score under ``score_key``.
+    """Write a cell-type map and its score volume into the store.
 
-    ``score_key`` names the metric actually produced: ``max_correlations`` for the
-    centroid correlation mapper, ``max_probabilities`` for the GaussianNB posterior.
-    Both volumes may coexist — re-running one method no longer throws away the other
-    method's result. ``zg.attrs['mapping_method']`` records which one is live, and
-    ``filter_celltypemaps`` reads it to pick its threshold (``min_p`` vs ``min_r``).
+    The score key names the metric actually produced: correlations for the centroid
+    correlation mapper, and probabilities for the naive Bayes and LDA posteriors. Both
+    volumes may coexist, so rerunning one method no longer throws away the other method's
+    result. The attribute ``mapping_method`` records which one is live, and
+    ``filter_celltypemaps`` reads it to pick the matching threshold.
+
+    :param zg: The zarr group to write into.
+    :param ds: The dataset whose attributes are updated.
+    :param M: The cell-type map, of shape rows by columns.
+    :param Rc: The score of each voxel, on the same grid.
+    :param sd: Lattice spacing, in micrometres.
+    :param overwrite: Whether to delete any existing arrays of the same name first.
+    :type overwrite: bool
+    :param score_key: Name of the score volume to write.
+    :type score_key: str
+    :param method: Name of the mapping method, needed when the score key alone does not
+        identify it, because the naive Bayes and LDA mappers share the posterior volume.
+    :type method: str or None
+    :param set_ds_attrs: Whether to update the dataset's own attributes from what was
+        written.
+    :type set_ds_attrs: bool
+    :returns: A pair holding the written cell-type map and score volume, each with a
+        trailing singleton depth axis.
+    :rtype: tuple
     """
     cm_3d = M.T[:, :, None].astype(np.int32)
     mc_3d = Rc.T[:, :, None].astype(np.float32)
@@ -985,30 +1299,31 @@ def _write_maps(zg, ds, M, Rc, sd, *, overwrite=True, set_ds_attrs=True,
 
 
 def analytic_vf_norm_threshold(zg, mult: float = 2.0) -> float:
-    """SSAM's ``vf_norm`` floor: ``mult`` x the KDE peak of a single molecule.
+    """Return the density floor, as a multiple of a single molecule's kernel peak.
 
-    This is the threshold every other part of ssaft uses
-    (``Analysis.dataset.norm_threshold = expression_threshold * 2``); the mappers
-    must use it too. It is an absolute quantity — it says "this voxel holds less
-    than two molecules' worth of evidence" — so it means the same thing on every
-    dataset, unlike a percentile, which always discards a fixed *share* of the
-    tissue no matter how good the signal is.
+    This is the threshold every other part of the package uses, and the mappers must use
+    it too. It is an absolute quantity, saying that a voxel holds less than so many
+    molecules' worth of evidence, so it means the same thing on every dataset. A
+    percentile would not, because it always discards a fixed share of the tissue however
+    good the signal is.
 
-    Units follow the field the backend actually stored, so sigma must be given in
-    the same units as ``vf_norm``'s support:
+    The units follow the field the backend actually stored, so the scale must be given in
+    the same units as the support of ``vf_norm``. On the count backend, as used for Visium
+    HD and Stereo-seq, the density is per squared bin and the blur is a standard deviation
+    in bins. On the transcript backend the density is per unit volume in micrometres and
+    the blur is a bandwidth in micrometres. Whatever kernel the store records is used, with
+    that kernel's own peak from :func:`kernel_peak`, and the recorded scale is already
+    that kernel's own.
 
-    * count backend (Visium HD / Stereo-seq): ``vf_norm`` is per bin^2 and the
-      blur is ``sigma_bin`` **bins** -> ``mult / (sqrt(2*pi) * sigma_bin)^2``
-    * transcript backend: ``vf_norm`` is per µm^ndim and the blur is the
-      bandwidth in **µm** -> ``mult / (sqrt(2*pi) * bandwidth)^ndim``
+    Mixing the two conventions is wrong by the bin size raised to the number of
+    dimensions, which is a factor of four at two micrometre bins in two dimensions.
 
-    Any other ``attrs['kde_kernel']`` swaps in that kernel's peak
-    (:func:`kernel_peak`) instead; the stored scale is already the kernel's own.
-
-    Mixing the two is a factor of ``bin_size_um^ndim`` (4x at 2 µm bins in 2D).
-
-    Returns ``0.0`` when the store records neither, i.e. keep every voxel the
-    field reached — never a percentile, which would silently cut real signal.
+    :param zg: The zarr group whose recorded blur settings are read.
+    :param mult: Number of molecules' worth of evidence a voxel must hold.
+    :type mult: float
+    :returns: The threshold, or zero when the store records neither convention, which
+        keeps every voxel.
+    :rtype: float
     """
     a = dict(zg.attrs)
     kern = a.get('kde_kernel', 'gaussian')
@@ -1028,15 +1343,16 @@ def analytic_vf_norm_threshold(zg, mult: float = 2.0) -> float:
 
 
 def resolve_vf_norm_threshold(zg, vf_norm_threshold=None, mult: float = 2.0) -> float:
-    """Threshold a mapper should use: explicit value, else the analytic one.
+    """Resolve the density threshold to use, from an explicit value or the store.
 
-    Deliberately does NOT fall back to ``attrs['select_vf_norm_threshold']``.
-    That key records the cut ``downsample_vector`` used to *pick training
-    voxels* — with ``vf_norm_percentile`` it is a percentile of the field, which
-    is the right call for sampling (take the denser part of the tissue to learn
-    from) and the wrong one for mapping (label every voxel that carries signal).
-    Reusing it made the map inherit a 25% cut of the tissue that no caller asked
-    for.
+    :param zg: The zarr group whose recorded blur settings are read.
+    :param vf_norm_threshold: An explicit threshold, or ``None`` to derive it from the
+        store through :func:`analytic_vf_norm_threshold`.
+    :param mult: Number of molecules' worth of evidence a voxel must hold, used only when
+        the threshold is derived.
+    :type mult: float
+    :returns: The threshold to apply.
+    :rtype: float
     """
     if vf_norm_threshold is not None:
         return float(vf_norm_threshold)
@@ -1046,33 +1362,39 @@ def resolve_vf_norm_threshold(zg, vf_norm_threshold=None, mult: float = 2.0) -> 
 def map_corr(analysis, centroids=None, *, vf_norm_threshold=None, chunk_h=128,
              device="cuda", overwrite=True, gene_indices=None, marker_index_sets=None,
              gpu_target_bytes=int(4e9), sub_batch=None):
-    """Map the blur field to celltypes by centroid Pearson correlation (no KDE).
+    """Map the count and blur field to cell types by centroid correlation.
 
-    Reads ``vf_normalized`` chunk-by-chunk, mean-centers + L2-normalizes each
-    voxel and each centroid, assigns the max-correlation cluster. Output layout
-    matches the transcript KDE path so downstream filter/plot work unchanged.
+    Every voxel whose density exceeds the threshold is assigned the centroid it correlates
+    best with, and the correlation is written alongside the label as the score volume.
 
-    :param analysis: the ``Analysis`` instance (provides ``dataset`` and ``verbose``).
+    :param analysis: The ``Analysis`` instance, which provides the dataset and the
+        verbosity setting.
     :type analysis: Analysis
-    :param centroids: cluster centroids ``(k, n_G)``; read from the zarr group when ``None``.
-    :type centroids: numpy.ndarray or None
-    :param vf_norm_threshold: minimum ``vf_norm`` for a voxel to be mapped; auto-derived when ``None``.
-    :type vf_norm_threshold: float or None
-    :param chunk_h: number of raster rows processed per GPU chunk.
+    :param centroids: The cluster centroids, of shape clusters by genes. They are read
+        from the store when ``None``.
+    :param vf_norm_threshold: Density below which a voxel is left unmapped. It is resolved
+        from the store when ``None``.
+    :param chunk_h: Number of raster rows per band, before any reduction to fit the memory
+        budget.
     :type chunk_h: int
-    :param device: torch device string.
+    :param device: Torch device for the correlation.
     :type device: str
-    :param overwrite: replace any existing ``celltype_maps`` / ``max_correlations``.
+    :param overwrite: Whether to replace existing map arrays in the store.
     :type overwrite: bool
-    :param gene_indices: positions into the store's gene axis to keep; ``None`` = all.
-        Set by ``map_celltypes(marker_genes_path=...)`` to the union of the marker
-        panel, so the correlation stops spending its variance on genes no celltype
-        was called on.
-    :type gene_indices: list[int] or None
-    :param marker_index_sets: per-celltype gene positions *within* ``gene_indices``
-        (see :func:`ssaft._marker_corr.marker_index_sets`). When given, each celltype
-        is correlated only on its own markers instead of the shared axis.
-    :type marker_index_sets: list or None
+    :param gene_indices: Positions into the store's gene axis to keep, where ``None``
+        keeps all of them.
+    :param marker_index_sets: Per-celltype marker gene positions, from
+        :func:`ssaft._marker_corr.marker_index_sets`. When given, each celltype is scored
+        only on its own markers. When ``None``, every celltype shares one gene axis, which
+        lets the centroids be normalized once up front.
+    :param gpu_target_bytes: Device memory budget for one band of the field. The number of
+        rows per band is reduced to fit it, so that a wide gene axis cannot run the card
+        out of memory the way a fixed row count can.
+    :type gpu_target_bytes: int
+    :param sub_batch: Voxels scored per device batch inside a band. It is sized from the
+        same budget when ``None``.
+    :returns: Whatever :func:`_write_maps` returns after writing the label raster and the
+        correlations into the store.
     """
     import torch
     zg = analysis.dataset.zarr_group

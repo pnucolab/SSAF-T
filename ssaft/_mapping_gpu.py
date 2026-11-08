@@ -1,23 +1,23 @@
-"""GPU helpers for ``Analysis.map_celltypes_gpu``.
+"""GPU helpers used by ``Analysis.map_celltypes_gpu``.
 
-Reuses the Triton KDE kernel + cell-list builders from
-``ssaft._kde_gpu`` and adds:
+This module reuses the Triton kernel-density kernel and the cell-list builders from
+``ssaft._kde_gpu`` and adds three primitives. ``_kde_setup_celllist`` builds the cell
+list once per outer chunk. ``_kde_run_subchunk`` runs the kernel density estimate for
+one sub-chunk of query points against a cell list that already exists, so nothing is
+rebuilt. ``_pearson_corr_gpu`` correlates a set of centroids of shape k by g against a
+set of rows of shape n by g, returning a k by n matrix, entirely on the GPU through
+``torch.matmul``.
 
-* ``_kde_setup_celllist``  — build the cell-list once per outer chunk.
-* ``_kde_run_subchunk``    — run KDE for one sub-chunk of query points
-                             using a pre-built cell-list (no rebuild).
-* ``_pearson_corr_gpu``    — (k, g) × (n, g) → (k, n) Pearson correlation
-                             entirely on GPU via torch.matmul.
+Together these let ``map_celltypes_gpu`` stream chunks the way ``map_celltypes_he``
+does while staying on the GPU all the way through the correlation step.
 
-These primitives let ``map_celltypes_gpu`` stream chunks like
-``map_celltypes_he`` while staying on GPU through the correlation step.
-
-Numerical equivalence vs the C++ ``map_celltypes_he`` path:
-- KDE row-L1 relative diff <2e-6 (Triton kernel inherits the same
-  bound documented in ``_kde_gpu``).
-- Pearson correlation absolute diff <1e-5 (cuBLAS GEMM vs AVX512 FMA).
-- Final ``celltype_maps`` may flip labels at decision boundaries
-  (≪0.1% of voxels in well-separated cluster cases).
+The results agree with the C++ ``map_celltypes_he`` path to the following tolerances.
+The relative difference in the row-wise L1 norm of the kernel density estimate is below
+2e-6, a bound the Triton kernel inherits from the one documented in ``_kde_gpu``. The
+absolute difference in Pearson correlation is below 1e-5, which is the gap between a
+cuBLAS matrix multiply and AVX512 fused multiply-add. The final ``celltype_maps`` may
+still flip a label at a decision boundary, which in well separated cases affects far
+less than 0.1 percent of voxels.
 """
 from __future__ import annotations
 
@@ -43,17 +43,33 @@ def _kde_setup_celllist(loc_x_t, loc_y_t, loc_z_t, gi_t,
                         chunk_q_xmax, chunk_q_ymax, chunk_q_zmax,
                         sampling_distance, bandwidth, prune_coefficient,
                         dim, kernel='gaussian'):
-    """Build a cell-list spanning the chunk's query bbox + transcripts.
+    """Build a cell list spanning the chunk's query bounding box and its transcripts.
 
-    Returns a state dict consumed by :func:`_kde_run_subchunk`, or
-    ``None`` when there are no transcripts (caller treats the result
-    as all-zero KDE).
-
-    :param kernel: one of ``ssaft._count.KDE_KERNELS`` (default ``'gaussian'``).
-        ``bandwidth`` here is the kernel's OWN scale, already converted from the
-        gaussian-equivalent one (:func:`ssaft._count.kernel_scale`); the reach is
-        :func:`ssaft._count.kernel_reach` of it, so ``prune_coefficient`` matters
-        only for the gaussian and the exponential.
+    :param loc_x_t: Transcript x coordinates on the device.
+    :param loc_y_t: Transcript y coordinates on the device.
+    :param loc_z_t: Transcript z coordinates on the device, used only when ``dim`` is 3.
+    :param gi_t: Gene index of each transcript.
+    :param chunk_q_xmin: Lowest query x coordinate in this chunk.
+    :param chunk_q_ymin: Lowest query y coordinate in this chunk.
+    :param chunk_q_zmin: Lowest query z coordinate in this chunk.
+    :param chunk_q_xmax: Highest query x coordinate in this chunk.
+    :param chunk_q_ymax: Highest query y coordinate in this chunk.
+    :param chunk_q_zmax: Highest query z coordinate in this chunk.
+    :param sampling_distance: Spacing of the lattice, which is also the cell size.
+    :param bandwidth: The kernel's own scale, already converted from the Gaussian
+        equivalent scale by :func:`ssaft._count.kernel_scale`. The reach follows from it
+        through :func:`ssaft._count.kernel_reach`, so ``prune_coefficient`` matters only
+        for the Gaussian and the exponential kernels.
+    :param prune_coefficient: Truncation of the kernel, measured in units of its scale.
+    :param dim: Either 2 or 3, selecting the planar or volumetric cell list.
+    :type dim: int
+    :param kernel: One of ``ssaft._count.KDE_KERNELS``.
+    :type kernel: str
+    :returns: A state dictionary consumed by :func:`_kde_run_subchunk`, or ``None`` when
+        there are no transcripts, in which case the caller treats the estimate as zero
+        everywhere.
+    :rtype: dict or None
+    :raises ImportError: If torch and Triton are not both available.
     """
     if not _HAS_TRITON:
         raise ImportError("_kde_setup_celllist requires torch + triton.")
@@ -101,15 +117,39 @@ def _kde_setup_celllist(loc_x_t, loc_y_t, loc_z_t, gi_t,
 
 def _kde_nonzero_queries(loc_x, loc_y, loc_z, x0, nx, ny, nz, sampling_distance, reach,
                          kernel='gaussian'):
-    """Which voxels of a query slab can have a nonzero KDE: flat (C-order ``(nx, ny, nz)``) bool.
+    """Mark which voxels of a query slab can possibly have a nonzero density.
 
-    ``_kde_run_subchunk`` sums only transcripts in the cells within
-    :func:`ssaft._count.kernel_search_cells` of the query's cell, so a voxel with no transcript
-    in a cube of half-width that + 2 voxels around it (the +2 absorbs the cell grid's own
-    origin) is exactly zero; skipping it changes nothing. On a 3D section most of the bounding box is such voxels (XEN010: ~70%).
-    The occupancy grid is dilated with three separable 1D max-pools on the device.
-    Query voxel ``(i, j, k)`` of the slab sits at ``((x0 + i) sd, j sd, k sd)`` in the frame of
-    ``loc_*`` (the frame the queries are built in).
+    :func:`_kde_run_subchunk` sums only the transcripts lying in the cells within
+    :func:`ssaft._count.kernel_search_cells` of the query's own cell. A voxel with no
+    transcript inside a cube of that half-width plus two voxels around it is therefore
+    exactly zero, and skipping it changes nothing. The two extra voxels absorb the offset
+    between the cell grid's origin and the query lattice. On a three-dimensional section
+    most of the bounding box consists of such voxels, around 70 percent on the XEN010
+    sample, so the saving is large.
+
+    The occupancy grid is dilated on the device with three separable one-dimensional max
+    pooling passes. Query voxel ``(i, j, k)`` of the slab sits at ``((x0 + i) * sd, j *
+    sd, k * sd)`` in the frame of the ``loc_`` arrays, which is the frame the queries
+    are built in.
+
+    :param loc_x: Transcript x coordinates on the device.
+    :param loc_y: Transcript y coordinates on the device.
+    :param loc_z: Transcript z coordinates on the device, or ``None`` in two dimensions.
+    :param x0: Index of the slab's first voxel along x.
+    :type x0: int
+    :param nx: Number of voxels of the slab along x.
+    :type nx: int
+    :param ny: Number of voxels of the slab along y.
+    :type ny: int
+    :param nz: Number of voxels of the slab along z.
+    :type nz: int
+    :param sampling_distance: Spacing of the lattice.
+    :param reach: Radius beyond which the kernel is treated as zero.
+    :param kernel: One of ``ssaft._count.KDE_KERNELS``.
+    :type kernel: str
+    :returns: A flat boolean array in C order over ``(nx, ny, nz)``, true where the
+        density can be nonzero.
+    :rtype: numpy.ndarray
     """
     import torch.nn.functional as F
     from ._count import kernel_search_cells
@@ -133,10 +173,24 @@ def _kde_nonzero_queries(loc_x, loc_y, loc_z, x0, nx, ny, nz, sampling_distance,
 
 
 def _kde_run_subchunk(state, qx, qy, qz, n_genes, device):
-    """Run KDE for a sub-chunk of query points using ``state``.
+    """Run the kernel density estimate for a sub-chunk of query points.
 
-    Returns a torch.float32 tensor of shape ``(N, n_genes)`` on
-    ``device``.
+    The cell list in ``state`` is reused as it stands, so nothing is rebuilt between
+    sub-chunks.
+
+    :param state: The state dictionary returned by :func:`_kde_setup_celllist`, or
+        ``None`` when the chunk held no transcripts.
+    :type state: dict or None
+    :param qx: Query x coordinates.
+    :param qy: Query y coordinates.
+    :param qz: Query z coordinates, used only for a three-dimensional state.
+    :param n_genes: Width of the output, meaning the number of genes.
+    :type n_genes: int
+    :param device: The torch device to allocate the output on.
+    :returns: A float32 tensor of shape ``(N, n_genes)`` on ``device``, which is all
+        zeros when there are no queries or no transcripts.
+    :rtype: torch.Tensor
+    :raises ImportError: If torch and Triton are not both available.
     """
     if not _HAS_TRITON:
         raise ImportError("_kde_run_subchunk requires torch + triton.")
@@ -192,10 +246,15 @@ def _kde_run_subchunk(state, qx, qy, qz, n_genes, device):
 
 
 def _pearson_corr_gpu(centroids_t, data_t):
-    """Pearson correlation between (k, g) centroids and (n, g) rows.
+    """Correlate every centroid against every row, on the GPU.
 
-    Returns a torch tensor of shape ``(k, n)`` on the same device.
-    Both inputs are assumed float32; the result is float32.
+    :param centroids_t: Centroids of shape ``(k, g)``, assumed float32.
+    :type centroids_t: torch.Tensor
+    :param data_t: Row vectors of shape ``(n, g)``, assumed float32.
+    :type data_t: torch.Tensor
+    :returns: Pearson correlations of shape ``(k, n)``, float32, on the same device.
+    :rtype: torch.Tensor
+    :raises ImportError: If torch is not available.
     """
     if not _HAS_TRITON:
         raise ImportError("_pearson_corr_gpu requires torch.")
@@ -207,13 +266,21 @@ def _pearson_corr_gpu(centroids_t, data_t):
 
 
 def _pearson_max_gpu(centroids_t, data_t):
-    """Shared mapping kernel: best-centroid label + Pearson score per row.
+    """Return the best-matching centroid and its Pearson score for every row.
 
-    ``centroids_t`` (k, g) and ``data_t`` (n, g) → ``(best_idx (n,), best_corr
-    (n,))`` on the same device. This is the single consumer used by BOTH the
-    count path (field read from the stored ``vf_normalized``) and the transcript
-    path (KDE field streamed chunk-by-chunk) — identical Pearson-max so results
-    do not depend on how the field was produced. Returns int32 idx, float32 corr.
+    This is the single mapping kernel shared by both paths. The count path reads the field
+    from the stored ``vf_normalized``, and the transcript path streams a kernel density
+    field chunk by chunk, but both finish here, so a result never depends on how the field
+    was produced.
+
+    :param centroids_t: Centroids of shape ``(k, g)``.
+    :type centroids_t: torch.Tensor
+    :param data_t: Row vectors of shape ``(n, g)``.
+    :type data_t: torch.Tensor
+    :returns: A pair of tensors on the same device. The first holds the index of the
+        winning centroid for each row as int32, and the second holds that row's
+        correlation as float32.
+    :rtype: tuple of torch.Tensor
     """
     corr = _pearson_corr_gpu(centroids_t, data_t)
     best_corr, best_idx = corr.max(dim=0)

@@ -1,21 +1,21 @@
-"""
-GPU equivalent of ``ssaft.utils.kde_at_points`` using a Triton
-cell-list kernel.
+"""GPU equivalent of ``ssaft.utils.kde_at_points``, built on a Triton cell-list kernel.
 
-This module is fully additive — it does not modify the C++ implementation;
-it swaps it in only for the duration of a context manager:
+This module is purely additive. It does not modify the C++ implementation, and swaps
+itself in only for the duration of a context manager::
 
     from ssaft._kde_gpu import gpu_kde
     with gpu_kde(device='cuda'):
-        ds.downsample_vector(he_path=..., sdata=...)   # uses GPU internally
-    # back to C++ outside the with-block
+        ds.downsample_vector(he_path=..., sdata=...)   # uses the GPU internally
+    # outside the with block the C++ implementation is back
 
-Numerical equivalence vs C++ ``kde_at_points``:
-    max row-L1 relative diff < 2e-6 (verified on M=5M, N=5k, n_genes=280).
+The results agree with the C++ ``kde_at_points`` to within a maximum row-wise L1
+relative difference of 2e-6, verified on 5 million molecules, 5 thousand query points
+and 280 genes.
 
-Supports both dim==2 and dim==3 (3D KDE). Note that the 3D cell-list array
-size is W*H*D*4 bytes; for very large/anisotropic domains consider using
-``force_2d=True`` to collapse z when 2D projection is acceptable.
+Both two and three dimensions are supported. Note that the three-dimensional cell
+list occupies W times H times D times 4 bytes, so for a very large or strongly
+anisotropic domain it may be worth passing ``force_2d=True`` to collapse z, whenever a
+two-dimensional projection is acceptable.
 """
 from __future__ import annotations
 
@@ -39,11 +39,22 @@ except ImportError:
 if _HAS_TRITON:
     @triton.jit
     def _kde_weight(r2, two_h2, inv_norm, Rw2, inv_scale, KERN: tl.constexpr):
-        """One molecule's weight at squared distance ``r2`` (the caller masks r2 > Rw2).
+        """Return one molecule's kernel weight at a squared distance.
 
-        ``KERN`` is the id in ``ssaft._count.KDE_KERNELS``. The gaussian and
-        Epanechnikov lines are the expressions these kernels have always used (the
-        Epanechnikov's support H is ``sqrt(Rw2)``), so their results are unchanged.
+        The caller is responsible for masking out any distance beyond the kernel's reach.
+
+        ``KERN`` is the kernel identifier used in ``ssaft._count.KDE_KERNELS``. The Gaussian
+        and Epanechnikov branches are the expressions these kernels have always used, with the
+        Epanechnikov support taken as the square root of ``Rw2``, so their results are
+        unchanged by this implementation.
+
+        :param r2: Squared distance between the molecule and the query point.
+        :param two_h2: Twice the squared bandwidth, used by the Gaussian branch.
+        :param inv_norm: Reciprocal of the kernel's normalization constant.
+        :param Rw2: Squared reach of the kernel.
+        :param inv_scale: Reciprocal of the kernel's own scale.
+        :param KERN: Compile-time kernel identifier.
+        :returns: The weight of this molecule at that distance.
         """
         if KERN == 0:        # gaussian
             w = tl.exp(-r2 / two_h2) * inv_norm
@@ -70,6 +81,35 @@ if _HAS_TRITON:
         inv_sd, two_h2, inv_norm, Rw2, inv_scale,
         BLOCK_T: tl.constexpr, KERN: tl.constexpr,
     ):
+        """Triton kernel computing the two-dimensional estimate for one query point per program.
+
+        Each program walks the cells within ``Rp`` of its query point's own cell, loads the
+        molecules those cells hold in blocks of ``BLOCK_T``, and atomically accumulates each
+        molecule's weight into the output row of its gene. Molecules beyond the kernel's reach,
+        and gene indices outside the output width, are masked out rather than branched on.
+
+        :param qx_ptr: Query x coordinates.
+        :param qy_ptr: Query y coordinates.
+        :param sx_ptr: Molecule x coordinates, sorted by cell.
+        :param sy_ptr: Molecule y coordinates, sorted by cell.
+        :param sg_ptr: Molecule gene indices, sorted by cell.
+        :param cell_start_ptr: Start offset of each cell in the sorted arrays.
+        :param out_ptr: Output of shape ``(N, n_genes)``, accumulated into.
+        :param N: Number of query points.
+        :param n_genes: Width of the output.
+        :param W: Number of cells along x.
+        :param H: Number of cells along y.
+        :param Rp: Half-width of the cell neighbourhood to visit, in cells.
+        :param x_min: World x coordinate of the cell grid's origin.
+        :param y_min: World y coordinate of the cell grid's origin.
+        :param inv_sd: Reciprocal of the cell size.
+        :param two_h2: Twice the squared bandwidth.
+        :param inv_norm: Reciprocal of the kernel's normalization constant.
+        :param Rw2: Squared reach of the kernel.
+        :param inv_scale: Reciprocal of the kernel's own scale.
+        :param BLOCK_T: Number of molecules loaded per block.
+        :param KERN: Compile-time kernel identifier.
+        """
         pid = tl.program_id(0)
         if pid >= N:
             return
@@ -116,6 +156,37 @@ if _HAS_TRITON:
         inv_sd, two_h2, inv_norm, Rw2, inv_scale,
         BLOCK_T: tl.constexpr, KERN: tl.constexpr,
     ):
+        """Triton kernel computing the three-dimensional estimate, one query point per program.
+
+        This is the volumetric counterpart of :func:`_kde_cell_kernel`. It walks a cube of
+        cells rather than a square, and the cell index runs over z, then y, then x.
+
+        :param qx_ptr: Query x coordinates.
+        :param qy_ptr: Query y coordinates.
+        :param qz_ptr: Query z coordinates.
+        :param sx_ptr: Molecule x coordinates, sorted by cell.
+        :param sy_ptr: Molecule y coordinates, sorted by cell.
+        :param sz_ptr: Molecule z coordinates, sorted by cell.
+        :param sg_ptr: Molecule gene indices, sorted by cell.
+        :param cell_start_ptr: Start offset of each cell in the sorted arrays.
+        :param out_ptr: Output of shape ``(N, n_genes)``, accumulated into.
+        :param N: Number of query points.
+        :param n_genes: Width of the output.
+        :param W: Number of cells along x.
+        :param H: Number of cells along y.
+        :param D: Number of cells along z.
+        :param Rp: Half-width of the cell neighbourhood to visit, in cells.
+        :param x_min: World x coordinate of the cell grid's origin.
+        :param y_min: World y coordinate of the cell grid's origin.
+        :param z_min: World z coordinate of the cell grid's origin.
+        :param inv_sd: Reciprocal of the cell size.
+        :param two_h2: Twice the squared bandwidth.
+        :param inv_norm: Reciprocal of the kernel's normalization constant.
+        :param Rw2: Squared reach of the kernel.
+        :param inv_scale: Reciprocal of the kernel's own scale.
+        :param BLOCK_T: Number of molecules loaded per block.
+        :param KERN: Compile-time kernel identifier.
+        """
         pid = tl.program_id(0)
         if pid >= N:
             return
@@ -161,6 +232,25 @@ if _HAS_TRITON:
 
 
 def _build_cell_list(lx_g, ly_g, gi_g, sampling_distance, x_min, y_min, W, H):
+    """Sort molecules into a two-dimensional cell list on the device.
+
+    Each molecule is assigned to the cell containing it, molecules outside the grid are
+    sent to a sentinel cell past the end, and everything is sorted by cell identifier. The
+    start offset of each cell is then found by binary search, which is what lets the
+    kernel visit a cell's molecules as a contiguous range.
+
+    :param lx_g: Molecule x coordinates on the device.
+    :param ly_g: Molecule y coordinates on the device.
+    :param gi_g: Gene index of each molecule.
+    :param sampling_distance: Cell size, which equals the lattice spacing.
+    :param x_min: World x coordinate of the grid's origin.
+    :param y_min: World y coordinate of the grid's origin.
+    :param W: Number of cells along x.
+    :param H: Number of cells along y.
+    :returns: The sorted x coordinates, y coordinates and gene indices, together with the
+        per-cell start offsets, all contiguous on the device.
+    :rtype: tuple of torch.Tensor
+    """
     inv_sd = 1.0 / sampling_distance
     tx = torch.floor((lx_g - x_min) * inv_sd).to(torch.int64)
     ty = torch.floor((ly_g - y_min) * inv_sd).to(torch.int64)
@@ -180,6 +270,26 @@ def _build_cell_list(lx_g, ly_g, gi_g, sampling_distance, x_min, y_min, W, H):
 
 def _build_cell_list_3d(lx_g, ly_g, lz_g, gi_g, sampling_distance,
                         x_min, y_min, z_min, W, H, D):
+    """Sort molecules into a three-dimensional cell list on the device.
+
+    This is the volumetric counterpart of :func:`_build_cell_list`, with the cell
+    identifier running over z, then y, then x.
+
+    :param lx_g: Molecule x coordinates on the device.
+    :param ly_g: Molecule y coordinates on the device.
+    :param lz_g: Molecule z coordinates on the device.
+    :param gi_g: Gene index of each molecule.
+    :param sampling_distance: Cell size, which equals the lattice spacing.
+    :param x_min: World x coordinate of the grid's origin.
+    :param y_min: World y coordinate of the grid's origin.
+    :param z_min: World z coordinate of the grid's origin.
+    :param W: Number of cells along x.
+    :param H: Number of cells along y.
+    :param D: Number of cells along z.
+    :returns: The sorted x, y and z coordinates and gene indices, together with the
+        per-cell start offsets, all contiguous on the device.
+    :rtype: tuple of torch.Tensor
+    """
     inv_sd = 1.0 / sampling_distance
     tx = torch.floor((lx_g - x_min) * inv_sd).to(torch.int64)
     ty = torch.floor((ly_g - y_min) * inv_sd).to(torch.int64)
@@ -251,6 +361,20 @@ def kde_at_points_gpu(
     :type ncores: int or None
     :param device: torch device string.
     :type device: str
+    :param _split: internal. When ``True``, a three-dimensional call whose cell list
+        would exceed the memory cap is split into strips along the longest axis and
+        each strip is solved separately. Set ``False`` on the recursive calls, which
+        must not split again.
+    :type _split: bool
+    :param _grid_origin: internal. The cell grid's origin, in the same frame as the
+        coordinates. Passing it pins every strip of a split call to one common
+        lattice, so that a molecule falls in the same cell whichever strip solves it.
+        ``None`` lets each call choose its own origin from its own bounding box.
+    :param _qbatch: internal. When ``True``, the queries are first grouped into
+        spatial batches so that each batch builds a cell list over its own
+        neighbourhood rather than over the whole section. Set ``False`` on the
+        recursive calls, which are already one batch.
+    :type _qbatch: bool
     """
     if not _HAS_TRITON:
         raise ImportError("kde_at_points_gpu requires torch + triton.")
@@ -531,35 +655,36 @@ def _kde_3d_in_strips(query_x, query_y, query_z, loc_x, loc_y, loc_z, gene_indic
 @contextlib.contextmanager
 def gpu_kde(device: str = 'cuda', fallback_3d_to_cpu: bool = False,
             force_2d: bool = False):
-    """
-    Inside this with-block, every call to ``ssaft.utils.kde_at_points``
-    is routed to the GPU implementation. All higher-level APIs that internally
-    call ``kde_at_points`` (downsample_vector, downsample_vector_component,
-    _compute_normalized_vectors, etc.) automatically use GPU.
+    """Route every kernel density call inside this block to the GPU implementation.
 
-    The C++ implementation is restored on exit; nothing is modified permanently.
+    While the block is active, every call to ``ssaft.utils.kde_at_points`` goes to the GPU
+    implementation, so every higher-level function that calls it internally uses the GPU
+    too. That includes ``downsample_vector``, ``downsample_vector_component`` and
+    ``_compute_normalized_vectors``. The C++ implementation is restored on exit and
+    nothing is modified permanently.
 
     Parameters
     ----------
     device : str
-        Torch device string (e.g. ``'cuda'``, ``'cuda:0'``, ``'cuda:1'``).
+        Torch device string, for example ``'cuda'``, ``'cuda:0'`` or ``'cuda:1'``.
     fallback_3d_to_cpu : bool
-        If True, 3D inputs are routed to the original C++ implementation.
-        Default False — the GPU kernel now supports 3D natively. Set True
-        if you hit GPU memory limits on very large 3D domains and prefer
-        CPU over reducing the chunk size.
+        Whether to route three-dimensional inputs to the original C++ implementation.
+        This defaults to ``False``, because the GPU kernel now supports three
+        dimensions natively. Set it to ``True`` if you run into GPU memory limits on a
+        very large volume and would rather fall back to the processor than reduce the
+        chunk size.
     force_2d : bool
-        If True, 3D inputs are projected to 2D (z is zeroed) and run on
-        the 2D GPU kernel. Default False. Useful for thin-slice data
-        (e.g. Xenium z-stack within a single section) when you want a
-        lighter cell-list footprint than full 3D.
+        Whether to project three-dimensional inputs down to two dimensions, by zeroing
+        z, and run them on the planar GPU kernel. This defaults to ``False``. It is
+        useful for thin-slice data, such as a Xenium z stack within one section, when a
+        lighter cell-list footprint than full three dimensions is wanted.
 
     Example
     -------
     >>> from ssaft._kde_gpu import gpu_kde
-    >>> with gpu_kde(device='cuda:0'):                # native 3D on GPU
+    >>> with gpu_kde(device='cuda:0'):                # native 3D on the GPU
     ...     stats = ds.downsample_vector(he_path=..., sdata=...)
-    >>> with gpu_kde(device='cuda:0', force_2d=True): # collapse z for speed/memory
+    >>> with gpu_kde(device='cuda:0', force_2d=True): # collapse z for speed and memory
     ...     stats = ds.downsample_vector(he_path=..., sdata=...)
     """
     if not _HAS_TRITON:
@@ -577,6 +702,36 @@ def gpu_kde(device: str = 'cuda', fallback_3d_to_cpu: bool = False,
                  gene_indices, n_genes,
                  sampling_distance, bandwidth, prune_coefficient,
                  dim, ncores=None, kernel=0):
+        """Stand in for ``ssaft.utils.kde_at_points`` while the context manager is active.
+
+        The signature matches the compiled function exactly, including the ``kernel``
+        argument, which carries the kernel's integer identifier. Dropping that argument would
+        silently run every call with this module's own default kernel, whatever the caller
+        asked for.
+
+        Two-dimensional input goes straight to the GPU. Three-dimensional input is projected
+        to two dimensions when ``force_2d`` is set, is handed back to the C++ implementation
+        when ``fallback_3d_to_cpu`` is set, with a warning issued once, and otherwise runs on
+        the native three-dimensional GPU kernel.
+
+        :param query_x: x coordinates of the query points.
+        :param query_y: y coordinates of the query points.
+        :param query_z: z coordinates of the query points.
+        :param loc_x: x coordinates of the molecules.
+        :param loc_y: y coordinates of the molecules.
+        :param loc_z: z coordinates of the molecules.
+        :param gene_indices: Gene index of each molecule.
+        :param n_genes: Width of the output.
+        :param sampling_distance: Lattice spacing, which is also the cell size.
+        :param bandwidth: The kernel's own scale.
+        :param prune_coefficient: Truncation of the kernel, in units of its scale.
+        :param dim: Either 2 or 3.
+        :param ncores: Accepted for signature compatibility and ignored on the GPU.
+        :param kernel: Integer identifier of the kernel, indexing
+            ``ssaft._count.KDE_KERNELS``.
+        :returns: The estimate, of shape ``(N, n_genes)`` and dtype float32.
+        :rtype: numpy.ndarray
+        """
         from ._count import KDE_KERNELS
         kname = KDE_KERNELS[int(kernel)]
         if int(dim) != 2:

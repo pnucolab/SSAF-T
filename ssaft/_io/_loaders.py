@@ -1,19 +1,22 @@
-"""Platform loaders for count-based spatial data → :class:`spatialdata.SpatialData`.
+"""Platform loaders that turn count-based spatial data into a SpatialData object.
 
-Each loader reads a platform's raw output and returns a uniform SpatialData
-(assembled by :meth:`GridDataset.to_spatialdata`): ``tables['table']`` = the count
-matrix (``obsm['spatial']`` in µm, region-less, GridDataset metadata in
-``uns['cellman']``) and ``images['staining']`` = the morphology image carrying an
-``affine_px_to_um`` (image pixel → world µm) Affine transform — the single
-cross-platform coordinate contract.
+Each loader reads one platform's raw output and returns a uniform SpatialData, which
+:meth:`GridDataset.to_spatialdata` assembles. ``tables['table']`` is the count matrix,
+whose ``obsm['spatial']`` is in micrometres, which carries no region annotation and
+which keeps the GridDataset metadata in ``uns['cellman']``. ``images['staining']`` is
+the morphology image, carrying an ``affine_px_to_um`` Affine transform from image
+pixels to world micrometres. That transform is the single coordinate contract shared
+across platforms.
 
-Only the raw read, the image source, the affine convention, and the species differ
-between platforms; everything downstream (panel → compute_vf → downsample → cluster
-→ map) is shared and consumes the lightweight :meth:`GridDataset.from_sdata` view.
+Only four things differ between platforms: the raw read, the image source, the affine
+convention and the species. Everything downstream is shared, namely panel selection,
+``compute_vf``, ``downsample_vector``, clustering and mapping, and all of it consumes
+the lightweight :meth:`GridDataset.from_sdata` view.
 
-Stereo-seq is intentionally absent: SAW deliveries (GEF / ``*.tissue.gef``) are read
-by ``spatialdata_io``, and the one-off MOSTA bin1-GEM + ssDNA reader lives beside the
-notebook that uses it (``notebooks/stereoseq_mosta.py``), not in this package.
+Stereo-seq is deliberately absent. SAW deliveries, meaning GEF and ``*.tissue.gef``
+files, are read by ``spatialdata_io``, and the one-off MOSTA bin1 GEM and ssDNA reader
+lives beside the notebook that uses it, in ``notebooks/stereoseq_mosta.py``, rather
+than in this package.
 """
 
 from __future__ import annotations
@@ -32,11 +35,11 @@ from ._grid import fit_affine_lstsq
 def load_visiumhd(path: str | Path, *, species: str = "mouse",
                   organ: str = "small_intestine", bin_um: int = 2,
                   fullres_image_file: Optional[str] = None):
-    """Load a 10x Visium HD ``outs/`` directory at the ``bin_um`` µm bin.
+    """Load a 10x Visium HD ``outs/`` directory at the ``bin_um`` micrometre bin.
 
-    Convenience wrapper: reads the directory with ``spatialdata_io.visium_hd`` and
-    converts the result with :func:`from_visiumhd`. If you already hold that
-    SpatialData, call :func:`from_visiumhd` on it directly.
+    This is a convenience wrapper. It reads the directory with
+    ``spatialdata_io.visium_hd`` and converts the result with :func:`from_visiumhd`. If
+    you already hold that SpatialData, call :func:`from_visiumhd` on it directly.
 
     :param path: Path to the Visium HD ``outs/`` directory.
     :type path: str or pathlib.Path
@@ -44,11 +47,11 @@ def load_visiumhd(path: str | Path, *, species: str = "mouse",
     :type species: str
     :param organ: Cell-Ontology module name for the gene panel.
     :type organ: str
-    :param bin_um: Bin size in µm to load from the binned outputs.
+    :param bin_um: Bin size in micrometres to load from the binned outputs.
     :type bin_um: int
-    :param fullres_image_file: Optional path to an explicit fullres image file.
+    :param fullres_image_file: Optional path to an explicit full-resolution image file.
     :type fullres_image_file: str, optional
-    :returns: The count SpatialData (see :func:`from_visiumhd`).
+    :returns: The count SpatialData described under :func:`from_visiumhd`.
     :rtype: spatialdata.SpatialData
     """
     import spatialdata_io
@@ -71,36 +74,42 @@ def from_visiumhd(sdata, *, species: str, organ: str, bin_um: int = 2,
                   um_per_px: Optional[float] = None):
     """Convert a ``spatialdata_io.visium_hd`` SpatialData into the SSAF-T count layout.
 
-    Takes the ``bin_um`` µm bin table, keeps the in-tissue bins, places each bin at
-    ``(array_col, array_row) * bin_um`` µm, and fits the image-pixel -> µm affine from
-    the bins' ``(array_col, array_row)`` against their full-resolution pixel positions
-    (``obsm['spatial']`` as ``spatialdata_io`` stores it), on the same lattice the
-    vector field uses.
+    The function takes the table binned at ``bin_um`` micrometres, keeps the bins that lie
+    in tissue, and places each bin at ``(array_col, array_row)`` multiplied by ``bin_um``
+    micrometres. It then fits the affine from image pixels to micrometres by regressing the
+    bins' ``(array_col, array_row)`` indices against their full-resolution pixel positions,
+    which ``spatialdata_io`` stores in ``obsm['spatial']``. The fit is made on the same
+    lattice that the vector field uses.
 
-    :param sdata: SpatialData returned by ``spatialdata_io.visium_hd`` (loaded with the
-        ``bin_um`` bin size).
+    :param sdata: SpatialData returned by ``spatialdata_io.visium_hd``, loaded with the
+        ``bin_um`` bin size.
     :type sdata: spatialdata.SpatialData
     :param species: Species name used for marker-panel lookup.
     :type species: str
     :param organ: Cell-Ontology module name for the gene panel.
     :type organ: str
-    :param bin_um: Bin size in µm; selects the ``square_{bin_um:03d}um`` table.
+    :param bin_um: Bin size in micrometres, which selects the ``square_{bin_um:03d}um`` table.
     :type bin_um: int
-    :param table_key: Bin table key; defaults to the table whose key contains
+    :param table_key: Bin table key. Defaults to the table whose key contains
         ``square_{bin_um:03d}um``.
     :type table_key: str, optional
-    :param image_key: Staining image key; defaults to the full-resolution image (a key
-        containing ``full``), else the first image.
+    :param image_key: Staining image key. Defaults to the full-resolution image, meaning a
+        key containing ``full``, and otherwise to the first image.
     :type image_key: str, optional
-    :param um_per_px: µm per full-resolution pixel. It sets the tissue-mask sampling density in
-        ``downsample_vector``. Defaults to the scale of the fitted affine; Space Ranger's
-        ``scalefactors_json.json`` ``microns_per_pixel`` differs from it in the fourth decimal,
-        and :func:`load_visiumhd` passes that value so earlier runs reproduce exactly.
+    :param um_per_px: Micrometres per full-resolution pixel, which sets the tissue-mask
+        sampling density in ``downsample_vector``. Defaults to the scale of the fitted
+        affine. The ``microns_per_pixel`` value in Space Ranger's
+        ``scalefactors_json.json`` differs from that scale in the fourth decimal place, and
+        :func:`load_visiumhd` passes the Space Ranger value so that earlier runs reproduce
+        exactly.
     :type um_per_px: float, optional
-    :returns: SpatialData with ``tables['table']`` (bins x genes, ``obsm['spatial']`` in
-        µm, metadata in ``uns['cellman']``) and ``images['staining']`` (the H&E with its
-        pixel -> µm Affine).
+    :returns: SpatialData holding ``tables['table']``, which is bins by genes with
+        ``obsm['spatial']`` in micrometres and metadata in ``uns['cellman']``, and
+        ``images['staining']``, which is the haematoxylin and eosin image with its Affine
+        transform from pixels to micrometres.
     :rtype: spatialdata.SpatialData
+    :raises RuntimeError: If no table matches the requested bin size, or if the chosen
+        table lacks the lattice indices or the pixel positions needed for the fit.
     """
     suffix = f"square_{bin_um:03d}um"
     tkey = table_key or next((k for k in sdata.tables if suffix in k), None)
@@ -152,27 +161,32 @@ def from_visiumhd(sdata, *, species: str, organ: str, bin_um: int = 2,
 def load_strata(h5ad_path: str | Path, he_ome_tiff: str | Path, *,
                 species: str = "human", organ: str = "breast",
                 he_level: int = 2, um_per_px_full: float = 0.260) -> GridDataset:
-    """Load a StrataMap NovaSeq-X sample: point-barcode ``.h5ad`` + registered H&E.
+    """Load a StrataMap NovaSeq X sample from a barcode h5ad and a registered image.
 
-    Barcode coordinates are already in ``obsm['spatial']`` (µm) if the h5ad was
-    prepared that way; otherwise pass an h5ad whose ``obs_names`` encode
-    ``…:X:Y:…`` in nm. Gene symbols are promoted to ``var_names``. The H&E axes
-    are transposed relative to barcode µm (image row is world x, image col is
-    world y).
+    Barcode coordinates are taken from ``obsm['spatial']`` in micrometres when the h5ad was
+    prepared that way. Otherwise the coordinates are parsed out of ``obs_names``, which are
+    expected to encode the x and y position in nanometres as the second and third
+    colon-separated fields. Gene symbols, when present, are promoted to ``var_names``.
+
+    The haematoxylin and eosin axes are transposed with respect to barcode micrometres: the
+    image row index gives world x and the image column index gives world y. The returned
+    affine encodes that transposition.
 
     :param h5ad_path: Path to the point-barcode ``.h5ad`` file.
     :type h5ad_path: str or pathlib.Path
-    :param he_ome_tiff: Path to the registered H&E OME-TIFF image.
+    :param he_ome_tiff: Path to the registered haematoxylin and eosin OME-TIFF image.
     :type he_ome_tiff: str or pathlib.Path
     :param species: Species name used for marker-panel lookup.
     :type species: str
     :param organ: Cell-Ontology module name for the gene panel.
     :type organ: str
-    :param he_level: Pyramid level of the H&E image to read.
+    :param he_level: Pyramid level of the image to read.
     :type he_level: int
-    :param um_per_px_full: Fallback µm-per-pixel at full resolution when the OME
-        metadata lacks ``PhysicalSizeX``.
+    :param um_per_px_full: Fallback micrometres per pixel at full resolution, used when the
+        OME metadata carries no ``PhysicalSizeX``.
     :type um_per_px_full: float
+    :returns: The count SpatialData, with the barcode table and the staining image.
+    :rtype: spatialdata.SpatialData
     """
     import scanpy as sc
 

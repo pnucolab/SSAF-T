@@ -1,16 +1,19 @@
-"""Canonical intermediate for **count-matrix** spatial platforms.
+"""The canonical intermediate for count-matrix spatial platforms.
 
-Transcript platforms (Xenium / MERSCOPE / CosMx) flow through SpatialData points
-and the KDE pipeline unchanged. Count platforms (Stereo-seq / Visium HD /
-NovaSeq-X StrataMap) do **not** provide molecule-resolved transcripts; they give a
-cell/bin x gene count matrix on a spatial lattice. Rather than unroll counts into
-synthetic transcripts (memory blow-up on dense data — Stereo-seq bin1 ~1e8 UMIs),
-the count path rasterizes counts onto a grid and GPU-blurs them into a
-KDE-equivalent vector field (see :meth:`Analysis.compute_vf`).
+Transcript platforms such as Xenium, MERSCOPE and CosMx flow through SpatialData
+points and the kernel density pipeline unchanged. Count platforms such as Stereo-seq,
+Visium HD and NovaSeq X StrataMap do not provide molecule-resolved transcripts at all.
+They give a matrix of cells or bins by genes on a spatial lattice.
 
-``GridDataset`` is the lightweight hand-off between a platform loader
-(:mod:`ssaft._io`) and that backend. It deliberately does **not** wrap a
-SpatialData object.
+Unrolling those counts into synthetic transcripts would blow up memory on dense data,
+since a Stereo-seq bin1 sample carries on the order of a hundred million unique
+molecules. The count path therefore rasterizes the counts onto a grid and blurs them
+on the GPU into a field equivalent to the kernel density one. See
+:meth:`Analysis.compute_vf`.
+
+``GridDataset`` is the lightweight hand-off between a platform loader, in
+:mod:`ssaft._io`, and that backend. It deliberately does not wrap a SpatialData
+object.
 """
 
 from __future__ import annotations
@@ -23,38 +26,65 @@ from anndata import AnnData
 
 
 class _RawView:
-    """Lightweight AnnData-duck for a count ``GridDataset.raw`` — exposes only the
-    surface aggregate_to_grid / compute_vf / GridDataset touch (``X``,
-    ``obsm['spatial']``, ``var``, ``var_names``, ``n_obs``, ``n_vars``, ``shape``,
-    column-slicing ``[:, genes]``). Avoids constructing a full AnnData over a
-    10^8-row count table, whose ``obs_names`` string-index materialization alone
-    costs ~144s (the real bottleneck of ``spatialdata``/``anndata`` read_zarr on
-    huge count stores). Read-only view (not writable back to SpatialData)."""
+    """A minimal stand-in for AnnData over a count ``GridDataset.raw``.
+
+    The class exposes only the surface that ``aggregate_to_grid``, ``compute_vf`` and
+    ``GridDataset`` actually touch, namely ``X``, ``obsm['spatial']``, ``var``,
+    ``var_names``, ``n_obs``, ``n_vars``, ``shape`` and slicing by column through
+    ``[:, genes]``.
+
+    Its purpose is to avoid constructing a full AnnData over a count table of a hundred
+    million rows. Materializing the string index of ``obs_names`` alone costs roughly 144
+    seconds on such a table, and that is the real bottleneck when ``spatialdata`` or
+    ``anndata`` read a huge count store. The view is read-only and cannot be written back
+    to SpatialData.
+    """
     def __init__(self, X, spatial, var):
+        """Wrap a count matrix, its coordinates and its gene table.
+
+        :param X: The count matrix, of shape ``(n_obs, n_vars)``.
+        :param spatial: The coordinates in micrometres, of shape ``(n_obs, 2)``.
+        :param var: The gene table, whose index holds the gene symbols.
+        """
         self.X = X
         self.obsm = {"spatial": spatial}
         self.var = var
 
     @property
     def var_names(self):
+        """The gene symbols, taken from the index of ``var``."""
         return self.var.index
 
     @property
     def n_obs(self):
+        """The number of rows, meaning points or bins."""
         return self.X.shape[0]
 
     @property
     def n_vars(self):
+        """The number of columns, meaning genes."""
         return self.X.shape[1]
 
     @property
     def shape(self):
+        """The shape of the count matrix, as rows by columns."""
         return self.X.shape
 
     def copy(self):
+        """Return the view itself, since it is read-only and needs no copy."""
         return self
 
     def __getitem__(self, key):
+        """Slice the view by column, which is the only slicing the backend needs.
+
+        A row slice, or a column slice that is a plain ``slice`` object, returns the view
+        unchanged. A list of gene symbols returns a new view holding only those genes that
+        exist, in the order given.
+
+        :param key: Either a column selector, or a tuple whose second element is one.
+        :returns: This view, or a new view restricted to the named genes.
+        :rtype: _RawView
+        """
         cols = key[1] if isinstance(key, tuple) else slice(None)
         if isinstance(cols, slice):
             return self
@@ -65,9 +95,15 @@ class _RawView:
 
 
 def _jsonify(obj):
-    """Recursively coerce a metadata value into something the AnnData zarr writer
-    accepts in ``uns`` (tuples → lists, numpy scalars → python scalars). The count
-    loaders stash e.g. ``meta['flip'] = (0, 1)`` — a tuple anndata cannot encode."""
+    """Coerce a metadata value into something the AnnData zarr writer accepts in ``uns``.
+
+    Tuples become lists and numpy scalars become plain Python scalars, recursively. The
+    count loaders store values such as ``meta['flip'] = (0, 1)``, and anndata cannot
+    encode a tuple.
+
+    :param obj: The value to coerce.
+    :returns: The coerced value.
+    """
     if isinstance(obj, dict):
         return {str(k): _jsonify(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -79,42 +115,52 @@ def _jsonify(obj):
 
 @dataclass
 class GridDataset:
-    """Platform-agnostic container for a count-based spatial sample.
+    """A platform-agnostic container for one count-based spatial sample.
 
     Attributes
     ----------
     raw : AnnData
-        Point/bin-level counts. ``obsm['spatial']`` holds x,y in **µm**;
-        ``var_names`` are gene symbols. This is the unit HVG selection and
-        rasterization operate on (via :func:`ssaft._io.aggregate_to_grid`).
+        Point-level or bin-level counts. ``obsm['spatial']`` holds x and y in
+        micrometres, and ``var_names`` holds gene symbols. This is the unit that
+        selection of highly variable genes and rasterization operate on, through
+        :func:`ssaft._io.aggregate_to_grid`.
     image : numpy.ndarray
-        Morphology / staining image used for tissue-mask voxel sampling. Either
-        ``(c, y, x)`` or ``(y, x)``. ssDNA (Stereo-seq), H&E (Visium HD /
-        StrataMap), etc.
+        The morphology or staining image used for sampling voxels inside the tissue
+        mask, shaped either as channel by y by x, or as y by x. Examples are ssDNA for
+        Stereo-seq and bright-field staining for Visium HD and StrataMap.
     um_per_px : float
-        Physical scale of ``image`` (µm per pixel), at the resolution stored.
+        The physical scale of the image, in micrometres per pixel, at the resolution
+        stored.
     species : str
+        Species name used for marker-panel lookup.
     organ : str
-        Cell-Ontology module name (e.g. ``'whole_brain'``, ``'breast'``). Used to
-        fetch marker genes for the gene panel.
+        Cell-Ontology module name, for example ``'whole_brain'`` or ``'breast'``, used
+        to fetch the marker genes of the gene panel.
     platform : str
-        ``'stereoseq'`` | ``'visiumhd'`` | ``'strata'`` (informational).
+        One of ``'stereoseq'``, ``'visiumhd'`` or ``'strata'``. It is informational.
     origin : tuple(float, float)
-        Shared global µm origin ``(x0, y0)`` = ``raw.obsm['spatial'].min(0)``.
-        Every lattice (coarse HVG grid, fine vector-field grid, voxel mapping)
-        must use this same origin so they align.
+        The shared global origin in micrometres, as ``(x0, y0)``, which is the minimum
+        of ``raw.obsm['spatial']`` along each axis. Every lattice must use this same
+        origin so that they align: the coarse grid for highly variable genes, the fine
+        grid of the vector field, and the voxel mapping.
     affine_px_to_um : numpy.ndarray, optional
-        ``(2, 3)`` affine mapping image pixel ``(px_x=col, px_y=row, 1)`` -> world
-        ``(µm_x, µm_y)``. This is the ONE cross-platform coordinate contract: each
-        loader folds its own convention (StrataMap axis transpose, Stereo-seq
-        mirror-flip, Visium HD lstsq lattice fit) into this matrix, so
-        :meth:`Analysis.downsample_vector` samples voxels identically for all.
-        World µm are converted to grid bins at compute time via ``origin`` +
-        ``bin_um``. ``None`` ⇒ fall back to a plain ``um_per_px`` scale.
+        A 2 by 3 affine mapping an image pixel, given as column, row and one, to world
+        coordinates in micrometres. This is the single cross-platform coordinate
+        contract. Each loader folds its own convention into this matrix, whether that
+        is the StrataMap axis transposition, the Stereo-seq mirror flip or the Visium
+        HD least-squares lattice fit, so that
+        :meth:`Analysis.downsample_vector` samples voxels identically for all of them.
+        World micrometres are converted to grid bins at compute time using ``origin``
+        and the bin size. A value of ``None`` falls back to a plain ``um_per_px``
+        scale.
     he_revert : bool
-        Tissue-mask polarity for Otsu: ``True`` = bright-background/dark-tissue
-        (brightfield H&E, invert before threshold); ``False`` = dark-background/
-        bright-tissue (fluorescence / ssDNA, threshold directly).
+        The polarity the tissue mask assumes when thresholding by Otsu's method.
+        ``True`` means a bright background with dark tissue, as in bright-field
+        staining, which is inverted before thresholding. ``False`` means a dark
+        background with bright tissue, as in fluorescence or ssDNA, which is
+        thresholded directly.
+    meta : dict
+        Any further per-platform metadata, carried through unchanged.
     """
 
     raw: AnnData
@@ -129,6 +175,10 @@ class GridDataset:
     meta: dict = field(default_factory=dict)
 
     def __post_init__(self):
+        """Validate the counts and fill in the origin when it was left at the default.
+
+        :raises ValueError: If ``raw`` carries no ``obsm['spatial']``.
+        """
         if "spatial" not in self.raw.obsm:
             raise ValueError("GridDataset.raw needs obsm['spatial'] (x,y in µm).")
         sp = np.asarray(self.raw.obsm["spatial"])
@@ -137,15 +187,19 @@ class GridDataset:
 
     @property
     def n_genes(self) -> int:
+        """The number of genes in the count matrix."""
         return int(self.raw.n_vars)
 
     def subset_genes(self, genes) -> "GridDataset":
-        """Return a copy of this dataset restricted to ``genes`` (a list of
-        symbols present in ``raw.var_names``), preserving all metadata.
+        """Return a copy of this dataset restricted to the named genes.
 
-        :param genes: Gene symbols to keep; those absent from ``raw.var_names``
-            are ignored.
+        All metadata is preserved.
+
+        :param genes: Gene symbols to keep. Any symbol absent from ``raw.var_names`` is
+            ignored.
         :type genes: list of str
+        :returns: The restricted copy.
+        :rtype: GridDataset
         """
         keep = [g for g in genes if g in set(self.raw.var_names)]
         sub = self.raw[:, keep].copy()
@@ -160,27 +214,28 @@ class GridDataset:
                        image_key: str = "staining", copy: bool = True):
         """Assemble a :class:`spatialdata.SpatialData` from this count sample.
 
-        * ``tables[table_key]`` is the count AnnData (region-less), with all
-          GridDataset metadata stashed in ``uns['cellman']`` so it round-trips.
-        * ``images[image_key]`` is the staining image ``(c, y, x)`` with an
-          **Affine** ``px`` to ``world µm`` transform built from
-          ``affine_px_to_um`` (falls back to an isotropic ``um_per_px`` Scale).
-          This is the single cross-platform coordinate contract, now expressed
-          natively.
+        The table is the count AnnData, carrying no region annotation, with all GridDataset
+        metadata stored in ``uns['cellman']`` so that it survives a round trip. The image is
+        the staining image, shaped channel by y by x, carrying an Affine transform from pixels
+        to world micrometres built from ``affine_px_to_um``, or an isotropic Scale built from
+        ``um_per_px`` when no affine is set. That transform is the single cross-platform
+        coordinate contract, here expressed natively.
 
-        The count pipeline (:meth:`Analysis.compute_vf`,
-        :meth:`~Analysis.downsample_vector`) threads this object through;
+        The count pipeline, meaning :meth:`Analysis.compute_vf` and
+        :meth:`~Analysis.downsample_vector`, threads this object through, and
         :meth:`from_sdata` reconstructs the lightweight view the backend needs.
 
-        :param table_key: Key under which the count table is stored in the
-            resulting SpatialData ``tables``.
+        :param table_key: Key under which the count table is stored in the resulting
+            SpatialData.
         :type table_key: str
-        :param image_key: Key under which the staining image is stored in the
-            resulting SpatialData ``images``.
+        :param image_key: Key under which the staining image is stored in the resulting
+            SpatialData.
         :type image_key: str
-        :param copy: If ``True`` duplicate ``raw`` before adding metadata; pass
-            ``False`` to mutate ``raw`` in place and skip the copy.
+        :param copy: Whether to duplicate ``raw`` before adding metadata to it. Pass ``False``
+            to modify ``raw`` in place and skip the copy.
         :type copy: bool
+        :returns: The assembled SpatialData.
+        :rtype: spatialdata.SpatialData
         """
         import spatialdata as sd
         from spatialdata.models import Image2DModel, TableModel
@@ -224,23 +279,27 @@ class GridDataset:
 
     @classmethod
     def from_sdata(cls, sdata, *, table_key=None, image_key=None) -> "GridDataset":
-        """Reconstruct a GridDataset view from a count SpatialData built by
-        :meth:`to_spatialdata` (reads the count table + ``uns['cellman']`` +
-        staining image). The heavy backend consumes this view directly, so the
-        blur / lookup internals stay array-based and unchanged.
+        """Reconstruct a GridDataset view from a count SpatialData.
 
-        :param sdata: Count SpatialData built by :meth:`to_spatialdata`.
+        The object is expected to be one built by :meth:`to_spatialdata`, and the count table,
+        its ``uns['cellman']`` metadata and the staining image are read back out of it. The
+        heavy backend consumes this view directly, which is what lets the blur and lookup
+        internals stay array-based and unchanged.
+
+        A SpatialData that came straight from ``spatialdata_io.visium_hd`` or
+        ``spatialdata_io.stereoseq``, and therefore carries no ``uns['cellman']``, is
+        converted on the fly by
+        :func:`ssaft._io._spatialdata_io.grid_from_spatialdata_io`. The input is not modified
+        in either case.
+
+        :param sdata: The count SpatialData to read.
         :type sdata: spatialdata.SpatialData
-        :param table_key: Count-table key; defaults to the table carrying
-            ``uns['cellman']``.
+        :param table_key: Count-table key. Defaults to the table carrying ``uns['cellman']``.
         :type table_key: str, optional
-        :param image_key: Staining-image key; defaults to the ``image_key``
-            stored in the metadata.
+        :param image_key: Staining-image key. Defaults to the key recorded in the metadata.
         :type image_key: str, optional
-
-        A SpatialData straight from ``spatialdata_io.visium_hd`` or
-        ``spatialdata_io.stereoseq`` (no ``uns['cellman']``) is converted on the fly by
-        :func:`ssaft._io._spatialdata_io.grid_from_spatialdata_io`; the input is not modified.
+        :returns: The reconstructed view.
+        :rtype: GridDataset
         """
         from ._io._spatialdata_io import grid_from_spatialdata_io, is_count_reader_output
         if is_count_reader_output(sdata):
@@ -275,23 +334,28 @@ class GridDataset:
     @classmethod
     def from_sdata_zarr(cls, sdata_path, *, table_key="table",
                         image_key=None) -> "GridDataset":
-        """FAST count-SpatialData reader (read-only). Reads the store zarr DIRECTLY
-        (X CSR + ``obsm/spatial`` via zarr; ``var``/``uns`` via
-        ``anndata.read_elem``) and wraps counts in :class:`_RawView`, bypassing
-        ``spatialdata.read_zarr`` / ``anndata.read_zarr`` whose ~144s cost on huge
-        (10^8-row) count tables is dominated by materializing 10^8 string
-        ``obs_names`` (never used by the count backend). ~25-30x faster; the
-        resulting GridDataset is consumed identically by aggregate_to_grid /
-        compute_vf. Use in place of ``sd.read_zarr(path)`` + ``from_sdata(sdata)``
-        for the heavy count path (no ``to_spatialdata`` on the result).
+        """Read a count SpatialData store directly from zarr, quickly and read-only.
+
+        The matrix is read as compressed sparse rows, ``obsm/spatial`` is read through zarr,
+        and ``var`` and ``uns`` are read with ``anndata.read_elem``. The counts are then
+        wrapped in :class:`_RawView`. This bypasses ``spatialdata.read_zarr`` and
+        ``anndata.read_zarr``, whose cost of roughly 144 seconds on a count table of a hundred
+        million rows is dominated by materializing that many string values for ``obs_names``,
+        which the count backend never uses. The result is about 25 to 30 times faster, and the
+        GridDataset it returns is consumed identically by ``aggregate_to_grid`` and
+        ``compute_vf``.
+
+        Use this in place of ``sd.read_zarr(path)`` followed by ``from_sdata(sdata)`` on the
+        heavy count path. Do not call ``to_spatialdata`` on the result.
 
         :param sdata_path: Filesystem path to the SpatialData zarr store.
         :type sdata_path: str or pathlib.Path
         :param table_key: Count-table key within the store.
         :type table_key: str
-        :param image_key: Staining-image key; defaults to the ``image_key``
-            stored in the metadata.
+        :param image_key: Staining-image key. Defaults to the key recorded in the metadata.
         :type image_key: str, optional
+        :returns: The reconstructed view.
+        :rtype: GridDataset
         """
         import zarr
         from scipy.sparse import csr_matrix
@@ -314,6 +378,18 @@ class GridDataset:
         ig = zarr.open_group(ipath, mode="r")
 
         def _find(g, pre=""):
+            """Walk a zarr group depth first and return the path of its first array.
+
+            Image elements may be stored plainly or as a multiscale pyramid, so the array is found
+            by descent rather than by assuming a fixed layout.
+
+            :param g: The zarr group to search.
+            :param pre: Path prefix accumulated so far during the descent.
+            :type pre: str
+            :returns: The full path of the first array found, or ``None`` when the group holds
+                none.
+            :rtype: str or None
+            """
             for k in g.keys():
                 full = f"{pre}/{k}" if pre else k
                 node = g[k]

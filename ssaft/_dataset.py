@@ -1,3 +1,13 @@
+"""The dataset object: the store behind one analysis, and the plots drawn from it.
+
+:class:`Dataset` owns the zarr group that holds every array an analysis produces,
+from the vector field through the downsampled vectors to the cell-type map, and it
+lazily loads each of them on first access. It also carries the coordinate information
+needed to put those arrays back into the micrometre frame of the input, and the
+plotting and writing methods that do so.
+
+An :class:`~ssaft.Analysis` computes; a ``Dataset`` remembers and renders.
+"""
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import to_rgba
@@ -30,26 +40,36 @@ except ImportError:
     corr = lambda a, b: np.corrcoef(a, b)[0, 1]
 
 class Dataset(object):
-    """
-    A class to store initial values and results of a ``ssaft`` analysis.
+    """Hold the inputs and the results of one ``ssaft`` analysis.
 
-    :param genes: The genes that will be used for the analysis.
-    :type genes: list(str)    
-    :param locations: Location of the mRNAs in um, given as a list of
-        N x D ndarrays (N is number of mRNAs, D is number of dimensions).
+    :param genes: The genes used for the analysis.
+    :type genes: list(str)
+    :param locations: Locations of the molecules in micrometres, given as a list of
+        arrays of shape N by D, where N is the number of molecules and D the number of
+        dimensions.
     :type locations: list(numpy.ndarray)
-    :param width: Width of the image in um.
+    :param width: Width of the image in micrometres.
     :type width: float
-    :param height: Height of the image in um.
+    :param height: Height of the image in micrometres.
     :type height: float
-    :param depth: Depth of the image in um. Depth == 1 means 2D image.
+    :param depth: Depth of the image in micrometres. A depth of one means a planar image.
     :type depth: float
-    :param save_dir: Directory to store intermediate data as zarr groups (e.g. density / vector field).
-        Any data which already exists will be loaded and reused.
+    :param save_dir: Directory in which intermediate data such as the density and the
+        vector field are stored as zarr groups. Any data already present there is loaded
+        and reused.
     :type save_dir: str
     """
         
     def __init__(self, store=None, in_memory=False):
+        """Open or create the backing store and clear every cached result.
+
+        :param store: Path to a zarr store, an already-open zarr store, or ``None`` for an
+            in-memory group that is never written to disk.
+        :type store: str or zarr store or None
+        :param in_memory: Whether to materialize the vector field in memory rather than
+            leaving it lazy. This trades memory for speed on repeated access.
+        :type in_memory: bool
+        """
         self._vf = None
         self._vf_norm = None
         self._vf_normalized = None
@@ -73,6 +93,18 @@ class Dataset(object):
     
     @staticmethod
     def _get_zarr_group(store):
+        """Open a zarr group, preserving the on-disk format version of an existing store.
+
+        A store written by zarr version 2 carries a ``.zgroup`` file and one written by
+        version 3 carries ``zarr.json``. The format is detected from whichever is present and
+        passed back when opening, so that an existing store is never reopened under the other
+        version's layout. A store holding both is treated as version 2.
+
+        :param store: Path to a store, an already-open store, or ``None``.
+        :returns: A pair holding the store, which is ``None`` for an in-memory group, and the
+            opened group.
+        :rtype: tuple
+        """
         if store is None:
             return None, zarr.group()
 
@@ -101,14 +133,19 @@ class Dataset(object):
 
     @staticmethod
     def _zarr_create_array(group, name, shape, dtype):
-        """Create a zero-filled array inside ``group``, respecting the
-        group's zarr_format.
+        """Create a zero-filled array inside a group, respecting the group's format version.
 
-        zarr 3's ``Group.zeros(...)`` always writes v3 metadata
-        (``zarr.json``) regardless of the parent group's format, which
-        breaks lookups when the group is opened in v2 mode. This helper
-        prefers ``create_array`` (which respects ``group.metadata``) and
-        falls back to ``create_dataset`` for legacy zarr 2.
+        The ``zeros`` method of a zarr version 3 group always writes version 3 metadata,
+        regardless of the parent group's format, which breaks lookups when that group is
+        opened in version 2 mode. This helper prefers ``create_array``, which respects the
+        group's own metadata, and falls back to ``create_dataset`` for older stores.
+
+        :param group: The group to create the array in.
+        :param name: Name of the new array.
+        :type name: str
+        :param shape: Shape of the new array.
+        :param dtype: Element type of the new array.
+        :returns: The created array.
         """
         shape = tuple(shape) if hasattr(shape, '__iter__') else (int(shape),)
         if hasattr(group, 'create_array'):
@@ -117,7 +154,12 @@ class Dataset(object):
 
     @staticmethod
     def _zarr_store_path(store):
-        """Return the on-disk path of a zarr store, compatible with zarr 2/3."""
+        """Return the on-disk path of a zarr store, for either format version.
+
+        :param store: The store to inspect, which may be ``None``.
+        :returns: The path as a string, or ``None`` when the store has none.
+        :rtype: str or None
+        """
         if store is None:
             return None
         for attr in ('root', 'path'):
@@ -127,6 +169,11 @@ class Dataset(object):
         return None
     
     def _try_flush(self):
+        """Flush the backing store if it has one, ignoring any failure.
+
+        Flushing is a durability convenience rather than a correctness requirement, so a
+        store that does not support it, or that fails to do it, is passed over silently.
+        """
         if self.zarr_store is not None:
             try:
                 self.zarr_store.flush()
@@ -134,14 +181,18 @@ class Dataset(object):
                 pass
     
     def extract_spatialdata_scale(self, sdata, element_name='transcripts'):
-        """
-        Extract coordinate transformation scale from SpatialData for proper coordinate mapping.
-        
-        :param sdata: SpatialData object containing points data
+        """Read the coordinate transformation of a points element and remember its scale.
+
+        The scale is needed to map analysis coordinates back onto the input's own frame. The
+        full affine is also kept, in ``_global_affine``, so that a rotated or sheared frame is
+        handled rather than only a scaled one.
+
+        :param sdata: SpatialData object containing the points.
         :type sdata: spatialdata.SpatialData
-        :param element_name: Name of the points element to extract scale from
+        :param element_name: Name of the points element to read the scale from.
         :type element_name: str
-        :returns: Tuple of (x_scale, y_scale) or None if extraction fails
+        :returns: The pair of scales along x and y, or ``None`` when the element is absent,
+            when spatialdata is not installed, or when the transformation could not be read.
         :rtype: tuple or None
         """
         if not _SPATIALDATA_AVAILABLE:
@@ -168,20 +219,28 @@ class Dataset(object):
     
     @property
     def downsampled_vectors(self):
+        """The sampled lattice positions, as voxel indices."""
         return self._downsampled_vectors
     
     @downsampled_vectors.setter
     def downsampled_vectors(self, v):
+        """Set the sampled lattice positions and invalidate the vectors cached from them.
+
+        :param v: The new positions, as voxel indices.
+        """
         self._downsampled_vectors = v
         self._selected_vectors = None
 
     @property
     def downsampled_vf_norm(self):
-        """Per-downsampled-vector local KDE density (vf_norm at each sampled
-        position), shape (N,), aligned row-for-row with ``downsampled_vectors``
-        and ``normalized_vectors``. Computed in ``_select_vectors`` and persisted
-        by ``downsample_vector``; used downstream as a density signal for
-        background / low-density-voxel detection."""
+        """The local density at each sampled position.
+
+        This is the value of ``vf_norm`` at the position of each downsampled vector, of shape
+        ``(N,)`` and aligned row for row with ``downsampled_vectors`` and
+        ``normalized_vectors``. It is computed in ``_select_vectors``, persisted by
+        ``downsample_vector``, and used downstream as the density signal for detecting
+        background and low-density voxels.
+        """
         if self._downsampled_vf_norm is not None:
             return self._downsampled_vf_norm
         if 'downsampled_vf_norm' in self.zarr_group:
@@ -191,10 +250,19 @@ class Dataset(object):
 
     @downsampled_vf_norm.setter
     def downsampled_vf_norm(self, v):
+        """Set the per-position density, or clear it.
+
+        :param v: The new densities, or ``None`` to clear them.
+        """
         self._downsampled_vf_norm = None if v is None else np.asarray(v)
 
     @property
     def selected_vectors(self):
+        """The raw field vectors at the sampled positions.
+
+        They are read from the store when it holds them, and otherwise gathered from the
+        vector field at the downsampled positions and cached.
+        """
         if 'selected_vectors' in self.zarr_group:
             self._selected_vectors = da.from_zarr(self.zarr_group['selected_vectors'])
             return self._selected_vectors
@@ -208,17 +276,27 @@ class Dataset(object):
     
     @selected_vectors.setter
     def selected_vectors(self, v):
+        """Set the raw field vectors at the sampled positions.
+
+        :param v: The new vectors.
+        """
         self._selected_vectors = v
 
     @property
     def vf(self):
-        """
-        Vector field as a numpy.ndarray.
-        """
+        """The vector field, as an array of shape ``(x, y, z, genes)``."""
         return self._vf
     
     @vf.setter
     def vf(self, vf):
+        """Set the vector field and invalidate the norm computed from it.
+
+        The field is materialized in memory when the dataset was opened with ``in_memory``,
+        and left lazy otherwise. Any ``vf_norm`` already in the store is deleted, because it
+        no longer describes this field.
+
+        :param vf: The new vector field.
+        """
         if self.in_memory:
             self._vf = da.array(vf.compute())
         else:
@@ -231,10 +309,18 @@ class Dataset(object):
         
     @property
     def vf_normalized(self):
+        """The row-normalized vector field, which is what the mappers score against."""
         return self._vf_normalized
         
     @vf_normalized.setter
     def vf_normalized(self, vf_normalized):
+        """Set the row-normalized vector field.
+
+        It is materialized in memory when the dataset was opened with ``in_memory``, and left
+        lazy otherwise.
+
+        :param vf_normalized: The new normalized field.
+        """
         if self.in_memory:
             self._vf_normalized = da.array(vf_normalized.compute())
         else:
@@ -243,6 +329,12 @@ class Dataset(object):
     @property
     def vf_norm(self):
 
+        """The total density per voxel, summed over genes.
+
+        The value is returned from the cache when it is loaded, read from the store when it
+        is present there, and otherwise computed from the vector field, written to the store
+        and then cached. It is ``None`` when no vector field exists yet.
+        """
         if self._vf_norm is not None:
             return self._vf_norm
 
@@ -260,12 +352,12 @@ class Dataset(object):
         return self._vf_norm
 
     def get_celltype_correlation(self, idx):
-        """
-        Get maximum correlation values of a cell type map between the given cluster's centroid to the vector field.
+        """Return the correlation map restricted to one cell type.
 
-        :param idx: Index of a cluster
+        :param idx: Index of the cluster.
         :type idx: int
-        :return: Correlation values of a cell type map of the specified cluster's centroid
+        :return: The correlation values where the map holds that cluster, and minus one
+            everywhere else.
         :rtype: numpy.ndarray
         """
         rtn = np.zeros_like(self.max_correlations) - 1
@@ -273,12 +365,12 @@ class Dataset(object):
         return rtn
 
     def get_celltype_probability(self, idx):
-        """
-        Get maximum probability map of a cell type.
+        """Return the probability map restricted to one cell type.
 
-        :param idx: Index of a cluster
+        :param idx: Index of the cluster.
         :type idx: int
-        :return: Maximum probability map
+        :return: The probabilities where the map holds that cluster, and minus one everywhere
+            else.
         :rtype: numpy.ndarray
         """
         rtn = np.zeros_like(self.max_probabilities) - 1
@@ -287,7 +379,18 @@ class Dataset(object):
 
 
     def _grid_to_original_coords(self, grid_x, grid_y, grid_z=None):
-        """Convert KDE grid coordinates to original SpatialData coordinates."""
+        """Convert lattice indices to the coordinate frame of the input.
+
+        Each index is scaled by the sampling distance and shifted by the coordinate offset.
+        When the dataset carries neither, the indices are returned unchanged.
+
+        :param grid_x: Lattice indices along x.
+        :param grid_y: Lattice indices along y.
+        :param grid_z: Lattice indices along z, or ``None`` for a planar map.
+        :returns: The three coordinate arrays, where the third is ``None`` if no depth was
+            given or the offset carries none.
+        :rtype: tuple
+        """
         if not hasattr(self, 'coordinate_offset') or not hasattr(self, 'sampling_distance'):
             return grid_x, grid_y, grid_z
 
@@ -301,7 +404,10 @@ class Dataset(object):
     
     @property
     def downsampled_vectors_original_coords(self):
-        """Return downsampled_vectors converted to the original coordinate system."""
+        """The sampled positions, converted to the coordinate frame of the input.
+
+        This is ``None`` when no positions have been sampled yet.
+        """
         if not hasattr(self, 'downsampled_vectors') or self.downsampled_vectors is None:
             return None
             
@@ -314,12 +420,16 @@ class Dataset(object):
             return (orig_x, orig_y, grid_z)
 
     def _get_plot_extent(self):
-        """Compute the extent used for matplotlib imshow.
+        """Compute the extent that ``imshow`` should be given for this dataset.
 
-        ``original_coordinate_bounds`` is written in two layouts by different
-        producers: the SSAM path stores nested ``[[x0,x1],[y0,y1],[z0,z1]]``
-        while the GridDataset 'blur' count path stores a flat
-        ``[minx,miny,minz, maxx,maxy,maxz]``. Handle both.
+        ``original_coordinate_bounds`` is written in two layouts by different producers. The
+        molecule path stores it nested, as pairs of low and high values per axis, while the
+        count path of the grid backend stores it flat, as the three minima followed by the
+        three maxima. Both are handled here, as is the four-element flat form.
+
+        :returns: The extent as left, right, bottom and top, or ``None`` when the dataset
+            carries no bounds or carries them in an unrecognized layout.
+        :rtype: list or None
         """
         if not hasattr(self, 'original_coordinate_bounds') or self.original_coordinate_bounds is None:
             return None
@@ -334,6 +444,35 @@ class Dataset(object):
         return None
 
     def _plot_celltypes_map(self, data, background="black", centroid_indices=[], colors=None, cmap='jet', rotate=0, min_r=0.6, set_alpha=False, z=None, use_original_coords=True):
+        """Draw one layer of a cell-type map onto the current axes.
+
+        A planar map is treated as a single layer. Voxels that hold no cell type are drawn
+        fully transparent rather than in the background colour, so that whatever was plotted
+        underneath stays visible.
+
+        :param data: The cell-type map, of shape ``(x, y)`` or ``(x, y, z)``, where minus one
+            means no cell type.
+        :param background: Colour of the axes behind the map.
+        :type background: str or list(float)
+        :param centroid_indices: The cell types to draw. An empty list draws all of them.
+        :type centroid_indices: list(int)
+        :param colors: Colour per cell type, which overrides ``cmap``.
+        :type colors: list or None
+        :param cmap: Colormap sampled for the cell types when ``colors`` is not given.
+        :type cmap: str or matplotlib.colors.Colormap
+        :param rotate: Rotation of the plot, as 0, 1, 2 or 3 quarter turns.
+        :type rotate: int
+        :param min_r: Lowest opacity used when ``set_alpha`` scales opacity by score.
+        :type min_r: float
+        :param set_alpha: Whether to scale each pixel's opacity by its correlation or
+            probability.
+        :type set_alpha: bool
+        :param z: Layer to draw. Defaults to the middle layer of the map.
+        :type z: int or None
+        :param use_original_coords: Accepted for signature compatibility. The extent is taken
+            from the dataset's own bounds in either case.
+        :type use_original_coords: bool
+        """
         data = np.asarray(data)
         if data.ndim == 2:                       # 2D map (no z axis) -> add a singleton z plane
             data = data[..., None]
@@ -392,36 +531,41 @@ class Dataset(object):
             plt.gca().invert_xaxis()
 
     def plot_celltypes_map(self, background="black", centroid_indices=[], colors=None, cmap='jet', rotate=0, min_r=0.6, set_alpha=False, z=None, save_to_spatialdata=True, show_annotation=False, annotation_csv=None, n_celltypes=None):
-        """
-        Plot the merged cell-type map.
+        """Plot the filtered cell-type map.
 
-        :param background: Set background color of the cell-type map.
+        :param background: Background colour of the cell-type map.
         :type background: str or list(float)
-        :param centroid_indices: The centroids which will be in the cell type map. If not given, the cell-type map is drawn with all centroids.
+        :param centroid_indices: The cell types to include. When not given, every cell type is
+            drawn.
         :type centroid_indices: list(int)
-        :param colors: Color of the clusters. Overrides `cmap` parameter.
+        :param colors: Colour of the clusters, which overrides the ``cmap`` parameter.
         :type colors: list(str), list(list(float))
         :param cmap: Colormap for the clusters.
         :type cmap: str or matplotlib.colors.Colormap
-        :param rotate: Rotate the plot. Possible values are 0, 1, 2, and 3.
+        :param rotate: Rotate the plot. The possible values are 0, 1, 2 and 3.
         :type rotate: int
-        :param min_r: Minimum correlation threshold for the cell-type map.
-            This value is only for the plotting, does not affect to the cell-type maps generated by `filter_celltypemaps`.
+        :param min_r: Minimum correlation threshold for the cell-type map. This value affects
+            the plot only and does not change the maps produced by ``filter_celltypemaps``.
         :type min_r: float
-        :param set_alpha: Set alpha of each pixel based on the correlation.
-            Not properly implemented yet, doesn't work properly with the background other than black.
+        :param set_alpha: Set the opacity of each pixel from its correlation. This is not
+            fully implemented and does not behave correctly against a background other than
+            black.
         :type set_alpha: bool
-        :param z: Z index to slice 3D cell-type map.
-            If not given, the slice at the middle will be used.
+        :param z: Index of the layer to slice out of a three-dimensional cell-type map. When
+            not given, the middle layer is used.
         :type z: int
-        :param save_to_spatialdata: Whether to save the celltype map to SpatialData images if input was SpatialData.
+        :param save_to_spatialdata: Whether to write the cell-type map into the SpatialData
+            images as well, when the input was a SpatialData object.
         :type save_to_spatialdata: bool
-        :param show_annotation: If True and annotation_csv is provided, draw a legend with celltype names.
+        :param show_annotation: Whether to draw a legend of cell-type names, which also
+            requires ``annotation_csv``.
         :type show_annotation: bool
-        :param annotation_csv: Path to annotation CSV (must have 'cluster', 'celltype', optionally 'global_cluster' columns).
+        :param annotation_csv: Path to an annotation CSV file, which must have a ``cluster``
+            and a ``celltype`` column and may have a ``global_cluster`` column.
         :type annotation_csv: str or None
-        :param n_celltypes: Total number of globally unique celltypes. Used with 'global_cluster' column to assign
-            consistent colors across tiles. If None, inferred from max(global_cluster) + 1.
+        :param n_celltypes: Total number of globally unique cell types, used together with the
+            ``global_cluster`` column to keep colours consistent across tiles. When ``None`` it
+            is inferred as one more than the largest global cluster.
         :type n_celltypes: int or None
         """
 
@@ -519,65 +663,68 @@ class Dataset(object):
                            background="white", z=None, min_r=0.6, set_alpha=False,
                            labels_key="ssaft_celltype_map",
                            image_key="ssaft_celltype_map_rgb"):
-        """Write the filtered cell-type map into ``sdata`` as two aligned rasters.
+        """Write the filtered cell-type map into a SpatialData as two aligned rasters.
 
-        Normally reached through :meth:`Analysis.filter_celltypemaps`, which passes
+        This is normally reached through :meth:`Analysis.filter_celltypemaps`, which passes
         the palette fixed at ``map_celltypes`` time.
 
-        * ``labels[labels_key]`` — integer raster; pixel value = ``celltype id +
-          1`` (0 = background / filtered out). This is the idiomatic categorical
-          (Labels2DModel) representation of the segmentation-free cell-type map.
-          A map with more than one z layer is written whole, as a ``(z, y, x)``
-          Labels3DModel whose z axis is the map's µm z (``coordinate_offset[2] +
-          k * sampling_distance``).
-        * ``images[image_key]`` — an RGB rendering for quick visual inspection, of
-          layer ``z`` on a 3D map. (SpatialData keys are globally unique across
-          element types, so the RGB image cannot share the labels' key; it takes the
-          ``…_rgb`` suffix.)
+        The first raster, under ``labels_key``, is an integer one whose pixel value is the
+        cell-type identifier plus one, with zero meaning background or filtered out. That is
+        the idiomatic categorical representation of a segmentation-free cell-type map. A map
+        with more than one layer is written whole, as a three-dimensional labels element
+        indexed by depth, row and column, whose depth axis is the map's own depth in
+        micrometres.
 
-        Both carry the SAME xy affine: ``Scale(sampling_distance) + Translation(origin)``
-        takes a pixel to the map's µm frame, and that frame is carried into
-        ``'global'`` by :meth:`_map_to_global_affine` -- the transcripts element's own
-        transformation when there is one (Xenium, MERSCOPE: µm -> image pixels), the
-        identity otherwise (count platforms, whose tables are already in ``'global'``
-        µm). The map therefore overlays the input table / points / staining image.
+        The second raster, under ``image_key``, is an RGB rendering for quick visual
+        inspection, showing layer ``z`` of a three-dimensional map. SpatialData keys are
+        globally unique across element types, so the rendering cannot share the labels' key
+        and takes a suffix instead.
 
-        No annotating table is written: the celltype names live once, in the
+        Both carry the same planar affine. A scale by the sampling distance followed by a
+        translation to the origin takes a pixel into the map's micrometre frame, and that
+        frame is carried into the global one by :meth:`_map_to_global_affine`. That is the
+        transcripts element's own transformation when there is one, as on Xenium and
+        MERSCOPE, where it maps micrometres to image pixels, and the identity otherwise, as
+        on the count platforms, whose tables are already in global micrometres. The map
+        therefore overlays the input table, points and staining image.
+
+        No annotating table is written. The cell-type names live once, in the
         ``ssaft_downsampled_vectors`` table that :meth:`Analysis.map_celltypes` attaches,
-        whose categorical is index-aligned with these pixel values (``names[pixel
-        - 1]``). Re-filtering therefore only ever replaces rasters.
-
-        ``sdata`` defaults to the SpatialData that was fed to ``compute_vf`` /
-        ``downsample_vector`` (remembered as ``_original_input_data``). Returns it.
+        whose categorical is index-aligned with these pixel values, so that the name of a
+        pixel is the entry one position below its value. Re-filtering therefore only ever
+        replaces rasters.
 
         :param sdata: Target SpatialData to write the elements into. Defaults to the
-            SpatialData remembered from ``compute_vf`` / ``downsample_vector``.
+            SpatialData remembered from ``compute_vf`` or ``downsample_vector``.
         :type sdata: spatialdata.SpatialData or None
-        :param colors: Per-celltype colours, indexed by celltype id. Pass the
-            palette stored at ``map_celltypes`` time so every view agrees;
-            ``None`` samples ``cmap`` over the ids present in the map.
+        :param colors: Colour per cell type, indexed by identifier. Pass the palette stored at
+            ``map_celltypes`` time so that every view agrees. Passing ``None`` samples ``cmap``
+            over the identifiers present in the map.
         :type colors: list or None
         :param cmap: Colormap used for the clusters when ``colors`` is not given.
         :type cmap: str or matplotlib.colors.Colormap
-        :param background: Colour the filtered-out voxels are composited onto.
-            Defaults to ``"white"``: the RGB image carries no alpha channel, so
-            whatever is behind a background voxel becomes part of the picture, and
-            a figure is read on a white page. ``"black"`` restores the old look.
-            Anything ``matplotlib.colors.to_rgba`` accepts works.
+        :param background: Colour the filtered-out voxels are composited onto. This defaults
+            to white, because the rendering carries no alpha channel, so whatever is behind a
+            background voxel becomes part of the picture, and a figure is read on a white
+            page. Passing black restores the older look. Anything
+            ``matplotlib.colors.to_rgba`` accepts will work.
         :type background: str or list(float)
-        :param z: 3D map: the layer rendered to ``images[image_key]``. Defaults to the
-            middle one, ``int(n_layers / 2)``. The labels keep every layer.
+        :param z: On a three-dimensional map, the layer rendered into the image element. It
+            defaults to the middle one. The labels keep every layer.
         :type z: int or None
-        :param min_r: Minimum correlation used when ``set_alpha`` scales opacity.
+        :param min_r: Lowest opacity used when ``set_alpha`` scales opacity.
         :type min_r: float
-        :param set_alpha: Whether to scale per-pixel opacity by correlation / probability.
+        :param set_alpha: Whether to scale each pixel's opacity by its correlation or
+            probability.
         :type set_alpha: bool
-        :param labels_key: Key for the integer labels element written into ``sdata``.
+        :param labels_key: Key of the integer labels element written into ``sdata``.
         :type labels_key: str
-        :param image_key: Key for the RGB image element written into ``sdata``.
+        :param image_key: Key of the RGB image element written into ``sdata``.
         :type image_key: str
-        :returns: The SpatialData object with the two elements added.
+        :returns: The SpatialData object, with the two elements added.
         :rtype: spatialdata.SpatialData
+        :raises ImportError: If spatialdata is not installed.
+        :raises ValueError: If no SpatialData was given and none was remembered.
         """
         if not _SPATIALDATA_AVAILABLE:
             raise ImportError("spatialdata not available — cannot write celltype map")
@@ -669,7 +816,12 @@ class Dataset(object):
         return sdata
 
     def _count_frame(self):
-        """The reader frame ``compute_vf`` recorded for spatialdata_io count input, or ``None``."""
+        """Return the reader frame ``compute_vf`` recorded for count input, if any.
+
+        :returns: The recorded frame, or ``None`` when the input was not read by
+            ``spatialdata_io`` or the frame was never recorded.
+        :rtype: dict or None
+        """
         zg = getattr(self, "zarr_group", None)
         if zg is None:
             return None
@@ -677,11 +829,17 @@ class Dataset(object):
         return dict(f) if f else None
 
     def _map_frame(self, sdata):
-        """``(coordinate_system, (3, 3) affine)`` carrying the map's µm frame into ``sdata``.
+        """Return the coordinate system and affine that carry the map into a SpatialData.
 
-        Count input read straight from ``spatialdata_io`` has no ``'global'`` µm frame, so
-        the map goes back into the reader's own coordinate system (recorded by
-        ``compute_vf``); everything else is written into ``'global'`` as before.
+        Count input read straight from ``spatialdata_io`` has no global frame in micrometres,
+        so the map goes back into the reader's own coordinate system, which ``compute_vf``
+        recorded. Everything else is written into the global frame, as before.
+
+        :param sdata: The SpatialData the map will be written into.
+        :type sdata: spatialdata.SpatialData
+        :returns: A pair holding the name of the target coordinate system and the 3 by 3
+            affine into it.
+        :rtype: tuple
         """
         f = self._count_frame()
         if f is not None:
@@ -690,13 +848,18 @@ class Dataset(object):
 
     @staticmethod
     def _map_to_global_affine(sdata):
-        """``(3, 3)`` affine from the cell-type map's µm frame to ``'global'``.
+        """Return the affine from the cell-type map's micrometre frame to the global one.
 
-        The transcript backend builds the map in the INTRINSIC coordinates of the points
-        element it read, so that element's own transformation is what carries the map into
-        ``'global'`` (µm -> mosaic/morphology pixels on Xenium and MERSCOPE). Count
-        platforms have no points element and their tables are already in ``'global'`` µm,
-        so the map needs no further transformation there.
+        The transcript backend builds the map in the intrinsic coordinates of the points
+        element it read, so that element's own transformation is what carries the map into the
+        global frame. On Xenium and MERSCOPE that transformation maps micrometres to mosaic or
+        morphology pixels. Count platforms have no points element, and their tables are
+        already in global micrometres, so there the map needs no further transformation.
+
+        :param sdata: The SpatialData the map will be written into.
+        :type sdata: spatialdata.SpatialData
+        :returns: The 3 by 3 affine, which is the identity when there is nothing to apply.
+        :rtype: numpy.ndarray
         """
         from spatialdata.transformations import get_transformation
         points = getattr(sdata, "points", None) or {}
@@ -708,9 +871,17 @@ class Dataset(object):
         return np.asarray(t.to_affine_matrix(input_axes=("x", "y"), output_axes=("x", "y")), dtype=float)
 
     def _celltype_map_origin(self, sdata):
-        """World-µm origin ``(x0, y0)`` of the vf grid: count platforms store it in
-        the count table's ``uns['cellman']['origin']``; otherwise fall back to the
-        dataset ``coordinate_offset``; otherwise ``(0, 0)``."""
+        """Return the world origin of the vector-field lattice, in micrometres.
+
+        Count platforms store it in the count table, under ``uns['cellman']['origin']``.
+        Failing that, the recorded reader frame is consulted, then the dataset's own
+        coordinate offset, and the origin falls back to zero.
+
+        :param sdata: The SpatialData the map will be written into.
+        :type sdata: spatialdata.SpatialData
+        :returns: The origin as a pair of coordinates in micrometres.
+        :rtype: tuple
+        """
         try:
             for t in sdata.tables.values():
                 cm = t.uns.get("cellman", {})
@@ -727,10 +898,15 @@ class Dataset(object):
         return 0.0, 0.0
 
     def celltype_names_colors(self):
-        """``(names, colors)`` of the celltype ids, from the store; ``None`` if absent.
+        """Return the cell-type names and colours recorded in the store.
 
-        Written by ``map_celltypes``; the single source for celltype naming and
-        colour, shared by the labels rendering, the annotated table and any legend.
+        These are written by ``map_celltypes`` and are the single source of cell-type naming
+        and colour, shared by the labels rendering, the annotated table and any legend.
+
+        :returns: A pair holding the names, indexed by cell-type identifier, and the colours.
+            Both are ``None`` when the store holds no names, and the colours alone are
+            ``None`` when no palette was recorded.
+        :rtype: tuple
         """
         zg = self.zarr_group
         if 'celltype_names' not in zg:
@@ -743,8 +919,24 @@ class Dataset(object):
                                           centroid_indices=[], colors=None, cmap='jet',
                                           rotate=0, min_r=0.6, set_alpha=False, z=None,
                                           image_name="ssaft_celltype_map"):
-        """``plot_celltypes_map(save_to_spatialdata=True)`` routes here, which
-        delegates to :meth:`write_celltype_map` (labels + RGB image + annotating table)."""
+        """Write the cell-type map into the remembered SpatialData, ignoring any failure.
+
+        ``plot_celltypes_map`` routes here when asked to save, and this method delegates to
+        :meth:`write_celltype_map`, which writes the labels and the RGB rendering.
+
+        :param data: Accepted for signature compatibility. The filtered map is read from the
+            dataset instead.
+        :param background: Colour the filtered-out voxels are composited onto.
+        :param centroid_indices: Accepted for signature compatibility and unused.
+        :param colors: Colour per cell type.
+        :param cmap: Colormap used when no colours are given.
+        :param rotate: Accepted for signature compatibility and unused.
+        :param min_r: Lowest opacity used when ``set_alpha`` scales opacity.
+        :param set_alpha: Whether to scale opacity by score.
+        :param z: Layer rendered into the image element.
+        :param image_name: Accepted for signature compatibility. The element keys are those of
+            :meth:`write_celltype_map`.
+        """
         try:
             self.write_celltype_map(colors=colors, cmap=cmap, background=background,
                                     z=z, min_r=min_r, set_alpha=set_alpha)
@@ -752,44 +944,51 @@ class Dataset(object):
             print(f"Warning: Failed to save celltype map to SpatialData: {e}")
 
     def plot_image(self, source, image_key='he', aspect='equal', **kwargs):
-        """
-        Display an H&E / morphology / staining image in global µm coordinates.
+        """Display a staining or morphology image in global micrometre coordinates.
 
-        Call this before :meth:`plot_downsampled_vector` in the same code
-        cell so the two plots overlay on the same axes (matplotlib uses
-        the same y-flipped convention thanks to the inverted ``extent``).
+        Call this before :meth:`plot_downsampled_vector` in the same code cell, so that the
+        two plots overlay on the same axes. Matplotlib then uses the same flipped convention
+        along y, thanks to the inverted extent.
 
-        The function accepts two input forms:
+        The function accepts two forms of input.
 
-        1. **File path** (``source`` is ``str`` / ``Path``) — opens an
-           OME-TIFF / PNG / JPG with PIL. The image is assumed to span
-           exactly the transcript bounding box stored in
-           ``original_coordinate_bounds`` (typical post-crop H&E tile).
-           Extent in global µm is computed as
-           ``original_coordinate_bounds * (x_scale, y_scale)``.
+        The first is a file path, as a string or a path object, which is opened with PIL and
+        may be an OME-TIFF, a PNG or a JPEG. The image is assumed to span exactly the
+        molecule bounding box recorded in ``original_coordinate_bounds``, which is the usual
+        case for a cropped tile. Its extent in global micrometres is that box scaled by the
+        dataset's own scales.
 
-        2. **SpatialData** (``source`` is a ``spatialdata.SpatialData``) —
-           the image element selected by ``image_key`` is rendered using
-           its own global extent (via ``spatialdata.get_extent``). This
-           respects whatever transformation lives on the element, which
-           is the correct alignment with cell/transcript coordinates.
+        The second is a SpatialData object, in which case the image element named by
+        ``image_key`` is rendered over its own global extent, obtained through
+        ``spatialdata.get_extent``. That respects whatever transformation lives on the
+        element, which is the correct alignment with cell and molecule coordinates.
 
-        :param source: Either a path to an image file, or a SpatialData object
-            containing the desired image element.
+        :param source: Either a path to an image file, or a SpatialData object containing the
+            image element.
         :type source: str, pathlib.Path, or spatialdata.SpatialData
-        :param image_key: Image element key when ``source`` is a SpatialData object.
-            Use ``'morphology_focus'`` (Xenium), ``'DAPI'`` (Merscope),
-            ``'hires_image'`` (Visium), etc., to render the morphology
-            channel instead of H&E. Ignored when ``source`` is a path.
+        :param image_key: Image element key, used when ``source`` is a SpatialData object. Use
+            ``'morphology_focus'`` on Xenium, ``'DAPI'`` on MERSCOPE or ``'hires_image'`` on
+            Visium to render the morphology channel instead of the bright-field image. It is
+            ignored when ``source`` is a path.
         :type image_key: str
-        :param aspect: Aspect ratio passed to ``plt.imshow``. Default ``'equal'``.
+        :param aspect: Aspect ratio passed to ``plt.imshow``.
         :type aspect: str
-        :param kwargs: Additional keyword arguments forwarded to ``plt.imshow``.
+        :param kwargs: Further keyword arguments forwarded to ``plt.imshow``.
         """
         import matplotlib.pyplot as plt
         from pathlib import Path as _Path
 
         def _display_array(arr):
+            """Put an image array into a layout ``imshow`` accepts.
+
+            A channel-first array is moved to channel-last, a single channel is squeezed to a
+            plain two-dimensional image, three channels are kept as RGB, and anything else is
+            reduced to its first channel.
+
+            :param arr: The image array.
+            :returns: The array, ready to display.
+            :rtype: numpy.ndarray
+            """
             arr = np.asarray(arr)
             if arr.ndim == 3 and arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (3, 4):
                 arr = np.moveaxis(arr, 0, -1)
@@ -880,22 +1079,20 @@ class Dataset(object):
     plot_he = plot_image
 
     def plot_downsampled_vector(self, c='red', s=0.3, alpha=0.45, **kwargs):
-        """
-        Scatter plot the downsampled vectors (H&E-guided local maxima) in µm
-        coordinates.
+        """Scatter the sampled lattice positions in micrometre coordinates.
 
-        Call ``plot_he()`` first in the same code cell to overlay the vectors
-        on the H&E image.
+        The positions are the local maxima that the tissue mask guided the sampling to. Call
+        :meth:`plot_image` first in the same code cell to overlay them on the staining image.
+        ``downsample_vector`` must have been run first.
 
-        Requires ``downsample_vector()`` to have been called first.
-
-        :param c: Colour of the scatter dots. Default ``'red'``.
+        :param c: Colour of the scatter dots.
         :type c: color
-        :param s: Size of the scatter dots. Default ``0.3``.
+        :param s: Size of the scatter dots.
         :type s: float
-        :param alpha: Transparency of the scatter dots. Default ``0.45``.
+        :param alpha: Transparency of the scatter dots.
         :type alpha: float
-        :param kwargs: Additional keyword arguments forwarded to ``plt.scatter``.
+        :param kwargs: Further keyword arguments forwarded to ``plt.scatter``.
+        :raises ValueError: If no positions have been sampled yet.
         """
         import matplotlib.pyplot as plt
 

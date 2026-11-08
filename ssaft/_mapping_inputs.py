@@ -1,23 +1,24 @@
-"""Build ``map_celltypes``' inputs (``cluster_labels`` + ``centroids``) from an
-annotated h5ad.
+"""Build the inputs of ``map_celltypes`` from an annotated h5ad.
 
-``map_celltypes`` calls :func:`build_centroids_from_h5ad` itself when the store has no
-``centroids`` / ``cluster_labels`` (or when an ``h5ad`` is passed explicitly). The
-annotated h5ad — row-aligned with the store's ``normalized_vectors`` — is grouped into
-celltypes purely by the label string in ``obs[column]``:
+The inputs in question are ``cluster_labels`` and ``centroids``.
+``map_celltypes`` calls :func:`build_centroids_from_h5ad` itself when the store holds
+neither of them, and also whenever an h5ad is passed explicitly. The annotated h5ad,
+which must be row-aligned with the store's ``normalized_vectors``, is grouped into
+celltypes purely by the label string in ``obs[column]``.
 
-  * a named celltype       -> one class per distinct label (different label = different
-                              celltype; state-suffixed names stay separate).
-  * ``Unknown``            -> grouped by the ORIGINAL cluster (``obs[leiden_column]``):
-                              each source cluster with Unknown vectors becomes its own
-                              class ``unknown1``, ``unknown2``, ... So unresolved
-                              populations are kept separable and are *mapped* (they are
-                              real classes for both correlation and GNB), not dropped.
-  * ``Background`` / ``*subclustering`` -> dropped to -1 (non-cell / never-finalized).
+A named celltype becomes one class per distinct label, so a different label always
+means a different celltype and names carrying a state suffix stay separate. The label
+``Unknown`` is instead grouped by the original cluster in ``obs[leiden_column]``, so
+that each source cluster holding unknown vectors becomes its own class, named
+``unknown1``, ``unknown2`` and so on. Unresolved populations are therefore kept
+separable and are genuinely mapped, being real classes for both the correlation and
+the naive Bayes mapper, rather than dropped. The labels ``Background`` and the
+never-finalized subclustering labels drop to minus one, because they are not cells.
 
-``centroids[k]`` is the mean of the row-L2-normalized member vectors (= Pearson-
-correlation space). Only ``cluster_labels`` + ``centroids`` are written; the store's
-``normalized_vectors`` is never modified, so this is non-destructive and idempotent.
+Each centroid is the mean of the member vectors after each has been scaled to unit L2
+norm, which places them in Pearson correlation space. Only ``cluster_labels`` and
+``centroids`` are written. The store's ``normalized_vectors`` is never modified, so
+the operation is non-destructive and idempotent.
 """
 import os
 
@@ -30,22 +31,27 @@ UNKNOWN_LABEL = 'Unknown'
 
 
 def _qualitative_pool(n):
-    """A pool of ``>= n`` maximally distinct hex colours (best effort).
+    """Return a pool of at least ``n`` maximally distinct hex colours, as best it can.
 
-    Celltypes are a NOMINAL variable, so the palette must be qualitative:
-    sampling a continuous map (``'jet'``) hands neighbouring ids nearly the same
-    colour, and with tens of classes the map becomes unreadable. Sources, in
-    order of size, each already optimized for categorical separation:
+    Celltypes are a nominal variable, so the palette must be qualitative. Sampling a
+    continuous map such as ``jet`` hands neighbouring identifiers nearly the same colour,
+    and with tens of classes the map becomes unreadable.
 
-    * ``n <= 20``  — matplotlib ``tab20``, de-paired so consecutive ids get the
-      saturated variants first (``tab20`` is stored as dark/light pairs of the
-      same hue, which would give adjacent ids near-identical colours).
-    * ``n <= 28``  — scanpy's ``default_28`` (Zeileis). Same palette scanpy uses
-      for a categorical ``obs`` column, so the celltype-map and any
-      ``sc.pl.spatial`` of the annotated h5ad agree.
-    * ``n <= 102`` — scanpy's ``default_102`` (Godsnot).
-    * beyond that  — ``default_102`` cycled with a lightness shift per cycle, so
-      colours repeat in family but never exactly.
+    Four sources are used in order of size, each already optimized for categorical
+    separation. Up to 20 colours come from the matplotlib ``tab20`` map, de-paired so that
+    consecutive identifiers get the saturated variants first, because ``tab20`` is stored
+    as dark and light pairs of one hue and would otherwise give adjacent identifiers
+    near-identical colours. Up to 28 come from scanpy's ``default_28``, the Zeileis
+    palette, which is the same palette scanpy uses for a categorical ``obs`` column, so
+    that the celltype map and any ``sc.pl.spatial`` of the annotated h5ad agree. Up to 102
+    come from scanpy's ``default_102``, the Godsnot palette. Beyond that, ``default_102``
+    is cycled with a lightness shift applied per cycle, so colours repeat in family but
+    never exactly.
+
+    :param n: Number of colours needed.
+    :type n: int
+    :returns: Hex colour strings, at least ``n`` of them.
+    :rtype: list of str
     """
     import matplotlib.pyplot as plt
     from matplotlib.colors import to_hex, to_rgb
@@ -70,12 +76,21 @@ def _qualitative_pool(n):
 
 
 def _uns_color_map(adata, column):
-    """``{label: hex}`` from ``uns[f'{column}_colors']``, or ``None``.
+    """Read the annotation's own palette out of ``uns`` and key it by label.
 
     scanpy stores that list index-aligned with ``obs[column].cat.categories``, so the
-    mapping is by NAME. Reading it positionally is the bug this exists to prevent: the
-    store orders celltypes by id (grouping order) while the categorical orders them
-    alphabetically, so the two lists hold the same colours against different celltypes.
+    mapping is by name. Reading it positionally is the bug this function exists to
+    prevent: the store orders celltypes by identifier, which is grouping order, while the
+    categorical orders them alphabetically, so the two lists hold the same colours against
+    different celltypes.
+
+    :param adata: The annotated data, still open.
+    :type adata: anndata.AnnData
+    :param column: The ``obs`` column whose colours are wanted.
+    :type column: str
+    :returns: A mapping from label to hex colour, or ``None`` when the annotation carries
+        no palette or when its length does not match the categories.
+    :rtype: dict or None
     """
     key = f'{column}_colors'
     cols = adata.uns.get(key, None)
@@ -92,16 +107,26 @@ def _uns_color_map(adata, column):
 
 
 def _colors_from_names(n, name_colors, names, fresh_for=None):
-    """Reuse the annotation's colour per celltype NAME; mint new ones for the rest.
+    """Reuse the annotation's colour for each celltype name and mint new ones for the rest.
 
-    ``fresh_for[i]`` forces a new colour even when the name matches — that is what
-    ``Unknown`` needs: the annotation calls every unassignable cell ``Unknown`` and
-    gives it ONE colour, but the store splits it per source cluster into
-    ``unknown1..N``. Handing all of them that one colour would make them
-    indistinguishable on the map, so they get fresh, mutually distinct colours instead.
+    An entry of ``fresh_for`` forces a new colour even when the name matches. That is what
+    ``Unknown`` needs: the annotation calls every unassignable cell ``Unknown`` and gives
+    it a single colour, but the store splits it per source cluster into ``unknown1`` and
+    its successors. Handing all of them that one colour would make them indistinguishable
+    on the map, so they are given fresh and mutually distinct colours instead.
 
-    New colours are drawn from the qualitative pool skipping anything the annotation
+    New colours are drawn from the qualitative pool, skipping anything the annotation has
     already used, so a minted colour never collides with a real celltype's.
+
+    :param n: Number of celltypes.
+    :type n: int
+    :param name_colors: Mapping from label to hex colour, as carried by the annotation.
+    :type name_colors: dict
+    :param names: Celltype names in identifier order.
+    :param fresh_for: Per-celltype flags forcing a newly minted colour.
+    :returns: One hex colour per celltype, in identifier order.
+    :rtype: list of str
+    :raises ValueError: If the number of names does not match ``n``.
     """
     names = list(names or [])
     if len(names) != n:
@@ -129,33 +154,38 @@ def _colors_from_names(n, name_colors, names, fresh_for=None):
 
 def celltype_colors(n_celltypes, cmap=None, *, name_colors=None, names=None,
                     fresh_for=None):
-    """``n_celltypes`` hex colours, index-aligned with the celltype ids.
+    """Return one hex colour per celltype, index-aligned with the celltype identifiers.
 
-    The palette is fixed HERE, once, against the number of classes the mapping
-    actually uses (``centroids.shape[0]``) — not against ``celltype_maps.max()``,
-    which only counts the classes that won at least one voxel. Everything
-    downstream (the labels raster, its RGB rendering, the annotated table's
-    ``uns['cellman_annotation_colors']``, any legend) reads this one list, so the
-    same celltype cannot come out in different colours in different views.
+    The palette is fixed here, once, against the number of classes the mapping actually
+    uses, which is ``centroids.shape[0]``. It is deliberately not fixed against
+    ``celltype_maps.max()``, which counts only the classes that won at least one voxel.
+    Everything downstream reads this one list, including the label raster, its RGB
+    rendering, the annotated table's ``uns['cellman_annotation_colors']`` and any legend,
+    so the same celltype cannot come out in different colours in different views.
 
-    :param n_celltypes: number of celltype classes (``centroids.shape[0]``).
+    :param n_celltypes: Number of celltype classes, which is ``centroids.shape[0]``.
     :type n_celltypes: int
-    :param cmap: ``None`` (default) picks a QUALITATIVE palette sized to the
-        class count (see :func:`_qualitative_pool`). Pass a matplotlib colormap
-        name to sample it continuously instead (e.g. ``'jet'``) — legible only
-        for a handful of classes. An explicit ``cmap`` overrides ``name_colors``.
+    :param cmap: Leaving this at ``None`` picks a qualitative palette sized to the class
+        count, as described under :func:`_qualitative_pool`. Passing the name of a
+        matplotlib colormap samples it continuously instead, for example ``'jet'``, which
+        is legible only for a handful of classes. An explicit colormap overrides
+        ``name_colors``.
     :type cmap: str or matplotlib.colors.Colormap or None
-    :param name_colors: ``{label: hex}`` carried by the annotation (its
-        ``uns[f'{column}_colors']``). When given with ``cmap=None``, every celltype
-        whose NAME appears there keeps the colour it had in the annotation, so the
-        celltype map and an ``sc.pl.spatial`` of the h5ad agree cell type by cell
-        type instead of merely drawing from the same list.
+    :param name_colors: The mapping from label to hex colour carried by the annotation, in
+        its ``uns[f'{column}_colors']``. When it is given and ``cmap`` is ``None``, every
+        celltype whose name appears there keeps the colour it had in the annotation, so
+        that the celltype map and an ``sc.pl.spatial`` of the h5ad agree cell type by cell
+        type rather than merely drawing from the same list.
     :type name_colors: dict or None
-    :param names: celltype names in id order; required with ``name_colors``.
+    :param names: Celltype names in identifier order. This is required with
+        ``name_colors``.
     :type names: list[str] or None
-    :param fresh_for: per-celltype flags forcing a newly minted colour even when the
-        name matches — used for the ``unknown1..N`` split of a single ``Unknown``.
+    :param fresh_for: Per-celltype flags forcing a newly minted colour even when the name
+        matches, used for the split of a single ``Unknown`` into ``unknown1`` and its
+        successors.
     :type fresh_for: list[bool] or None
+    :returns: One hex colour per celltype.
+    :rtype: list of str
     """
     n = int(n_celltypes)
     if cmap is None and name_colors:
@@ -169,19 +199,23 @@ def celltype_colors(n_celltypes, cmap=None, *, name_colors=None, names=None,
 
 
 def compute_centroids(nv, labels, n_clusters, chunk=20000):
-    """Per-cluster mean of the row-L2-normalized member vectors.
+    """Compute each cluster's mean over its member vectors, scaled to unit L2 norm.
 
-    :param nv: the store's ``normalized_vectors`` (L, g); read in chunks.
+    :param nv: The store's ``normalized_vectors``, of shape ``(L, g)``. It is read in
+        chunks.
     :type nv: array-like
-    :param labels: per-vector cluster index (L,), -1 = dropped.
+    :param labels: Cluster index of each vector, of shape ``(L,)``, where minus one means
+        the vector is dropped.
     :type labels: numpy.ndarray
-    :param n_clusters: number of clusters (rows of the returned centroids).
+    :param n_clusters: Number of clusters, which is the number of rows of the result.
     :type n_clusters: int
-    :param chunk: rows per chunk when accumulating (default 20000). Accumulation is in
-        float64, so the result is independent of the chunk size.
+    :param chunk: Number of rows accumulated per step. Accumulation is in float64, so the
+        result does not depend on this value.
     :type chunk: int
-    :returns: ``(centroids (k, g) float32, counts (k,) int64)``.
+    :returns: A pair holding the centroids, of shape ``(k, g)`` and dtype float32, and the
+        member counts, of shape ``(k,)`` and dtype int64.
     :rtype: tuple(numpy.ndarray, numpy.ndarray)
+    :raises ValueError: If any cluster ended up with no members.
     """
     n_genes = nv.shape[1]
     acc = np.zeros((n_clusters, n_genes), dtype=np.float64)
@@ -203,18 +237,20 @@ def compute_centroids(nv, labels, n_clusters, chunk=20000):
 
 
 def _build_units(celltype, leiden):
-    """Group vectors into an ordered list of celltype units by label string.
+    """Group vectors into an ordered list of celltype units, by label string.
 
-    Named labels -> one unit each. ``Unknown`` -> one unit per source cluster
-    (``obs[leiden_column]``), named ``unknown1..N`` in ascending-cluster order.
-    ``DROP_LABELS`` -> excluded (their vectors stay -1).
+    Each named label becomes one unit. The label ``Unknown`` becomes one unit per source
+    cluster, named ``unknown1`` upwards in ascending order of cluster. The labels in
+    ``DROP_LABELS`` are excluded, and their vectors stay at minus one.
 
-    :param celltype: per-vector label string (L,).
+    :param celltype: Label string of each vector, of shape ``(L,)``.
     :type celltype: numpy.ndarray
-    :param leiden: per-vector original cluster id (L,); required only to split Unknown.
+    :param leiden: Original cluster identifier of each vector, of shape ``(L,)``. It is
+        needed only to split ``Unknown``.
     :type leiden: numpy.ndarray
-    :returns: list of unit dicts (``label / mask / is_unknown / source_cluster``),
-        ordered by original cluster then label.
+    :returns: The units, each a dictionary holding the label, the member mask, whether it
+        came from ``Unknown`` and its source cluster, ordered by original cluster and then
+        by label.
     :rtype: list(dict)
     """
     units = []
@@ -239,38 +275,44 @@ def build_centroids_from_h5ad(z, h5ad_path, *, column='cellman_annotation',
                               leiden_column='leiden', chunk=20000,
                               store_dir=None, out_csv_name='celltype_index.csv',
                               cmap=None):
-    """Group an annotated h5ad into celltypes and write ``cluster_labels`` +
-    ``centroids`` (+ ``celltype_names`` and the colour palette) into the open
-    zarr group ``z``.
+    """Group an annotated h5ad into celltypes and write the mapping inputs into a store.
 
-    Grouping is by the label string in ``obs[column]`` (see the module docstring):
-    named labels are one class each, ``Unknown`` is split by original cluster into
-    ``unknown1..N``, and Background / unfinalized labels drop to -1. This is what
-    :meth:`Analysis.map_celltypes` invokes when the store lacks the inputs.
+    What is written into the open zarr group is ``cluster_labels``, ``centroids``,
+    ``celltype_names`` and the colour palette. Grouping is by the label string in
+    ``obs[column]``, as described in the module docstring: named labels become one class
+    each, ``Unknown`` is split by original cluster into ``unknown1`` and its successors,
+    and background or unfinalized labels drop to minus one. This is the function
+    :meth:`Analysis.map_celltypes` invokes when the store lacks its inputs.
 
-    :param z: open zarr group (mode ``r+``); must hold ``normalized_vectors`` and is
-        where ``cluster_labels`` / ``centroids`` are (over)written.
+    :param z: An open zarr group in mode ``r+``. It must already hold
+        ``normalized_vectors``, and it is where ``cluster_labels`` and ``centroids`` are
+        written, overwriting any that exist.
     :type z: zarr.hierarchy.Group
-    :param h5ad_path: annotated h5ad, row-aligned with ``normalized_vectors``.
+    :param h5ad_path: The annotated h5ad, row-aligned with ``normalized_vectors``.
     :type h5ad_path: str
-    :param column: obs column with the final celltype label.
+    :param column: The ``obs`` column holding the final celltype label.
     :type column: str
-    :param leiden_column: obs column with the original cluster id, used to split
-        ``Unknown`` (required only when Unknown vectors are present).
+    :param leiden_column: The ``obs`` column holding the original cluster identifier, used
+        to split ``Unknown``. It is required only when unknown vectors are present.
     :type leiden_column: str
-    :param chunk: rows per chunk when accumulating centroids.
+    :param chunk: Number of rows accumulated per step when computing centroids.
     :type chunk: int
-    :param store_dir: if given, the celltype-index CSV is written here.
+    :param store_dir: When given, the celltype index is also written here as a CSV file.
     :type store_dir: str or None
-    :param out_csv_name: name of the celltype-index CSV.
+    :param out_csv_name: File name of that celltype index.
     :type out_csv_name: str
-    :param cmap: palette used to fix the per-celltype colours (see
-        :func:`celltype_colors`); ``None`` = qualitative, sized to the class
-        count. Stored in ``z.attrs['cellman_celltype_colors']``.
+    :param cmap: Palette used to fix the per-celltype colours, as described under
+        :func:`celltype_colors`. Leaving it at ``None`` gives a qualitative palette sized
+        to the class count. The result is stored in
+        ``z.attrs['cellman_celltype_colors']``.
     :type cmap: str or matplotlib.colors.Colormap or None
-    :returns: the celltype-index DataFrame (id -> label / is_unknown / source_cluster /
-        n_vectors).
+    :returns: The celltype index, mapping identifier to label, whether the class came from
+        ``Unknown``, its source cluster and its number of vectors.
     :rtype: pandas.DataFrame
+    :raises ValueError: If the store holds no ``normalized_vectors``, if the h5ad is not
+        row-aligned with them, if the label column is absent, if unknown vectors are
+        present without the cluster column, or if no callable celltype remains.
+    :raises FileNotFoundError: If the annotated h5ad does not exist.
     """
     if 'normalized_vectors' not in z:
         raise ValueError('store has no normalized_vectors; run downsample_vector() first')
@@ -320,6 +362,12 @@ def build_centroids_from_h5ad(z, h5ad_path, *, column='cellman_annotation',
     centroids, counts = compute_centroids(nv, labels, len(units), chunk)
 
     def overwrite(name, arr):
+        """Write an array into the zarr group, replacing any array already under that name.
+
+        :param name: Name of the array in the group.
+        :type name: str
+        :param arr: The array to store.
+        """
         if name in z:
             del z[name]
         z[name] = arr

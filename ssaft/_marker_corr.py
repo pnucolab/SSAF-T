@@ -1,54 +1,56 @@
-"""Per-celltype marker-restricted Pearson correlation.
+"""Pearson correlation restricted, per celltype, to that celltype's marker genes.
 
-Same correlation as always — only the gene axis changes per celltype. The default
-scores every celltype on the SAME axis: a voxel's whole vector against a centroid's
-whole vector. That axis is dominated by genes which are flat across celltypes, so a
-rare celltype defined by three genes is judged mostly on the ~60 genes it shares
-with everything else.
+The correlation itself is the usual one. Only the gene axis changes from celltype to
+celltype. The default scores every celltype on the same axis, correlating a voxel's
+whole vector against a centroid's whole vector. That axis is dominated by genes which
+are flat across celltypes, so a rare celltype defined by three genes is judged mostly
+on the sixty or so genes it shares with everything else.
 
-With a marker panel (``map_celltypes(marker_genes_path=...)``) each celltype is
-correlated ONLY on its own markers — its node's markers in the
-``celltype_markers.yaml`` tree plus every ancestor's, since the Cell-Ontology is
-normalized delta-only (see :meth:`~ssaft.Analysis.read_marker_genes`). So
-``glomerular endothelial cell`` is scored on ``Ehd3, Podxl, Icam2`` *and* the
-``endothelial cell`` markers above it, while ``proximal tubule cell`` is scored on
-its own.
+When a marker panel is supplied, through ``map_celltypes(marker_genes_path=...)``,
+each celltype is correlated only on its own markers. Those are the markers on its own
+node of the ``celltype_markers.yaml`` tree together with the markers of every
+ancestor, because the Cell-Ontology is normalized to record only the delta at each
+level. See :meth:`~ssaft.Analysis.read_marker_genes`. A glomerular endothelial cell is
+therefore scored on ``Ehd3``, ``Podxl`` and ``Icam2`` as well as on the endothelial
+cell markers above it, while a proximal tubule cell is scored on its own markers.
 
-The centroids themselves are still built over the union of all marker genes: one
+The centroids themselves are still built over the union of all marker genes. One
 shared gene axis is what makes the celltypes comparable at all, and the marker set
 only picks which of its columns a given celltype is judged on.
 
 Marker sets that are too small
 ------------------------------
-Pearson over ``n`` points needs ``n >= 3`` to mean anything: **over 2 points it is
-always exactly ±1**, whatever the values. A celltype with 2 on-panel markers
-therefore scores ``r = 1.0`` on every voxel where its two markers happen to be
-ordered like its centroid's, wins those voxels outright, and — worse — is immune to
-``filter_celltypemaps(min_r=...)``, since no threshold below 1 can remove it.
+A Pearson correlation over n points needs n to be at least 3 to mean anything,
+because over 2 points it is always exactly 1 or minus 1 whatever the values. A
+celltype with two on-panel markers therefore scores 1.0 on every voxel where its two
+markers happen to be ordered the way its centroid's are. It wins those voxels
+outright and, worse, it is immune to ``filter_celltypemaps(min_r=...)``, because no
+threshold below 1 can remove it.
 
-Measured on the mouse-kidney Xenium panel, where ``proximal tubule cell`` had only
-``Epcam, Slc5a12`` on panel: 23.5% of its cells scored exactly 1.0, and 29.4% of all
-cells ended up saturated at ``|r| > 0.999``.
+Measured on the mouse kidney Xenium panel, where the proximal tubule cell had only
+``Epcam`` and ``Slc5a12`` on panel, 23.5 percent of its cells scored exactly 1.0 and
+29.4 percent of all cells ended up saturated above 0.999 in absolute value.
 
-So a celltype with fewer than :data:`MIN_MARKER_GENES` markers on the panel falls
-back to the full axis and is named in a warning. That keeps the score filterable,
-but it is a guard, not a fix — the fix is for the annotation to emit more on-panel
-markers for that celltype in ``celltype_markers.yaml``.
+A celltype with fewer than :data:`MIN_MARKER_GENES` markers on the panel therefore
+falls back to the full axis and is named in a warning. That keeps the score
+filterable, but it is a guard rather than a fix. The fix is for the annotation to
+emit more on-panel markers for that celltype in ``celltype_markers.yaml``.
 
 The fallback belongs to the correlation and nowhere else. :func:`marker_score` is a
 mean over the marker genes, and a mean over one gene is neither degenerate nor
-unfilterable — routing it through the fallback would score that celltype 0, which
-:func:`marker_score_cutoffs` then skips, leaving it with no cut at all. So the lda
-path builds its score on the fallback-free OWN sets (``min_genes=0``) instead.
+unfilterable. Routing it through the fallback would score that celltype 0, which
+:func:`marker_score_cutoffs` then skips, leaving it with no cut at all. The LDA path
+therefore builds its score on the fallback-free sets, by passing ``min_genes=0``.
 
-Why a loop and not one masked GEMM
-----------------------------------
-A masked correlation can be batched into three ``(N,G)x(G,K)`` matmuls via the
-computational formula for covariance. It is not worth it here: marker sets are
-small (a handful of genes out of hundreds), so gathering ``D[:, idx_k]`` costs
-``N x sum(n_k)`` — well under the ``N x G x K`` of the batched form — and the
-two-pass centering below is exact, where the computational formula loses three
-digits in float32 on nearly-constant marker sets.
+Why a loop and not one masked matrix multiply
+---------------------------------------------
+A masked correlation can be batched into three matrix multiplies of shape n by g
+against g by k, using the computational formula for covariance. It is not worth it
+here. Marker sets are small, a handful of genes out of hundreds, so gathering the
+columns of one celltype costs n times the sum of the set sizes, which is well under
+the n times g times k of the batched form. The two-pass centering used below is also
+exact, whereas the computational formula loses about three digits in float32 on
+marker sets that are nearly constant.
 """
 import numpy as np
 
@@ -62,22 +64,25 @@ MIN_MARKER_GENES = 3
 
 
 def marker_score(density, labels, marker_idx):
-    """``(n,)`` — each voxel's mean density over ITS OWN celltype's marker genes.
+    """Return each voxel's mean density over the marker genes of its own celltype.
 
-    The quantity a celltype is present *enough* to be called, as opposed to
-    ``vf_norm``, which sums all genes and so measures how transcript-rich the
-    neighbourhood is regardless of which celltype won. Expression level differs by
-    an order of magnitude between celltypes, so the comparison only means anything
-    within a celltype — hence one score per voxel, taken over the winner's markers,
-    and a threshold set per celltype downstream.
+    This is the quantity that says whether a celltype is present in sufficient quantity to
+    be called, as opposed to ``vf_norm``, which sums all genes and so measures how
+    transcript-rich the neighbourhood is regardless of which celltype won. Expression
+    level differs by an order of magnitude between celltypes, so the comparison means
+    something only within a celltype. Hence one score per voxel, taken over the winning
+    celltype's markers, with a threshold set per celltype further downstream.
 
-    :param density: ``(n, G)`` absolute densities (molecules per µm^ndim), on the
-        same gene axis ``marker_idx`` indexes.
-    :param labels: ``(n,)`` celltype id per voxel; ``-1`` scores 0.
-    :param marker_idx: ``[idx_0 ... idx_{K-1}]`` from :func:`marker_index_sets`;
-        ``None`` for a celltype means "no marker set", scored 0 so the filter
-        leaves it alone.
-    :returns: ``(n,)`` float32.
+    :param density: Absolute densities of shape ``(n, G)``, in molecules per cubic or
+        square micrometre according to the dimensionality, on the same gene axis that
+        ``marker_idx`` indexes.
+    :param labels: Celltype identifier of each voxel, of shape ``(n,)``. A value of minus
+        one scores zero.
+    :param marker_idx: The list of index arrays returned by :func:`marker_index_sets`. An
+        entry of ``None`` means the celltype has no marker set and is scored zero, so that
+        the filter leaves it alone.
+    :returns: The per-voxel score, of shape ``(n,)`` and dtype float32.
+    :rtype: numpy.ndarray
     """
     out = np.zeros(len(labels), dtype=np.float32)
     for k in np.unique(labels):
@@ -99,18 +104,36 @@ def marker_score(density, labels, marker_idx):
 def marker_index_sets(celltype_names, marker_genes, gene_names, *,
                       min_genes=MIN_MARKER_GENES, warn_few=True,
                       verbose=False, log=print):
-    """``[idx_0, ..., idx_{K-1}]`` — gene positions each celltype is correlated on.
+    """Return the gene positions that each celltype should be correlated on.
 
-    ``idx_k`` indexes into ``gene_names``, i.e. the gene axis actually being
-    mapped (after any ``exclude_gene_indices`` removal), so callers can apply it
-    to their data chunk directly.
+    Each returned index array indexes into ``gene_names``, that is into the gene axis
+    actually being mapped after any removal requested through ``exclude_gene_indices``, so
+    a caller can apply it to its data chunk directly.
 
-    ``None`` means "score on the whole axis". A celltype gets it when
+    An entry of ``None`` means the celltype is scored on the whole axis. A celltype gets
+    that in two cases. The first is that it has no entry in ``marker_genes``, which is the
+    honest fallback for the annotation's ``unknown1`` to ``unknownN`` classes, since those
+    were never defined by markers. The second is that fewer than ``min_genes`` of its
+    markers are on the panel; see the module docstring on why a two-gene correlation
+    cannot be thresholded.
 
-    * it has no entry in ``marker_genes`` — the honest fallback for the
-      annotation's ``unknown1..N`` classes, which were never defined by markers;
-    * fewer than ``min_genes`` of its markers are on the panel — see the module
-      docstring on why a 2-gene correlation cannot be thresholded.
+    :param celltype_names: The celltype names, in the order of the centroid rows.
+    :param marker_genes: Mapping from celltype name to its marker gene symbols. Lookup is
+        case-insensitive.
+    :type marker_genes: dict
+    :param gene_names: The gene axis being mapped.
+    :param min_genes: Fewest on-panel markers a celltype needs before it is scored on its
+        own axis rather than the full one.
+    :type min_genes: int
+    :param warn_few: Whether to name the celltypes that fell back for having too few
+        markers.
+    :type warn_few: bool
+    :param verbose: Whether to log a summary at all.
+    :type verbose: bool
+    :param log: The callable used for logging.
+    :returns: One entry per celltype, each either an int64 array of gene positions or
+        ``None``.
+    :rtype: list
     """
     pos = {g: i for i, g in enumerate(gene_names)}
     lower = {str(g).lower(): i for i, g in enumerate(gene_names)}
@@ -147,7 +170,13 @@ def marker_index_sets(celltype_names, marker_genes, gene_names, *,
 
 
 def _pearson_against(sub, cen):
-    """Pearson of every row of ``sub`` (n, g) against the vector ``cen`` (g,)."""
+    """Correlate every row of a matrix against one vector.
+
+    :param sub: The rows, of shape ``(n, g)``. The array is centered in place.
+    :param cen: The vector to correlate against, of shape ``(g,)``.
+    :returns: The correlations, of shape ``(n,)``.
+    :rtype: numpy.ndarray
+    """
     sub = sub - sub.mean(axis=1, keepdims=True)
     sub /= np.maximum(np.linalg.norm(sub, axis=1, keepdims=True), 1e-12)
     cen = cen - cen.mean()
@@ -156,13 +185,18 @@ def _pearson_against(sub, cen):
 
 
 def masked_pearson_max(data, centroids, index_sets, *, bar=None):
-    """Best celltype per row, each correlated on its own marker genes (NumPy).
+    """Pick the best celltype per row, each scored on its own marker genes, in NumPy.
 
-    :param data: ``(n_voxels, n_genes)`` voxel vectors.
-    :param centroids: ``(k, n_genes)`` centroids on the same axis.
-    :param index_sets: from :func:`marker_index_sets`; ``None`` = full axis.
-    :returns: ``(best_idx int32 (n,), best_corr float32 (n,))``; ``-1`` where no
-        celltype scored (empty input).
+    :param data: Voxel vectors of shape ``(n_voxels, n_genes)``.
+    :param centroids: Centroids of shape ``(k, n_genes)``, on the same gene axis.
+    :param index_sets: The index arrays from :func:`marker_index_sets`, where ``None``
+        means the full axis. Pass ``None`` for the whole argument to score every celltype
+        on the full axis.
+    :param bar: Optional progress bar, advanced once per celltype.
+    :returns: A pair. The first element holds the winning celltype index per row as int32,
+        and is minus one where no celltype scored. The second holds that row's correlation
+        as float32.
+    :rtype: tuple of numpy.ndarray
     """
     n = data.shape[0]
     best_corr = np.full(n, -1.0, dtype=np.float32)
@@ -182,9 +216,20 @@ def masked_pearson_max(data, centroids, index_sets, *, bar=None):
 
 
 def masked_pearson_max_torch(data_t, centroids_t, index_sets, *, bar=None):
-    """torch counterpart of :func:`masked_pearson_max`; keeps everything on device.
+    """Pick the best celltype per row, in torch, keeping everything on the device.
 
-    ``data_t`` is ``(n, g)``, ``centroids_t`` is ``(k, g)``.
+    This is the counterpart of :func:`masked_pearson_max` and returns the same quantities.
+
+    :param data_t: Voxel vectors of shape ``(n, g)``.
+    :type data_t: torch.Tensor
+    :param centroids_t: Centroids of shape ``(k, g)``.
+    :type centroids_t: torch.Tensor
+    :param index_sets: The index arrays from :func:`marker_index_sets`, where ``None``
+        means the full axis.
+    :param bar: Optional progress bar, advanced once per celltype.
+    :returns: A pair of tensors on the same device, holding the winning celltype index per
+        row as int32 and that row's correlation as float32.
+    :rtype: tuple of torch.Tensor
     """
     import torch
     n = data_t.shape[0]
@@ -216,19 +261,25 @@ MARKER_SCORE_FLOOR = 1e-4
 
 
 def half_sample_mode(x):
-    """Peak of ``x`` by the half-sample mode (Robertson & Cryer 1974).
+    """Locate the peak of a sample by the half-sample mode of Robertson and Cryer, 1974.
 
-    Repeatedly keeps the NARROWEST half of the sorted values, so it converges on the
-    densest region and ignores both tails. Used instead of a mean, a KDE argmax or a
-    two-component mixture because the marker-score distributions here fail all three:
-    they are skewed (a mean lands left of the peak), they carry a spike of exact
-    zeros at the clip floor that a KDE argmax mistakes for the mode when a celltype
-    has a single sparse marker, and they are typically 3-4 modal rather than 2, so a
-    two-component fit has no principled component to threshold on.
+    The method repeatedly keeps the narrowest half of the sorted values, so it converges
+    on the densest region and ignores both tails. It is used here instead of a mean, a
+    kernel density argmax or a two-component mixture, because the marker-score
+    distributions fail all three. They are skewed, so a mean lands to the left of the
+    peak. They carry a spike of exact zeros at the clip floor, which a kernel density
+    argmax mistakes for the mode whenever a celltype has a single sparse marker. And they
+    are typically three or four modal rather than two, so a two-component fit has no
+    principled component to threshold on.
 
-    It reports a value for any input — that is the point, and also the caveat: the
-    value is only meaningful when the majority of the sample is the population you
-    meant. See :func:`marker_score_cutoffs`, which flags the two ways that fails.
+    The function reports a value for any input. That is the point, and also the caveat:
+    the value is meaningful only when the majority of the sample is the population you
+    meant. See :func:`marker_score_cutoffs`, which flags the two ways that assumption
+    fails.
+
+    :param x: The sample. It is flattened before use.
+    :returns: The located peak, or not-a-number for an empty sample.
+    :rtype: float
     """
     x = np.sort(np.asarray(x, dtype=np.float64).ravel())
     if x.size == 0:
@@ -249,23 +300,37 @@ def half_sample_mode(x):
 
 def marker_score_cutoffs(celltype_maps, marker_score, frac, *, min_voxels=300,
                          floor=MARKER_SCORE_FLOOR):
-    """``(cutoffs, notes)`` — a marker-score threshold per celltype, at ``frac`` x its peak.
+    """Return a marker-score threshold per celltype, set at a fraction of its own peak.
 
-    Expression level differs by an order of magnitude between celltypes (measured on
-    the mouse-kidney Xenium panel: peak 0.156 for cortical TAL vs 0.014 for the
-    parietal epithelium, an 11x spread), so one global cut is meaningless. Each
-    celltype's own peak is located with :func:`half_sample_mode` on ``log10`` of the
-    score, and everything below ``frac`` x that peak is dropped.
+    Expression level differs by an order of magnitude between celltypes. Measured on the
+    mouse kidney Xenium panel the peak was 0.156 for the cortical thick ascending limb
+    against 0.014 for the parietal epithelium, a spread of eleven times, so one global cut
+    is meaningless. Each celltype's own peak is located with :func:`half_sample_mode` on
+    the base ten logarithm of the score, and everything below ``frac`` times that peak is
+    dropped.
 
-    ``notes`` names the celltypes whose peak should not be trusted:
+    The accompanying notes name the celltypes whose peak should not be trusted. The first
+    case is more than half the voxels sitting on the clip floor, where the peak is the
+    floor and the cutoff degenerates to zero, meaning no filtering at all. The second is
+    the peak landing in the bottom 15 percent or the top 85 percent of its own
+    distribution, which is what a peak sitting on the spike of zeros, or on a lone cluster
+    in the tail, looks like. Both are reported rather than silently corrected, because a
+    celltype that trips them has a marker problem, and the honest response is to fix the
+    markers rather than the cutoff.
 
-    * more than half the voxels sitting on the clip floor — the peak IS the floor and
-      the cutoff degenerates to zero, i.e. no filtering;
-    * the peak landing in the bottom 15% or top 85% of its own distribution, which is
-      what a peak sitting on the zero spike (or on a lone tail cluster) looks like.
-
-    Both are reported rather than silently corrected: a celltype that trips them has
-    a marker problem, and the honest response is to fix the markers, not the cutoff.
+    :param celltype_maps: Celltype identifiers on the mapping grid.
+    :param marker_score: The per-voxel score, on the same grid.
+    :param frac: Fraction of the peak below which a voxel is cut.
+    :type frac: float
+    :param min_voxels: A celltype with fewer voxels than this is given no cut.
+    :type min_voxels: int
+    :param floor: Scores at or below this are treated as nothing measured when the peak is
+        located.
+    :type floor: float
+    :returns: A pair. The first element maps celltype identifier to its cut. The second is
+        a list of ``(celltype id, voxel count, message)`` triples naming the untrustworthy
+        peaks.
+    :rtype: tuple
     """
     cm = np.asarray(celltype_maps)
     ms = np.asarray(marker_score, dtype=np.float64)
@@ -298,37 +363,47 @@ def marker_score_cutoffs(celltype_maps, marker_score, frac, *, min_voxels=300,
 
 def density_cutoffs(celltype_maps, vf_norm, frac, *, mask=None, depth_normalize=True,
                     min_voxels=300):
-    """``(cutoffs, plane_factor)`` — a density threshold per celltype, at ``frac`` x its peak.
+    """Return a density threshold per celltype, set at a fraction of its own peak.
 
-    The rule of :func:`marker_score_cutoffs`, applied to ``vf_norm`` instead of the marker
-    score, which is what lets it reach every celltype: a marker score exists only for the
-    celltypes the annotation gave a marker set (10 of 28 on the mouse-kidney Xenium
-    panel, 8% of the mapped volume), a density exists for all of them. Densities differ
-    between celltypes as well (peaks span 3.4x on that panel, 0.058 for the parietal
-    epithelium to 0.197 for S3), so the cut is per celltype: the half-sample-mode peak of
-    ``log10(vf_norm)`` over that celltype's voxels, times ``frac``. What falls below it
-    is the KDE halo around a cell rather than the cell.
+    This applies the rule of :func:`marker_score_cutoffs` to ``vf_norm`` instead of the
+    marker score, which is what lets it reach every celltype. A marker score exists only
+    for the celltypes the annotation gave a marker set to, which was 10 of 28 on the mouse
+    kidney Xenium panel and 8 percent of the mapped volume, whereas a density exists for
+    all of them. Densities differ between celltypes as well, with peaks spanning a factor
+    of 3.4 on that panel, from 0.058 for the parietal epithelium to 0.197 for the S3
+    segment, so the cut is made per celltype. It is the half-sample-mode peak of the base
+    ten logarithm of ``vf_norm`` over that celltype's voxels, multiplied by ``frac``. What
+    falls below it is the kernel density halo around a cell rather than the cell itself.
 
-    ``depth_normalize`` matters on a 3D map. Density falls off with depth — on that
-    section the plane median runs from 1.00 in the middle of the tissue to 0.05-0.08 at
-    its top and bottom — so one number per celltype removes the shallow and deep planes
-    wholesale (2% of the mapped voxels kept at z=7 against 81% at z=13). Each plane's
-    density is therefore divided first by that plane's median over the selected voxels,
-    relative to the densest plane, and the peak and the cut are taken on the normalised
-    density; the fraction kept per plane then stays flat (79-82% across the tissue). A
-    single-plane map is unchanged by it.
+    Depth normalization matters on a three-dimensional map. Density falls off with depth:
+    on that section the plane median ran from 1.00 in the middle of the tissue to between
+    0.05 and 0.08 at its top and bottom. One number per celltype therefore removes the
+    shallow and deep planes wholesale, keeping 2 percent of the mapped voxels at plane 7
+    against 81 percent at plane 13. Each plane's density is instead divided first by that
+    plane's median over the selected voxels, taken relative to the densest plane, and both
+    the peak and the cut are computed on the normalized density. The fraction kept per
+    plane then stays flat, between 79 and 82 percent across the tissue. A single-plane map
+    is unaffected.
 
-    :param celltype_maps: ``(x, y[, z])`` celltype ids, ``-1`` = unmapped.
-    :param vf_norm: density on the same grid.
-    :param frac: fraction of the peak below which a voxel is cut.
-    :param mask: optional boolean array; only these voxels enter the peaks and the plane
-        medians.
-    :param depth_normalize: divide by the plane median first (3D maps only).
-    :param min_voxels: a celltype with fewer selected voxels gets no cut.
-    :returns: ``({celltype id: cut on the normalised density}, plane_factor (nz,))``. A
-        voxel of celltype ``k`` in plane ``z`` is below the cut when
-        ``vf_norm / plane_factor[z] < cutoffs[k]``. ``plane_factor`` is all ones when
-        not depth-normalising, and ``nan`` for a plane with no selected voxel.
+    :param celltype_maps: Celltype identifiers of shape ``(x, y)`` or ``(x, y, z)``, where
+        minus one means unmapped.
+    :param vf_norm: Density on the same grid.
+    :param frac: Fraction of the peak below which a voxel is cut.
+    :type frac: float
+    :param mask: Optional boolean array. Only the voxels it selects enter the peaks and
+        the plane medians.
+    :param depth_normalize: Whether to divide by the plane median first. This has an
+        effect on three-dimensional maps only.
+    :type depth_normalize: bool
+    :param min_voxels: A celltype with fewer selected voxels than this is given no cut.
+    :type min_voxels: int
+    :returns: A pair. The first element maps celltype identifier to its cut on the
+        normalized density. The second is the per-plane factor, of shape ``(nz,)``. A voxel
+        of celltype k in plane z is below the cut when ``vf_norm / plane_factor[z]`` is
+        less than ``cutoffs[k]``. The factor is all ones when not normalizing by depth, and
+        not-a-number for a plane holding no selected voxel.
+    :rtype: tuple
+    :raises ValueError: If ``vf_norm`` and ``celltype_maps`` are not on the same grid.
     """
     cm = np.asarray(celltype_maps)
     vf = np.asarray(vf_norm, dtype=np.float32)

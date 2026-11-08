@@ -1,4 +1,4 @@
-"""Shared rasterization helpers for count-based loaders."""
+"""Rasterization helpers shared by the count-based loaders."""
 
 from __future__ import annotations
 
@@ -11,20 +11,24 @@ from scipy.sparse import csr_matrix, issparse
 
 def aggregate_to_grid(adata: ad.AnnData, bin_um: float,
                       origin: Optional[Tuple[float, float]] = None) -> ad.AnnData:
-    """Sum point/bin counts onto a regular ``bin_um`` µm lattice.
+    """Sum point or bin counts onto a regular lattice of ``bin_um`` micrometre squares.
 
-    Every count row is assigned to the square bin containing its
-    ``obsm['spatial']`` (x, y) µm coordinate, using a shared global ``origin``
-    so that grids at different bin sizes (coarse HVG vs fine vector field) stay
-    aligned. Returns a bin-level AnnData with ``obs['array_row'/'array_col']``
-    and ``obsm['spatial'] = (col, row)``.
+    Every count row is assigned to the square bin that contains its ``obsm['spatial']``
+    coordinate in micrometres. A shared global origin is used so that lattices built at
+    different bin sizes, such as a coarse lattice for highly variable gene selection and a
+    fine one for the vector field, stay aligned with each other.
 
-    :param adata: Point/bin-level counts with ``obsm['spatial']`` in µm.
+    :param adata: Point-level or bin-level counts whose ``obsm['spatial']`` is in micrometres.
     :type adata: anndata.AnnData
-    :param bin_um: Lattice bin size in µm.
+    :param bin_um: Lattice bin size in micrometres.
     :type bin_um: float
-    :param origin: Shared ``(x0, y0)`` µm origin. Defaults to ``spatial.min(0)``.
+    :param origin: Shared origin as ``(x0, y0)`` in micrometres. Defaults to the minimum
+        of ``obsm['spatial']`` along each axis.
     :type origin: tuple of float, optional
+    :returns: Bin-level counts carrying ``obs['array_row']`` and ``obs['array_col']``, with
+        ``obsm['spatial']`` set to ``(col, row)`` and the bin size and origin recorded in
+        ``uns``.
+    :rtype: anndata.AnnData
     """
     sp = np.asarray(adata.obsm["spatial"])
     if origin is None:
@@ -55,20 +59,26 @@ def aggregate_to_grid(adata: ad.AnnData, bin_um: float,
 
 
 def fit_affine_lstsq(array_col, array_row, px_col, px_row) -> np.ndarray:
-    """Least-squares affine ``(col, row, 1) -> (px_x, px_y)``, return inverse (2,3).
+    """Fit a least-squares affine from lattice indices to pixels and return its inverse.
 
-    Used by platforms that give a per-bin lattice-to-pixel correspondence table
-    (e.g. Visium HD ``tissue_positions``: array_col/array_row to pxl_col/pxl_row).
-    Fit the correspondence on the SAME lattice the vector field uses.
+    The forward fit maps ``(col, row, 1)`` to ``(px_x, px_y)``. The returned 2 by 3 matrix
+    is the inverse of that fit, so it maps pixels back to lattice indices.
+
+    This is used by platforms that publish a per-bin correspondence table between the
+    lattice and the image, such as the Visium HD ``tissue_positions`` file, which pairs
+    ``array_col`` and ``array_row`` with ``pxl_col`` and ``pxl_row``. Fit the
+    correspondence on the same lattice that the vector field uses.
 
     :param array_col: Lattice column indices of the correspondence points.
     :type array_col: array-like
     :param array_row: Lattice row indices of the correspondence points.
     :type array_row: array-like
-    :param px_col: Pixel x (column) coordinates of the correspondence points.
+    :param px_col: Pixel x coordinates, that is column positions, of the correspondence points.
     :type px_col: array-like
-    :param px_row: Pixel y (row) coordinates of the correspondence points.
+    :param px_row: Pixel y coordinates, that is row positions, of the correspondence points.
     :type px_row: array-like
+    :returns: The inverse affine as a 2 by 3 matrix.
+    :rtype: numpy.ndarray
     """
     A = np.c_[np.asarray(array_col), np.asarray(array_row), np.ones(len(array_col))]
     cx, *_ = np.linalg.lstsq(A, np.asarray(px_col), rcond=None)

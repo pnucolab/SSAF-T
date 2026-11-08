@@ -27,6 +27,12 @@ Z_STASH = '_z_depth'
 
 
 def parse_args():
+    """Parse the command-line arguments of this script.
+
+    :returns: The parsed arguments, carrying the input store, the tile size, the output
+        directory and the flags controlling which elements each tile keeps.
+    :rtype: argparse.Namespace
+    """
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -85,7 +91,14 @@ def parse_args():
 
 
 def _highest_res_dataarray(tree):
-    """Return the highest-resolution DataArray from a multiscale DataTree."""
+    """Return the highest-resolution DataArray of a multiscale DataTree.
+
+    The node named ``scale0`` is preferred, and the first node is used when there is none.
+
+    :param tree: The multiscale element.
+    :returns: The DataArray holding the finest level.
+    :rtype: xarray.DataArray
+    """
     children = list(tree.items())
     pick_name = 'scale0' if 'scale0' in dict(children) else children[0][0]
     sub = tree[pick_name] if pick_name in tree else children[0][1]
@@ -95,6 +108,19 @@ def _highest_res_dataarray(tree):
 
 
 def _rechunk_dataarray(xda, target_chunk=2048):
+    """Give a DataArray regular chunks along its spatial axes.
+
+    The y and x axes are chunked to at most ``target_chunk``, while the channel and z
+    axes are left whole. An array that is not backed by dask is returned unchanged.
+
+    :param xda: The array to rechunk.
+    :type xda: xarray.DataArray
+    :param target_chunk: Largest chunk size along y and x.
+    :type target_chunk: int
+    :returns: The rechunked array, carrying the original dimensions, coordinates,
+        attributes and name.
+    :rtype: xarray.DataArray
+    """
     arr = xda.data
     if not isinstance(arr, da.Array):
         return xda
@@ -115,7 +141,18 @@ def _rechunk_dataarray(xda, target_chunk=2048):
 
 
 def rebuild_raster(elem, kind):
-    """Rebuild a raster element so it has regular chunks. Drops multiscale pyramid."""
+    """Rebuild a raster element so that it has regular chunks.
+
+    Any multiscale pyramid is dropped and only the finest level is kept. The element's
+    transformations are carried over unchanged.
+
+    :param elem: The image or labels element to rebuild.
+    :param kind: Either ``'image'`` or anything else, which is treated as labels. The
+        choice selects the SpatialData model, and the presence of a z axis selects between
+        its two-dimensional and three-dimensional form.
+    :type kind: str
+    :returns: The rebuilt element.
+    """
     try:
         transformations = get_transformation(elem, get_all=True)
         if not isinstance(transformations, dict):
@@ -140,6 +177,13 @@ def rebuild_raster(elem, kind):
 
 
 def rechunk_all_rasters(cropped_sdata):
+    """Rebuild every image and labels element of a tile so that its chunks are regular.
+
+    The elements are replaced in place.
+
+    :param cropped_sdata: The cropped tile to rewrite.
+    :type cropped_sdata: spatialdata.SpatialData
+    """
     for k in list(cropped_sdata.images.keys()):
         cropped_sdata.images[k] = rebuild_raster(cropped_sdata.images[k], 'image')
     for k in list(cropped_sdata.labels.keys()):
@@ -147,17 +191,25 @@ def rechunk_all_rasters(cropped_sdata):
 
 
 def strip_points_meta_transform(cropped_sdata):
-    """Workaround for spatialdata io_points.py JSON serialization bug.
+    """Rebuild each points element so that it can be written to parquet.
 
-    `points_without_transform.to_parquet(...)` triggers a dask compute that
-    reaches `pa.Table.from_pandas(partition)`. pyarrow tries to JSON-encode
-    `partition.attrs` for parquet's pandas-metadata, and chokes on Identity().
-    spatialdata only deletes attrs['transform'] on the wrapper copy, not on
-    `_meta` and not on the partition payload baked into the dask-expr graph.
+    This works around a serialization bug in the ``io_points`` module of spatialdata.
+    Writing the points triggers a dask computation that reaches
+    ``pa.Table.from_pandas(partition)``. pyarrow then tries to encode
+    ``partition.attrs`` as JSON for the pandas metadata of the parquet file, and chokes on
+    an ``Identity`` transformation. spatialdata deletes ``attrs['transform']`` only on the
+    wrapper copy, not on ``_meta`` and not on the partition payload already baked into the
+    dask expression graph.
 
-    Fix: rebuild the dask DataFrame by computing it to pandas, clearing all
-    attrs, and re-parsing through PointsModel with the same transformation.
-    Tile-cropped points should already fit in memory, so compute() is OK.
+    The fix is to rebuild the dask DataFrame: compute it to pandas, clear every attribute,
+    and parse it again through ``PointsModel`` with the same transformation. Points cropped
+    to one tile should already fit in memory, so computing them is acceptable.
+
+    The depth column set aside by :func:`normalize_points_indices` is renamed back to
+    ``z`` here, so that each written tile is three-dimensional again.
+
+    :param cropped_sdata: The cropped tile whose points are rebuilt in place.
+    :type cropped_sdata: spatialdata.SpatialData
     """
     from spatialdata.models import PointsModel
     from spatialdata.transformations import get_transformation
@@ -189,6 +241,15 @@ def strip_points_meta_transform(cropped_sdata):
 
 
 def points_count(p):
+    """Count the rows of a points element, without failing on an unusual one.
+
+    The length is read from the shape, computing it when the shape is lazy, and falls back
+    to the built-in length. Anything that raises yields zero rather than propagating.
+
+    :param p: The points element.
+    :returns: The number of rows, or zero when it could not be determined.
+    :rtype: int
+    """
     try:
         n = int(p.shape[0].compute()) if hasattr(p.shape[0], 'compute') else int(p.shape[0])
         return n
@@ -201,11 +262,29 @@ def points_count(p):
 
 def slim_cropped(cropped, image_key=None, keep_points=None,
                  drop_labels=False, drop_shapes=False, drop_tables=False):
-    """Drop unused elements from a cropped SpatialData in-place.
+    """Drop the unused elements of a cropped tile, in place.
 
-    Used to reduce per-tile zarr footprint when the downstream consumer
-    only needs a subset of elements (e.g. images[image_key] + points for
-    Analysis.downsample_vector).
+    This reduces the footprint of each tile on disk when the downstream consumer needs
+    only a subset of the elements, for example the chosen images together with the points
+    for ``Analysis.downsample_vector``.
+
+    :param cropped: The cropped tile to slim.
+    :type cropped: spatialdata.SpatialData
+    :param image_key: Image key, or several, to keep. Every other image is dropped.
+        Passing ``None`` keeps them all.
+    :type image_key: str or iterable of str, optional
+    :param keep_points: Points keys to keep. Every other points element is dropped.
+        Passing ``None`` keeps them all.
+    :type keep_points: iterable of str, optional
+    :param drop_labels: Whether to drop every labels element.
+    :type drop_labels: bool
+    :param drop_shapes: Whether to drop every shapes element.
+    :type drop_shapes: bool
+    :param drop_tables: Whether to drop every tables element.
+    :type drop_tables: bool
+    :returns: The same tile, slimmed.
+    :rtype: spatialdata.SpatialData
+    :raises KeyError: If a requested image key is not present after the crop.
     """
     if drop_labels:
         for k in list(cropped.labels.keys()):
@@ -236,7 +315,16 @@ def slim_cropped(cropped, image_key=None, keep_points=None,
 
 
 def has_biological_data(cropped):
-    """A tile is meaningful only if it contains transcripts or cells (a table)."""
+    """Report whether a tile holds anything worth writing.
+
+    A tile is meaningful only when it contains transcripts or cells, meaning a non-empty
+    points element or a non-empty table.
+
+    :param cropped: The cropped tile, which may be ``None``.
+    :type cropped: spatialdata.SpatialData or None
+    :returns: ``True`` when the tile holds data, ``False`` otherwise.
+    :rtype: bool
+    """
     if cropped is None:
         return False
     for k, p in cropped.points.items():
@@ -249,39 +337,50 @@ def has_biological_data(cropped):
 
 
 def normalize_points_indices(sdata, keep_z=True):
-    """Rewrite every points dask DataFrame with a clean global RangeIndex.
+    """Rewrite every points element with a clean global range index.
 
-    Two problems we need to fix up-front, before `get_extent` or
-    `bounding_box_query`:
+    Two problems have to be fixed before ``get_extent`` or ``bounding_box_query`` is
+    called.
 
-    1. Duplicate labels.
-       Vizgen/Merscope `detected_transcripts` parquet is read as a
-       multi-partition dask DataFrame whose per-partition RangeIndex(0..N_i)
-       gives duplicate labels across partitions. `spatialdata.transform()`
-       does `pd.Series(values, index=transformed.index)`, which materializes
-       that index and trips `ValueError: cannot reindex on an axis with
-       duplicate labels`. Both get_extent and bounding_box_query go through
-       transform.
+    The first is duplicate labels. A Vizgen MERSCOPE ``detected_transcripts`` parquet file
+    is read as a dask DataFrame of many partitions, each carrying its own range index from
+    zero, so labels repeat across partitions. ``spatialdata.transform`` performs
+    ``pd.Series(values, index=transformed.index)``, which materializes that index and
+    raises a ValueError about reindexing on an axis with duplicate labels. Both
+    ``get_extent`` and ``bounding_box_query`` go through ``transform``.
 
-    2. 3D-data / 2D-transform mismatch.
-       The source has an `x, y, z` column trio but the on-disk transformation
-       is 2D. `PointsModel.parse` reports "Column z will be ignored", but the
-       column survives, and `get_axes_names(DaskDataFrame)` later scans
-       columns and reports 3D — `bounding_box_query` then trips case 3
-       (data_dim=3, transform_dim=2, unsupported). The crop itself needs only
-       x/y, so `z` is set aside under ``Z_STASH`` — a name no axis scan picks
-       up — and :func:`strip_points_meta_transform` puts it back on each tile.
-       Earlier versions dropped it, which left every tile 2D and made
-       ``Analysis.downsample_vector(z=3, chunked=True)`` impossible.
-       ``keep_z=False`` (``--drop-z``) still drops it.
+    The second is a mismatch between three-dimensional data and a two-dimensional
+    transformation. The source has an x, y and z column trio while the transformation
+    stored on disk is planar. ``PointsModel.parse`` reports that the z column will be
+    ignored, but the column survives, and ``get_axes_names`` later scans the columns and
+    reports three dimensions. ``bounding_box_query`` then hits its unsupported case of
+    three-dimensional data against a two-dimensional transformation. The crop itself needs
+    only x and y, so z is set aside under :data:`Z_STASH`, a name no axis scan picks up,
+    and :func:`strip_points_meta_transform` restores it on each tile. Earlier versions
+    dropped the column instead, which left every tile planar and made
+    ``Analysis.downsample_vector(z=3, chunked=True)`` impossible. Passing ``keep_z`` as
+    ``False``, which the ``--drop-z`` option does, still drops it.
 
-    We materialize the dataframe to pandas once (Merscope transcripts is
-    typically a few hundred MB — fits in RAM), set `z` aside, reset_index, clear
-    stale attrs, and re-parse through PointsModel. Computing also forces the
-    `gene` categorical to known categories, silencing the perf warning that
-    PointsModel.parse otherwise emits on a partially-known categorical.
+    The DataFrame is materialized to pandas once, which for MERSCOPE transcripts is
+    typically a few hundred megabytes and fits in memory. Computing it also forces the
+    gene column's categorical dtype to have known categories, which silences the
+    performance warning ``PointsModel.parse`` otherwise emits on a partially known
+    categorical.
+
+    :param sdata: The SpatialData whose points are rewritten in place.
+    :type sdata: spatialdata.SpatialData
+    :param keep_z: Whether to set the depth aside and keep it, rather than dropping it.
+    :type keep_z: bool
     """
     def _project_to_2d(t):
+        """Reduce a transformation to its planar part.
+
+        An identity stays an identity, an affine is reduced to the x and y axes, and anything
+        that cannot be reduced falls back to an identity.
+
+        :param t: The transformation to project.
+        :returns: The planar transformation.
+        """
         if isinstance(t, Identity):
             return Identity()
         try:
@@ -318,6 +417,15 @@ def normalize_points_indices(sdata, keep_z=True):
 
 
 def main():
+    """Cut the input store into a grid of tiles and write each tile as its own zarr.
+
+    The global extent is measured in the chosen coordinate system and divided into tiles
+    of the requested size. A trailing row or column smaller than the minimum is merged
+    into the one before it. Each tile is cropped by bounding box, slimmed to the requested
+    elements, rechunked, and written together with a small JSON file recording its source,
+    its grid position and its bounding box. A tile holding neither transcripts nor cells
+    is skipped.
+    """
     args = parse_args()
     SDATA_PATH = args.sdata_path
     TILE_SIZE = float(args.tile_size)
