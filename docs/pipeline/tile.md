@@ -1,13 +1,15 @@
 # Tile (optional)
 
-Transcript platforms only (not CosMx, which runs per FOV). Cuts the SpatialData into square tiles so that
-`downsample_vector(chunked=True, sdata_dir=...)` streams them instead of holding the whole section.
-Tiling only affects downsampling; mapping always reads the whole SpatialData chunk by chunk.
+Imaging-based platforms only (excluding CosMx, which is processed per FOV). The SpatialData is cut
+into square tiles so that `downsample_vector(chunked=True, sdata_dir=...)` streams them rather than
+holding the whole section in memory. Tiling affects downsampling only; mapping always reads the whole
+SpatialData chunk by chunk.
 
-Tile when the section's transcripts and images do not fit comfortably in RAM. Both verified 3D runs
-(Xenium kidney, MERFISH liver) were tiled; small sections and crops run untiled.
+Tiling is used when the section's transcripts and images do not fit comfortably in memory. Both
+verified 3D runs (Xenium kidney, MERFISH liver) were tiled; small sections and crops are processed
+untiled.
 
-The script ships inside the package:
+The script is provided within the package:
 
 ```python
 import subprocess, sys
@@ -24,7 +26,7 @@ subprocess.run([sys.executable, str(SLICE),
                 "--drop-labels", "--drop-shapes", "--drop-tables"], check=True)
 ```
 
-It writes `r{row:02d}_c{col:02d}.zarr` per tile.
+One `r{row:02d}_c{col:02d}.zarr` is written per tile.
 
 ## Parameters
 
@@ -33,11 +35,11 @@ It writes `r{row:02d}_c{col:02d}.zarr` per tile.
 Default
 : no tiling
 Applies to
-: transcript platforms
+: imaging-based platforms
 Asked
 : yes
 
-Whether to tile at all.
+Whether tiling is performed.
 
 ### --tile-size
 
@@ -50,8 +52,8 @@ Asked
 Verified
 : Xenium kidney `10000` (Xenium pixels, about 2.1 mm); MERFISH liver `20000`
 
-Tile edge **in the units of the chosen coordinate system**. These are pixels for Xenium's `global`
-system, not µm. Check the element extent before choosing.
+Tile edge **in the units of the chosen coordinate system**. For Xenium's `global` system these are
+pixels rather than µm; the element extent should be inspected before a value is chosen.
 
 ### --image-key
 
@@ -62,9 +64,9 @@ Applies to
 Asked
 : no (set from the image choices made for downsampling)
 
-Images to keep in every tile. It must include the image downsampling thresholds: the 2D image
-([`image_key`](downsample.md#image_key)) for 2D, and the z-stack
-([`images`](downsample.md#images)) for 3D.
+Images to retain in every tile. It must include the images from which the downsampling thresholds are
+computed: the 2D image (`image_key`) in two dimensions, and the z-stack (`images`) in three — see
+{py:meth}`~ssaft.Analysis.downsample_vector`.
 
 ### --keep-points
 
@@ -75,7 +77,7 @@ Applies to
 Asked
 : no
 
-Points elements to keep; give the transcripts key.
+Points elements to retain; the transcripts key is supplied.
 
 ### --min-tile-size
 
@@ -106,7 +108,7 @@ Applies to
 Asked
 : no
 
-Drop elements downsampling does not read. Recommended: all three.
+These drop elements that downsampling does not read; all three are recommended.
 
 ### --drop-z
 
@@ -117,4 +119,4 @@ Applies to
 Asked
 : no
 
-Drops the transcripts' z column. **Never use it for a 3D run.**
+Drops the transcripts' z column. **It must not be used for a 3D run.**

@@ -1,23 +1,17 @@
 # Pipeline stages
 
-Each page documents one stage: what it does, its inputs and outputs, and every parameter under its
-own heading so it can be linked directly.
+SSAF-T proceeds through a sequence of stages, each documented on its own page: the operation it
+performs, its inputs and outputs, the platform-specific calls, and the considerations that are not
+evident from a function signature. The **parameter reference is given in the
+[API reference](../api.md)**, where every `ssaft` function's parameters are taken from its docstring;
+the stage pages refer to it rather than reproduce it.
 
-Every parameter section starts with the same four fields:
-
-Default
-: the value the function uses when you pass nothing.
-
-Applies to
-: the regime (transcript / count), dimension (2D / 3D) or platforms the parameter is read in.
-  Elsewhere it is ignored or rejected.
-
-Asked
-: whether the [agent skill](../agent.md) asks for it before a run (**yes**), or leaves it at the
-  platform default unless you override it (**no**).
-
-Verified
-: the values the tutorials and benchmark datasets were run with, where they differ from the default.
+Two stages are driven by something other than an `ssaft` function and retain their own parameter
+notes: [tile](tile.md) (the `slice_spatialdata.py` command-line interface) and
+[annotate](annotate.md) (the CeLLMan skill prompt fields). These notes record whether each field is
+requested interactively (**Asked**) and the values used in the tutorials (**Verified**). [Load](load.md) and [cluster](cluster.md) rely on external readers and clustering
+tools; they present the calls in context and leave those tools' parameters to their respective
+documentation.
 
 ```{toctree}
 :maxdepth: 1
@@ -32,7 +26,11 @@ annotate
 map
 filter
 segment
+kernels
 ```
+
+The final page, [kernels](kernels.md), describes a concept common to the field stages rather than a
+stage of its own.
 
 ## Stages per platform
 
@@ -47,12 +45,12 @@ segment
 | [annotate](annotate.md) | yes | yes | yes | yes | yes |
 | [map](map.md) | yes | yes | yes | yes | yes |
 | [filter](filter.md) | yes | yes | yes | yes | yes |
-| [segment](segment.md) | optional | optional | optional | optional | optional |
+| [segment](segment.md) | yes | yes | yes | yes | yes |
 
 ## Resuming
 
-Every stage persists its result, so a run can stop between any two stages and continue in a new
-process:
+Every stage persists its result, so a run may be interrupted between any two stages and continued in
+a new process:
 
 | after | what is on disk | resume with |
 |---|---|---|

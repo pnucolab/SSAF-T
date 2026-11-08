@@ -34,7 +34,7 @@ myst_heading_anchors = 3
 # docstrings only.
 autodoc_mock_imports = [
     "ssaft.utils",
-    "numpy", "scipy", "pandas", "sklearn", "skimage", "matplotlib", "seaborn", "cv2",
+    "pandas", "sklearn", "skimage", "matplotlib", "seaborn", "cv2",
     "zarr", "numcodecs", "dask", "xarray", "igraph", "leidenalg", "psutil", "packaging",
     "tqdm", "anndata", "scanpy", "spatialdata", "spatialdata_io", "spatialdata_plot",
     "PIL", "tifffile", "requests", "tensorstore", "torch", "triton", "cupy", "cuml",

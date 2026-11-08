@@ -6,8 +6,8 @@
 it. Reinstall with `--config-settings=setup-args=-Dsimd=disabled`
 ([details](installation.md#cpus-without-avx-512)).
 
-**`import rapids_singlecell` fails with a `cuml` import error.** `rapids-singlecell` and `cuml` are out
-of step. Use the pinned lock file on Python 3.11 + CUDA 13.
+**`import rapids_singlecell` fails with a `cuml` import error.** `rapids-singlecell` and `cuml` are
+mismatched. Install from the pinned lock file on Python 3.11 + CUDA 13.
 
 **Source edits have no effect.** The package was installed non-editably, or the editable install
 cannot rebuild. Reinstall with `uv pip install --no-build-isolation -e ./SSAF-T`.
@@ -17,40 +17,42 @@ cannot rebuild. Reinstall with `uv pip install --no-build-isolation -e ./SSAF-T`
 **No anchors, or anchors outside the tissue.** `revert_image` does not match the stain: `True` for
 H&E (dark tissue on bright), `False` for DAPI, polyT, ssDNA.
 
-**Sparse tissue missing from the anchors.** The Otsu mask is too tight; lower
-[`otsu_mult`](pipeline/downsample.md#otsu_mult) (e.g. `0.6`).
+**Sparse tissue missing from the anchors.** The Otsu mask is too tight; reduce `otsu_mult` (for
+example `0.6`) on {py:meth}`~ssaft.Analysis.downsample_vector`.
 
-**`no anchor survived on any of the N planes` (3D).** The z-stack's z transformation does not put
-the planes inside the transcripts' z range. Check `z_step`, and for MERSCOPE convert transcript z
-from plane index to µm.
+**`no anchor survived on any of the N planes` (3D).** The z-stack's z transformation does not place
+the planes within the transcripts' z range. Verify `z_step`, and for MERSCOPE convert the transcript
+z from plane index to micrometres.
 
-**`ValueError: the count backend field is a 2D blur raster`.** Count platforms are 2D; pass `z=2`.
+**`ValueError: the count backend field is a 2D blur raster`.** Array-based platforms are
+two-dimensional; pass `z=2`.
 
-**`otsu_mult is supported for the transcript backend only`.** Use `otsu_threshold` on count
+**`otsu_mult is supported for the transcript backend only`.** Use `otsu_threshold` on array-based
 platforms.
 
 ## Mapping and filtering
 
-**The map looks shifted against the image.** The image-to-molecule registration is off. Count
-platforms: check the overlay in the coordinate system the reader used (`<dataset_id>` for Visium HD,
-`'global'` for Stereo-seq), not in another one.
+**The map appears shifted against the image.** The image-to-molecule registration is incorrect. For
+array-based platforms, inspect the overlay in the coordinate system used by the reader
+(`<dataset_id>` for Visium HD, `'global'` for Stereo-seq) rather than in another.
 
-**`spatialdata_io.stereoseq` cannot find its files.** It reads the directory layout of older SAW
-releases (`03.register/`, `04.tissuecut/`, ...); see [Stereo-seq](platforms/stereoseq.md#input).
+**`spatialdata_io.stereoseq` cannot find its files.** The reader expects the directory layout of
+older SAW releases (`03.register/`, `04.tissuecut/`, ...); see the Stereo-seq tab on
+[load](pipeline/load.md).
 
-**A rare cell type is missing from the map.** Try `method='lda'` (the default) rather than `corr`,
-lower `norm_f`, and check the annotation actually emitted it.
+**A rare cell type is missing from the map.** Use `method='lda'` (the default) rather than `corr`,
+reduce `norm_f`, and confirm that the annotation emitted the type.
 
-**Most voxels removed.** Lower [`norm_f`](pipeline/filter.md#norm_f); keep `min_p` at 0 unless you
-need unambiguous calls only.
+**Most voxels removed.** Reduce `norm_f` on {py:meth}`~ssaft.Analysis.filter_celltypemaps`; keep
+`min_p` at 0 unless only unambiguous calls are required.
 
-**GPU out of memory.** Lower `gpu_target_bytes` (mapping), `chunk_w` (compute_vf), or run PCA on the
-CPU (clustering).
+**GPU out of memory.** Reduce `gpu_target_bytes` (mapping) or `chunk_w` (compute_vf), or run PCA on
+the CPU (clustering).
 
 ## Other
 
-**`print(sdata)` crashes on a large store.** The SpatialData repr walks every dask graph; the data is
-intact. Print element keys instead: `list(sdata.images)`, `list(sdata.points)`.
+**`print(sdata)` crashes on a large store.** The SpatialData repr traverses every dask graph; the
+data is intact. Print the element keys instead: `list(sdata.images)`, `list(sdata.points)`.
 
-**Large numpy allocations stall for minutes with high system CPU.** Transparent huge page compaction.
-Set `NUMPY_MADVISE_HUGEPAGE=0` before starting Python.
+**Large numpy allocations stall for minutes with high system CPU.** This is transparent huge page
+compaction. Set `NUMPY_MADVISE_HUGEPAGE=0` before starting Python.

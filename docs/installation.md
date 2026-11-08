@@ -1,7 +1,7 @@
 # Installation
 
-SSAF-T is distributed as source on GitHub only; there is no PyPI or conda package. You build it
-into a virtual environment of your own.
+SSAF-T is distributed as source on GitHub only; no PyPI or conda package is provided. It is built
+into a dedicated virtual environment.
 
 ## Requirements
 
@@ -13,12 +13,13 @@ into a virtual environment of your own.
 | Build tools | a C++17 compiler; `meson`, `ninja` and `meson-python` are pulled in by the build | same |
 | Package manager | [uv](https://docs.astral.sh/uv/) | uv |
 
-The GPU stack (RAPIDS `cuml`/`cugraph`/`cuvs`, `rapids-singlecell`, `cupy`, `torch`, `triton`) is
-only verified on **Python 3.11 + CUDA 13**. Other combinations may resolve, but they are not tested
-and are not supported by the [agent skill](agent.md).
+The GPU stack (RAPIDS `cuml`/`cugraph`/`cuvs`, `rapids-singlecell`, `cupy`, `torch`, `triton`) has
+been verified only on **Python 3.11 + CUDA 13**. Other combinations may resolve but are untested and
+are not supported.
 
-A CUDA GPU is effectively required for real datasets: the KDE, the mapping and the Leiden
-clustering all run on it. The CPU install is useful for inspecting stores and for small crops.
+A CUDA GPU is effectively required for datasets of realistic size: the kernel density estimate, the
+mapping and the Leiden clustering are all performed on it. The CPU installation is intended for
+inspecting stores and for small crops.
 
 ## 1. Get the source
 
@@ -26,8 +27,8 @@ clustering all run on it. The CPU install is useful for inspecting stores and fo
 git clone --recurse-submodules https://github.com/pnucolab/SSAF-T.git
 ```
 
-`--recurse-submodules` also fetches `SSAF-T/CeLLMan`, the annotation skill and agent. If you
-cloned without it, run `git submodule update --init` inside `SSAF-T/`.
+`--recurse-submodules` also fetches `SSAF-T/CeLLMan`, the annotation skill and agent. If the
+repository was cloned without it, run `git submodule update --init` inside `SSAF-T/`.
 
 ## 2. Create the environment
 
@@ -38,13 +39,13 @@ source .venv/bin/activate
 
 ## 3. Install
 
-Pick **one**.
+Select **one**.
 
 ::::{tab-set}
 
 :::{tab-item} GPU, pinned (recommended)
-Reproduces the environment the tutorials were run in. Every dependency is pinned in
-`requirements-lock.txt`; SSAF-T itself is then installed without re-resolving.
+Reproduces the environment in which the tutorials were run. Every dependency is pinned in
+`requirements-lock.txt`, and SSAF-T itself is then installed without re-resolving.
 
 ```bash
 uv pip install -r SSAF-T/requirements-lock.txt \
@@ -56,8 +57,8 @@ uv pip install --no-deps ./SSAF-T
 :::
 
 :::{tab-item} GPU, ranges
-Resolves the compatible ranges declared in `pyproject.toml`. Use this when SSAF-T has to share the
-environment with other packages.
+Resolves the compatible ranges declared in `pyproject.toml`. This option is appropriate when SSAF-T
+must share the environment with other packages.
 
 ```bash
 uv pip install './SSAF-T[gpu]' \
@@ -77,25 +78,29 @@ uv pip install ./SSAF-T
 
 ### CPUs without AVX-512
 
-The C extension is built with AVX-512 enabled on every x86_64 host without checking the CPU. On a
-machine that lacks it the first call into the extension dies with *illegal instruction*. Check:
+The C extension is built with AVX-512 enabled on every x86_64 host, without checking the CPU. On a
+machine that lacks AVX-512, the first call into the extension terminates with *illegal instruction*.
+This is checked as follows:
 
 ```bash
 lscpu | grep -o avx512f | head -1     # prints nothing -> no AVX-512
 ```
 
-If it prints nothing (most consumer Ryzen and Core CPUs, every Intel Mac), append
-`--config-settings=setup-args=-Dsimd=disabled` to the install command you chose. ARM hosts need
-nothing.
+If nothing is printed (most consumer Ryzen and Core CPUs, and every Intel Mac), append
+`--config-settings=setup-args=-Dsimd=disabled` to the chosen install command. ARM hosts require no
+such adjustment.
 
 ### Editable install (development)
 
+This is applied on top of an environment that already carries the dependencies (for example after
+the GPU install above); the `[dev]` extra adds only the test tools, not the GPU stack. The build
+backend must be present in that environment first, because `--no-build-isolation` has meson-python
+rebuild the extension on import from the tools found there:
+
 ```bash
+uv pip install meson-python meson ninja
 uv pip install --no-build-isolation -e './SSAF-T[dev]'
 ```
-
-`--no-build-isolation` is required: meson-python rebuilds the extension on import, and it can only
-do so when the build tools live in the same environment.
 
 ## 4. Verify
 
@@ -112,14 +117,14 @@ PY
 ```
 
 ```{note}
-CUDA device numbering follows PCI bus order in PyTorch but may differ from the order printed by
-`nvidia-smi`. Check `torch.cuda.get_device_name(i)` before choosing `gpu_device='cuda:1'`.
+CUDA device numbering in PyTorch follows PCI bus order and may differ from the order printed by
+`nvidia-smi`. Verify `torch.cuda.get_device_name(i)` before selecting `gpu_device='cuda:1'`.
 ```
 
-## 5. Register CeLLMan with your LLM host
+## 5. Register CeLLMan with the language-model host
 
-The annotation stage is run by an LLM host (Claude Code or Codex), not by Python. Copy the skill and
-the expert agent from the submodule:
+The annotation stage is run by a language-model host (Claude Code or Codex) rather than by Python.
+Copy the skill and the expert agent from the submodule:
 
 ::::{tab-set}
 
@@ -142,7 +147,7 @@ printf '\n[sandbox_workspace_write]\nnetwork_access = true\n' >> .codex/config.t
 
 ::::
 
-The annotator reads the Cell-Ontology knowledge graph from its public server
-(`https://cellman.pnucolab.com`); no local database is needed. Keep exactly one CeLLMan clone in
-the directory tree the host runs from: the skill locates its helper by searching for
+The annotator reads the knowledge graph from its public server (`https://cellman.pnucolab.com`), so
+no local database is required. Exactly one CeLLMan clone must be present in the directory tree from
+which the host runs, because the skill locates its helper by searching for
 `*CeLLMan/scripts/helper.py`.

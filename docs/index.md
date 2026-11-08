@@ -1,54 +1,41 @@
 # SSAF-T
 
-**Spatial Segmentation-free Agentic Framework - Transcriptomics**
+**A spatial segmentation-free agentic framework for transcriptomics**
 
-SSAF-T assigns cell types in spatial transcriptomics without segmenting cells first. Transcripts
-(or binned counts) are turned into a kernel-density **vector field**; representative positions of
-that field are clustered; the clusters are named by the agentic annotator
-[CeLLMan](https://github.com/pnucolab/CeLLMan); and the names are mapped back onto every voxel of
-the field. Segmentation, if you want single cells at all, comes last and is constrained by the map.
+SSAF-T infers cell types from spatial transcriptomics data without using cell boundaries to decide
+identity. Expression is estimated as a continuous gene expression vector field — computed from
+transcript coordinates for imaging-based data and from binned counts for array-based data — and cell
+identity is settled on that field by [CeLLMan](https://github.com/pnucolab/CeLLMan), a large language
+model agent that queries a curated, literature-grounded knowledge graph in place of a reference
+dataset. The vector field is sampled at representative positions within a tissue mask, the sampled
+vectors are clustered and annotated, and the labels are extended to every voxel of the field by a
+semi-supervised classifier, producing a cell-type map. Because identity is settled on the field,
+cells are not required at any point: where single cells are wanted they are recovered from the
+finished map, so that segmentation becomes the last step rather than the first.
 
 ```{image} ../SSAF-T.png
 :alt: SSAF-T overview
 :width: 100%
 ```
 
-## Supported platforms
-
-| platform | data kind | loaded with | 2D | 3D |
-|---|---|---|---|---|
-| [Xenium](platforms/xenium.md) | transcripts | `spatialdata_io.xenium` | yes | yes |
-| [MERSCOPE / MERFISH](platforms/merscope.md) | transcripts | `spatialdata_io.merscope` | yes | yes |
-| [CosMx](platforms/cosmx.md) | transcripts, per FOV | `spatialdata_io.cosmx` | yes (experimental) | yes (experimental) |
-| [Visium HD](platforms/visiumhd.md) | 2 µm bins | `spatialdata_io.visium_hd` | yes | no |
-| [Stereo-seq](platforms/stereoseq.md) | 0.5 µm DNB bins (SAW) | `spatialdata_io.stereoseq` | yes | no |
-
 ## Where to start
 
-- New here: [Installation](installation.md), then [Concepts](concepts.md).
-- Running a dataset: find your platform under **Platforms**, then follow the
-  [pipeline stages](pipeline/index.md) it lists. Every parameter has its own anchor, e.g.
-  [`n_samples`](pipeline/downsample.md#n_samples).
-- Driving the run from an LLM agent: see [Running with an agent](agent.md).
+- Installation and a first run: [Installation](installation.md), followed by the
+  [Quick start](tldr.md).
+- Processing a dataset: the [pipeline stages](pipeline/index.md) document each step; the platform is
+  selected in each stage's tabs, and every function's parameters are given in the
+  [API reference](api.md).
+- Browsing without a local installation: the [SSAF-T viewer](https://ssaf.pnucolab.com/T) presents
+  the cell-type maps and the [CeLLMan KG Explorer](https://cellman.pnucolab.com) the knowledge graph;
+  each portal documents its own use on its About page.
 
 ```{toctree}
 :maxdepth: 1
 :caption: Getting started
 
 installation
-concepts
+tldr
 tutorials
-```
-
-```{toctree}
-:maxdepth: 1
-:caption: Platforms
-
-platforms/xenium
-platforms/merscope
-platforms/cosmx
-platforms/visiumhd
-platforms/stereoseq
 ```
 
 ```{toctree}
@@ -60,10 +47,15 @@ pipeline/index
 
 ```{toctree}
 :maxdepth: 1
+:caption: API
+
+api
+```
+
+```{toctree}
+:maxdepth: 1
 :caption: Reference
 
 outputs
-api
-agent
 troubleshooting
 ```
