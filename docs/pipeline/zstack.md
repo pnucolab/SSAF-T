@@ -20,7 +20,7 @@ A single ZYX stack file; `z_step` is read from the OME metadata.
 ```python
 sdata.images["morphology_zstack"] = ssaft.Analysis.zstack_image(
     "path/to/morphology.ome.tif", like=sdata.images["morphology_focus"])
-sdata.write("outputs/sample/spatialdata.zarr")
+sdata.write("outputs/sample/ssaft_sdata.zarr")
 ```
 :::
 
@@ -32,7 +32,7 @@ loading only `z0` and `z3` requires `z_step=4.5`).
 ```python
 sdata.images["morphology_zstack"] = ssaft.Analysis.zstack_image(
     "path/to/images", like=sdata.images["<dataset_id>_z3"], z_step=1.5)
-sdata.write("outputs/sample/spatialdata.zarr")
+sdata.write("outputs/sample/ssaft_sdata.zarr")
 ```
 :::
 

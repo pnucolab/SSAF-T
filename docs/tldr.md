@@ -19,8 +19,8 @@ field is then built into a SSAF-T store. See [load](pipeline/load.md) and
 import spatialdata as sd, spatialdata_io, ssaft
 
 sdata = spatialdata_io.xenium("path/to/xenium_output")
-sdata.write("outputs/sample/spatialdata.zarr")
-sdata = sd.read_zarr("outputs/sample/spatialdata.zarr")
+sdata.write("outputs/sample/ssaft_sdata.zarr")
+sdata = sd.read_zarr("outputs/sample/ssaft_sdata.zarr")
 
 ds = ssaft.Dataset("outputs/sample/ssaft_store")
 analysis = ssaft.Analysis(ds, ncores=30, verbose=True)

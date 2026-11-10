@@ -11,8 +11,10 @@ import yaml  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config as C  # noqa: E402
+from _common.store import panel_genes  # noqa: E402
 
 STORE = C.SDATA
+GRID = C.SDATA.parent / "ssaft_store"
 OUT = C.OUT
 TAB = C.TAB
 WORK = C.TAB / "work"
@@ -95,6 +97,4 @@ def enact_cells(backed=None):
     return ad.read_h5ad(p, backed=backed)
 
 def signal_genes():
-    import spatialdata as sd
-    dv = sd.read_zarr(STORE, selection=("tables",)).tables["ssaft_downsampled_vectors"]
-    return [str(g) for g in dv.var_names]
+    return panel_genes(GRID, STORE)

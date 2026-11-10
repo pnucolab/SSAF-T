@@ -31,7 +31,7 @@ DATA    = Path("data/visiumhd_small_intestine")
 FULLRES = DATA / "Visium_HD_Mouse_Small_Intestine_tissue_image.btf"
 ENACT   = Path("data/enact_output/mouse_small_intestine")
 OUT     = Path("outputs/visiumhd_small_intestine")
-ZARR    = OUT / "spatialdata.zarr"
+ZARR    = OUT / "ssaft_sdata.zarr"                 # SpatialData store: the input and every ssaft output
 STORE   = OUT / "ssaft_store"
 CLS     = OUT / "mouse_small_intestine_cls.h5ad"
 ANNOTATION = OUT / "annotation_out"
@@ -120,16 +120,17 @@ Ref: [downsample](../pipeline/downsample.md) (Visium HD tab).
 ## 5. Cluster
 
 ```python
-import scanpy as sc
 import rapids_singlecell as rsc
 
-# PCA on the CPU: the anchors x panel matrix does not fit on a 24 GB GPU next to the vector field;
-# the kNN graph and Leiden run on the GPU
-sc.pp.pca(adata, n_comps=50, svd_solver="randomized", random_state=0)
+rsc.pp.pca(adata, n_comps=50)
 rsc.pp.neighbors(adata, n_neighbors=15)
 rsc.tl.leiden(adata, resolution=1)
 adata.write_h5ad(CLS)
 ```
+
+The dense `anchors x panel` matrix is approximately 13 GB here, so on a 24 GB device the vector
+field's allocation has to be released first (the notebook kernel is restarted after the
+downsampling) or `rsc.pp.pca` has to be given `chunked=True`.
 
 Ref: [cluster](../pipeline/cluster.md).
 
@@ -227,7 +228,27 @@ territory of the map.
 
 Ref: [segment](../pipeline/segment.md) (array platforms seed segmentation from external nuclei).
 
-## 9. Explore in the viewer
+## 9. Save
+
+SSAF-T adds its elements to the SpatialData in memory, so the run ends by writing the ones the zarr
+does not hold yet. Everything stays in the one store the example opened with: there is no second
+zarr for the cells.
+
+```python
+SKIP = {"ssaft_downsampled_vectors"}     # the anchors stay in the SSAF-T store, not here
+on_disk = set(sdata.elements_paths_on_disk())
+new = sorted({p.rsplit("/", 1)[-1] for p in sdata.elements_paths_in_memory()
+              if p not in on_disk} - SKIP)
+sdata.write_element(new)
+```
+
+An element already in the zarr cannot be overwritten in place: `delete_element_from_disk` has to
+remove the previous copy first, which is what the reproduction scripts under `notebooks/` do when a
+stage is run again.
+
+Ref: [outputs](../outputs.md).
+
+## 10. Explore in the viewer
 
 The 2D map and the recovered cells are presented in the
 [SSAF-T viewer](https://ssaf.pnucolab.com/T/explore/visiumhd-mouse-small-intestine-ffpe/); the

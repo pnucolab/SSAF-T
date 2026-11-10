@@ -17,7 +17,6 @@ CELLBIN = MOSTA / "Mouse_brain_Adult_GEM_CellBin.tsv.gz"
 
 
 CELLTYPE_MAP = "ssaft_celltype_map"
-VECTORS = "ssaft_downsampled_vectors"
 SHAPES_2D = "ssaft_cell_boundaries_2d"
 TABLE = "ssaft_cells"
 LABEL_COL = "cellman_annotation"

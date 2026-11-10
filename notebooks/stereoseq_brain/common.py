@@ -6,9 +6,11 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config as C  # noqa: E402
+from _common.store import celltype_names, panel_genes  # noqa: E402
 
 OUT, CACHE, TAB = C.OUT, C.CACHE, C.TAB
 STORE = C.SDATA
+GRID = C.SDATA.parent / "ssaft_store"
 X0, Y0, W, H, PX = C.X0, C.Y0, C.W, C.H, C.PX
 NX, NY = C.NX, C.NY
 
@@ -47,10 +49,10 @@ def raster(b, genes=None, px=PX, weight="umi"):
 
 def load_map(filtered=True):
     import spatialdata as sd
-    s = sd.read_zarr(C.SDATA, selection=("labels", "tables"))
+    s = sd.read_zarr(C.SDATA, selection=("labels",))
     lab = np.asarray(s.labels[C.CELLTYPE_MAP])
     cm = lab[0] if lab.ndim == 3 and lab.shape[0] == 1 else lab
-    names = list(s.tables[C.VECTORS].obs[C.LABEL_COL].cat.categories)
+    names = celltype_names(GRID, C.SDATA, C.LABEL_COL)
     if cm.shape != (W, H):
         cm = cm.T
     assert cm.shape == (W, H), f"map {cm.shape} is not the {W} x {H} µm grid"
@@ -67,9 +69,7 @@ def palette():
 
 
 def signal_genes():
-    import spatialdata as sd
-    dv = sd.read_zarr(C.SDATA, selection=("tables",)).tables[C.VECTORS]
-    return [str(g) for g in dv.var_names]
+    return panel_genes(GRID, C.SDATA)
 
 
 def ssaft_cells():

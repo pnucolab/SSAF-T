@@ -8,6 +8,7 @@ from pathlib import Path
 os.environ.setdefault("NUMPY_MADVISE_HUGEPAGE", "0")
 
 import config as C                                      # noqa: E402
+from _common.store import save_elements                 # noqa: E402
 
 
 DIM = 2
@@ -19,6 +20,7 @@ BANDWIDTH = 2.5
 SD = 2.0
 PRUNE = 4.3
 N_SAMPLES, BLOCK_UM = 5, 10.0
+VF_NORM_PERC = 25
 N_COMPS, N_NEIGHBORS, RESOLUTION = 50, 15, 1.0
 NORM_F = 0.3
 
@@ -59,6 +61,7 @@ def step_down(args):
     sdata = sd.read_zarr(C.SDATA)
     adata = an.downsample_vector(
         sdata, z=DIM, element_name=C.BIN_TABLE, n_samples=N_SAMPLES, block_um=BLOCK_UM,
+        vf_norm_percentile=VF_NORM_PERC,
         bandwidth=BANDWIDTH, sampling_distance=SD, kernel=KERNEL, prune_coefficient=PRUNE,
         genes=signal_genes(sdata.tables[C.BIN_TABLE]), gpu_device=DEVICE)
     print(f"anchors {adata.n_obs:,} x {adata.n_vars} genes", flush=True)
@@ -81,15 +84,13 @@ def step_map(args):
 def step_filter(args):
     import spatialdata as sd
     sdata = store().filter_celltypemaps(sd.read_zarr(C.SDATA), norm_f=NORM_F, show_unknown=True)
-    for k in ("ssaft_celltype_map", "ssaft_celltype_map_rgb"):
-        sdata.write_element(k, overwrite=True)
+    save_elements(sdata, ("ssaft_celltype_map", "ssaft_celltype_map_rgb"))
 
 
 def step_segment(args):
     import spatialdata as sd
     sdata = store().segment_cells(sd.read_zarr(C.SDATA), nuclei=NUCLEI)
-    for k in (C.SHAPES_2D, C.TABLE):
-        sdata.write_element(k, overwrite=True)
+    save_elements(sdata, (C.SHAPES_2D, C.TABLE))
     print(f"cells {sdata.tables[C.TABLE].n_obs:,}", flush=True)
 
 

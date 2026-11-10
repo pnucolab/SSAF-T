@@ -18,7 +18,7 @@ import ssaft
 
 SLICE = Path(ssaft.__file__).parent / "scripts" / "slice_spatialdata.py"
 subprocess.run([sys.executable, str(SLICE),
-                "--sdata-path", "outputs/sample/spatialdata.zarr",
+                "--sdata-path", "outputs/sample/ssaft_sdata.zarr",
                 "--tile-size", "10000",
                 "--output-dir", "outputs/sample/spatialdata_crops",
                 "--image-key", "morphology_focus", "morphology_zstack",

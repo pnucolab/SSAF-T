@@ -2,7 +2,7 @@
 
 Usage:
     .venv/bin/python scripts/slice_spatialdata.py \\
-        --sdata-path  dataset/<DATASET>/spatialdata.zarr \\
+        --sdata-path  dataset/<DATASET>/ssaft_sdata.zarr \\
         --tile-size   10000 \\
         --output-dir  dataset/<DATASET>/spatialdata_crops
 """

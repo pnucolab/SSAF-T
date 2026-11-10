@@ -54,7 +54,7 @@ a new process:
 
 | after | what is on disk | resume with |
 |---|---|---|
-| load | `spatialdata.zarr` | `sd.read_zarr(...)` |
+| load | `ssaft_sdata.zarr` | `sd.read_zarr(...)` |
 | tile | `<crops>/r00_c00.zarr ...` | pass the directory as `sdata_dir` |
 | field | `vf_normalized`, `vf_norm` in the store | `ssaft.Dataset(store)` |
 | downsample | anchors in the store | `Dataset(store)`; the AnnData can be rebuilt from the store |

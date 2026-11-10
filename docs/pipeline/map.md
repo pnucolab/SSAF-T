@@ -24,7 +24,8 @@ sdata = analysis.map_celltypes(
 Written to the store: `celltype_maps` (voxel to class id), the score volume for the method
 (`max_probabilities` for `lda`/`gnb`, `max_correlations` for `corr`), `vf_norm`, and the class names
 and colours. Written to `sdata`: `tables['ssaft_downsampled_vectors']`, the representative vectors
-with their rebuilt labels and palette. The raster images are added by [filter](filter.md).
+with their rebuilt labels and palette, which is usually left in memory because the store
+holds the same vectors, names and colours. The raster images are added by [filter](filter.md).
 
 This is the most time-consuming stage on large sections, requiring hours in three dimensions.
 

@@ -22,7 +22,7 @@ given by `ds.celltype_names_colors()`.
 
 | element | kind | written by | notes |
 |---|---|---|---|
-| `ssaft_downsampled_vectors` | table | `map_celltypes` | anchors with `obs['cellman_annotation']` and `uns['cellman_annotation_colors']`; the categories name the map's pixel values |
+| `ssaft_downsampled_vectors` | table | `map_celltypes` | anchors with `obs['cellman_annotation']` and `uns['cellman_annotation_colors']`; the categories name the map's pixel values. Usually left in memory, since the store holds the same vectors, names and colours |
 | `ssaft_celltype_map` | labels | `filter_celltypemaps` | pixel = class id + 1, 0 = background; `(z, y, x)` in 3D |
 | `ssaft_celltype_map_rgb` | image | `filter_celltypemaps` | RGB rendering; middle layer in 3D |
 | `ssaft_cell_boundaries_2d` | shapes | `segment_cells` | one polygon per cell (on its seed layer in 3D) |
@@ -40,10 +40,13 @@ sdata.pl.render_shapes("ssaft_cell_boundaries_2d", color="cellman_annotation",
                        table_name="ssaft_cells").pl.show()
 ```
 
-`sdata` is modified in memory; the elements to be retained are written explicitly:
+`sdata` is modified in memory; the elements to be retained are written explicitly. An
+element the zarr already holds cannot be overwritten in place, so a second run has to
+`sdata.delete_element_from_disk(name)` before writing it again:
 
 ```python
-sdata.write_element(["ssaft_celltype_map", "ssaft_celltype_map_rgb", "ssaft_downsampled_vectors"])
+sdata.write_element(["ssaft_celltype_map", "ssaft_celltype_map_rgb",
+                     "ssaft_cell_boundaries_2d", "ssaft_cells"])
 sdata.tables["ssaft_cells"].write_h5ad("outputs/sample/ssaft_cells.h5ad")
 ```
 

@@ -28,7 +28,7 @@ import ssaft
 
 DATA = Path("data/xenium_kidney/ShamR-output-XETG00063__0005295__Region_6__20230717__191520")
 OUT  = Path("outputs/xenium_kidney")
-ZARR  = OUT / "spatialdata.zarr"      # Xenium outputs + the morphology z-stack
+ZARR  = OUT / "ssaft_sdata.zarr"      # the input (Xenium + z-stack) and every ssaft output
 CROPS = OUT / "spatialdata_crops"     # tiles for chunked downsampling
 STORE = OUT / "ssaft_store"           # SSAF-T store: anchors, vector-field norms, cell-type maps
 CLS   = OUT / "mouse_kidney_cls.h5ad" # clustered anchors, the input of annotate-mode
@@ -238,7 +238,27 @@ where the map changes type; cells of the same type divide midway between their n
 
 Ref: [segment](../pipeline/segment.md).
 
-## 9. Explore in the viewer
+## 9. Save
+
+SSAF-T adds its elements to the SpatialData in memory, so the run ends by writing the ones the zarr
+does not hold yet. Everything stays in the one store the example opened with: there is no second
+zarr for the cells.
+
+```python
+SKIP = {"ssaft_downsampled_vectors"}     # the anchors stay in the SSAF-T store, not here
+on_disk = set(sdata.elements_paths_on_disk())
+new = sorted({p.rsplit("/", 1)[-1] for p in sdata.elements_paths_in_memory()
+              if p not in on_disk} - SKIP)
+sdata.write_element(new)
+```
+
+An element already in the zarr cannot be overwritten in place: `delete_element_from_disk` has to
+remove the previous copy first, which is what the reproduction scripts under `notebooks/` do when a
+stage is run again.
+
+Ref: [outputs](../outputs.md).
+
+## 10. Explore in the viewer
 
 The 3D map and the recovered cells are presented in the browser by the
 [SSAF-T viewer](https://ssaf.pnucolab.com/T/explore/xenium-mouse-kidney-sham-region6/). The

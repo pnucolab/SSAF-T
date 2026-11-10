@@ -7,6 +7,7 @@ import os
 os.environ.setdefault("NUMPY_MADVISE_HUGEPAGE", "0")
 
 import config as C                                      # noqa: E402
+from _common.store import save_elements                 # noqa: E402
 
 
 DIM = 3
@@ -64,18 +65,15 @@ def step_map(args):
 def step_filter(args):
     import spatialdata as sd
     sdata = store().filter_celltypemaps(sd.read_zarr(C.SDATA), norm_f=NORM_F, show_unknown=True)
-    for k in ("ssaft_celltype_map", "ssaft_celltype_map_rgb"):
-        sdata.write_element(k, overwrite=True)
+    save_elements(sdata, ("ssaft_celltype_map", "ssaft_celltype_map_rgb"))
 
 
 def step_segment(args):
     import spatialdata as sd
     sdata = store().segment_cells(sd.read_zarr(C.SDATA), nuclei=NUCLEI, transcripts=POINTS,
                                   seed_rule=args.seed_rule)
-    for k in ("ssaft_cell_boundaries_2d", "ssaft_cell_boundaries_3d", "ssaft_cell_labels_3d",
-              "ssaft_cells"):
-        if k in sdata.shapes or k in sdata.labels or k in sdata.tables:
-            sdata.write_element(k, overwrite=True)
+    save_elements(sdata, ("ssaft_cell_boundaries_2d", "ssaft_cell_boundaries_3d",
+                          "ssaft_cell_labels_3d", "ssaft_cells"))
     print(f"cells {sdata.tables['ssaft_cells'].n_obs:,}", flush=True)
 
 

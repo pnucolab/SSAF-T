@@ -14,8 +14,9 @@ Written to the store: `filtered_celltype_maps` (`-1` = background). Written to `
   map retains every layer as `(z, y, x)`;
 - `images['ssaft_celltype_map_rgb']`: an RGB rendering (the middle layer in three dimensions).
 
-The class names for the pixel values are
-`sdata['ssaft_downsampled_vectors'].obs['cellman_annotation'].cat.categories[pixel - 1]`.
+The class names for the pixel values come from the store, `ds.celltype_names_colors()[0][pixel - 1]`.
+The in-memory `sdata['ssaft_downsampled_vectors'].obs['cellman_annotation'].cat.categories` is the
+same list in the same order, but that table is not usually written to the zarr.
 
 Two independent questions arise, with one parameter for each:
 

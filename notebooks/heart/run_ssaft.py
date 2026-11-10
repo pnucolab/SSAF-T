@@ -7,6 +7,7 @@ import os
 os.environ.setdefault("NUMPY_MADVISE_HUGEPAGE", "0")
 
 import config as C                                      # noqa: E402
+from _common.store import save_elements                 # noqa: E402
 
 
 DIM = 3
@@ -101,8 +102,7 @@ def step_filter(section, p):
     import spatialdata as sd
     sdata = analysis(section).filter_celltypemaps(sd.read_zarr(p["zarr"]), norm_f=NORM_F,
                                                   show_unknown=True)
-    for k in ("ssaft_celltype_map", "ssaft_celltype_map_rgb"):
-        sdata.write_element(k, overwrite=True)
+    save_elements(sdata, ("ssaft_celltype_map", "ssaft_celltype_map_rgb"))
 
 
 def step_segment(section, p):
@@ -112,9 +112,8 @@ def step_segment(section, p):
     nz = sdata.shapes[NUCLEI]["z"].to_numpy().astype(float) * Z_STEP
     sdata = an.segment_cells(sdata, nuclei=NUCLEI, nuclei_z=nz, nuclei_frame="intrinsic",
                              transcripts="transcripts", exclude_celltypes=EXCLUDE)
-    for k in ("ssaft_cell_boundaries_2d", "ssaft_cell_boundaries_3d", "ssaft_cell_labels_3d",
-              "ssaft_cells"):
-        sdata.write_element(k, overwrite=True)
+    save_elements(sdata, ("ssaft_cell_boundaries_2d", "ssaft_cell_boundaries_3d",
+                          "ssaft_cell_labels_3d", "ssaft_cells"))
     cells = sdata.tables["ssaft_cells"]
     cells.write_h5ad(p["cells"])
     o = cells.obs

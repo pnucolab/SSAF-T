@@ -11,6 +11,7 @@ os.environ.setdefault("NUMPY_MADVISE_HUGEPAGE", "0")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _common.paths import REPO                                      # noqa: E402
+from _common.store import save_elements                              # noqa: E402
 
 
 SKIN = Path(os.environ.get("SSAFT_SKIN", REPO / "_notebooks/fig5_skin"))
@@ -121,7 +122,6 @@ def step_map(args):
 
 
 def _promote(backup=True):
-    import contextlib
     import json
     import numpy as np
     import shutil
@@ -197,15 +197,8 @@ def _promote(backup=True):
     ds.sampling_distance = float(ds.zarr_group.attrs.get("sampling_distance", SD))
     ds.filtered_celltype_maps = np.asarray(ds.zarr_group["filtered_celltype_maps"][:])
     sdata = ds.write_celltype_map(sd.read_zarr(ZARR))
-    on_disk = set()
-    with contextlib.suppress(Exception):
-        on_disk = set(sdata.elements_paths_on_disk())
-    for k in ("ssaft_celltype_map", "ssaft_celltype_map_rgb"):
-        with contextlib.suppress(Exception):
-            if any(q.endswith("/" + k) for q in on_disk) or k in on_disk:
-                sdata.delete_element_from_disk(k)
-        sdata.write_element(k, overwrite=True)
-        log(f"promote: persisted {k}")
+    saved = save_elements(sdata, ("ssaft_celltype_map", "ssaft_celltype_map_rgb"))
+    log(f"promote: persisted {saved}")
 
 
 def step_filter(args):
@@ -213,8 +206,7 @@ def step_filter(args):
     import spatialdata as sd
     an = analysis()
     sdata = an.filter_celltypemaps(sd.read_zarr(ZARR), norm_f=NORM_F, show_unknown=True)
-    for k in ("ssaft_celltype_map", "ssaft_celltype_map_rgb"):
-        sdata.write_element(k, overwrite=True)
+    save_elements(sdata, ("ssaft_celltype_map", "ssaft_celltype_map_rgb"))
     fm = np.asarray(an.dataset.zarr_group["filtered_celltype_maps"][:])
     log(f"filter: {float((fm >= 0).mean()):.2%} of voxels kept")
 
@@ -247,9 +239,8 @@ def step_segment(args):
     if z is not None:
         kw["nuclei_z"] = z
     sdata = an.segment_cells(sdata, nuclei=NUCLEI, **kw)
-    for k in ("ssaft_cell_boundaries_2d", "ssaft_cell_boundaries_3d", "ssaft_cell_labels_3d",
-              "ssaft_cells"):
-        sdata.write_element(k, overwrite=True)
+    save_elements(sdata, ("ssaft_cell_boundaries_2d", "ssaft_cell_boundaries_3d",
+                          "ssaft_cell_labels_3d", "ssaft_cells"))
     cells = sdata.tables["ssaft_cells"]
     cells.write_h5ad(OUT / "ssaft_cells.h5ad")
     log(f"segment: {cells.n_obs:,} cells")

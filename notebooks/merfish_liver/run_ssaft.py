@@ -8,6 +8,7 @@ from pathlib import Path
 os.environ.setdefault("NUMPY_MADVISE_HUGEPAGE", "0")
 
 import config as C                                      # noqa: E402
+from _common.store import save_elements                 # noqa: E402
 
 
 DIM = 3
@@ -90,15 +91,13 @@ def step_map(args):
 def step_filter(args):
     import spatialdata as sd
     sdata = store().filter_celltypemaps(sd.read_zarr(C.SDATA), norm_f=NORM_F, show_unknown=True)
-    for k in ("ssaft_celltype_map", "ssaft_celltype_map_rgb"):
-        sdata.write_element(k, overwrite=True)
+    save_elements(sdata, ("ssaft_celltype_map", "ssaft_celltype_map_rgb"))
 
 
 def step_segment(args):
     import spatialdata as sd
     sdata = store().segment_cells(sd.read_zarr(C.SDATA), nuclei=C.NUCLEI, transcripts=C.POINTS)
-    for k in (C.SHAPES_2D, C.SHAPES_3D, "ssaft_cell_labels_3d", C.TABLE):
-        sdata.write_element(k, overwrite=True)
+    save_elements(sdata, (C.SHAPES_2D, C.SHAPES_3D, "ssaft_cell_labels_3d", C.TABLE))
     print(f"cells {sdata.tables[C.TABLE].n_obs:,}", flush=True)
 
 

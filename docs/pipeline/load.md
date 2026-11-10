@@ -10,8 +10,8 @@ import spatialdata as sd
 import spatialdata_io
 
 sdata = spatialdata_io.xenium("path/to/xenium_output")   # one reader per platform, below
-sdata.write("outputs/sample/spatialdata.zarr")
-sdata = sd.read_zarr("outputs/sample/spatialdata.zarr")   # always continue from the zarr
+sdata.write("outputs/sample/ssaft_sdata.zarr")
+sdata = sd.read_zarr("outputs/sample/ssaft_sdata.zarr")   # always continue from the zarr
 ```
 
 Reading back from zarr is necessary because the vendor readers return lazily-parsed elements whose
@@ -97,7 +97,7 @@ fov_sdata = sd.SpatialData(
         transformations={"global": Scale([1/PX_UM, 1/PX_UM], axes=("x", "y"))})},
     images={"composite": Image2DModel.parse(sdata.images[f"{fov}_image"].data, dims=("c","y","x"),
         transformations={"global": Identity()})})
-fov_sdata.write(f"outputs/sample/fov{fov}/spatialdata.zarr")
+fov_sdata.write(f"outputs/sample/fov{fov}/ssaft_sdata.zarr")
 ```
 :::
 
