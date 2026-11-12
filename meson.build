@@ -63,6 +63,7 @@ py.install_sources([
   'ssaft/__init__.py',
   'ssaft/_analysis.py',
   'ssaft/_dataset.py',
+  'ssaft/_gene_bins.py',
   'ssaft/_kde_gpu.py',
   'ssaft/_mapping_gpu.py',
   'ssaft/_marker_corr.py',

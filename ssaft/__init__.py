@@ -13,6 +13,7 @@ this package.
 from ._analysis import Analysis
 from ._dataset import Dataset
 
+from ._gene_bins import write_gene_bins, read_gene
 from ._griddataset import GridDataset
 from ._panel import select_gene_panel, resolve_server, fetch_ontology_markers
 from ._io import (aggregate_to_grid, load_visiumhd, load_strata,

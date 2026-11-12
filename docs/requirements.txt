@@ -1,7 +1,12 @@
-# Documentation build only. ssaft itself is NOT installed on Read the Docs: its C extension and
-# GPU stack are mocked in conf.py, and the API pages are generated from the source tree.
+# Documentation build only. ssaft itself is NOT installed on Read the Docs: its C extension
+# (ssaft.utils) and GPU/IO stack are mocked in conf.py, and the API pages are autodoc'd from the
+# source tree. numpy and scipy are the exception — they are imported at module load (e.g.
+# `np.pi` in _count.py and scipy in _analysis.py) and are NOT mocked, so autodoc needs them really
+# installed or the API reference renders empty.
 sphinx>=8.1
 myst-parser>=4.0
 furo>=2024.8.6
 sphinx-copybutton>=0.5.2
 sphinx-design>=0.6.1
+numpy>=1.26
+scipy>=1.11
