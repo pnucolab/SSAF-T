@@ -144,10 +144,11 @@ The clusters are annotated by CeLLMan's **annotate-mode** skill, which runs in C
 rather than in the notebook kernel. It is invoked with a prompt of the form below, with the absolute
 paths filled in. It writes `mouse_kidney_cls_annotated.h5ad` with `obs['cellman_annotation']`, the
 rationale for every cluster, and `celltype_markers.yaml` — the knowledge-graph markers behind each
-label, which the mapping uses next.
+label, which the mapping uses next. The `annotate-lead` agent judges the dataset three times over and
+merges the judgments, as described in [annotate](../pipeline/annotate.md).
 
 ```text
-/annotate-mode Annotate the h5ad file below using the annotate-expert agent.
+/annotate-mode Annotate the h5ad file below.
 
 - input          : /abs/outputs/xenium_kidney/mouse_kidney_cls.h5ad
 - tissue         : mouse, kidney, normal

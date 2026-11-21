@@ -124,7 +124,10 @@ CUDA device numbering in PyTorch follows PCI bus order and may differ from the o
 ## 5. Register CeLLMan with the language-model host
 
 The annotation stage is run by a language-model host (Claude Code or Codex) rather than by Python.
-Copy the skill and the expert agent from the submodule:
+Copy the skill and **both** agents from the submodule. Both are required, because annotation runs as a
+three-judge ensemble by default: `annotate-lead` owns the run and adjudicates, and three
+`annotate-expert` judges supply the independent judgments it merges. With `annotate-lead` absent the
+host cannot start it and the run falls back to a single judgment.
 
 ::::{tab-set}
 
@@ -132,7 +135,7 @@ Copy the skill and the expert agent from the submodule:
 ```bash
 mkdir -p .claude/skills .claude/agents
 cp -r SSAF-T/CeLLMan/skills/annotate-mode .claude/skills/
-cp SSAF-T/CeLLMan/agents/annotate-expert.md .claude/agents/
+cp SSAF-T/CeLLMan/agents/annotate-expert.md SSAF-T/CeLLMan/agents/annotate-lead.md .claude/agents/
 ```
 :::
 
@@ -140,7 +143,7 @@ cp SSAF-T/CeLLMan/agents/annotate-expert.md .claude/agents/
 ```bash
 mkdir -p .agents/skills .codex/agents
 cp -r SSAF-T/CeLLMan/skills/annotate-mode .agents/skills/
-cp SSAF-T/CeLLMan/agents/annotate-expert.toml .codex/agents/
+cp SSAF-T/CeLLMan/agents/annotate-expert.toml SSAF-T/CeLLMan/agents/annotate-lead.toml .codex/agents/
 printf '\n[sandbox_workspace_write]\nnetwork_access = true\n' >> .codex/config.toml
 ```
 :::

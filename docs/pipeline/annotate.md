@@ -1,13 +1,22 @@
 # Annotate (CeLLMan)
 
 The clusters are annotated by [CeLLMan](https://github.com/pnucolab/CeLLMan)'s `annotate-mode`,
-which runs inside a language-model host (Claude Code or Codex) rather than in Python. An
-`annotate-expert` agent loads the knowledge-graph module for the organ and judges every cluster: a
-label is assigned only when the term's own discriminating markers are elevated above the dataset as
-a whole, the deepest such term is chosen, and a cluster that is not a single identity is re-clustered
-on the markers of its ontology children and judged again.
+which runs inside a language-model host (Claude Code or Codex) rather than in Python. An agent loads
+the knowledge-graph module for the organ and judges every cluster: a label is assigned only when the
+term's own discriminating markers are elevated above the dataset as a whole, the deepest such term is
+chosen, and a cluster that is not a single identity is re-clustered on the markers of its ontology
+children and judged again.
 
-The skill and agent are installed as described in
+**Each dataset is judged three times by default.** An `annotate-lead` agent owns the run, and three
+`annotate-expert` judges, handed the same cluster profiles, judge independently of one another. The
+lead keeps the deepest ontology term that a majority of them support and sets each label's confidence
+from how far they agreed, so disagreement is recorded rather than resolved by a coin flip. One result
+is produced either way. Adding `replicates : 1` to the prompt turns the ensemble off, leaving a single
+`annotate-expert` run. The ensemble costs about three times the tokens and about the same wall-clock,
+because the judges run concurrently and the compute runs once. The prompt names no agent: `/annotate-mode`
+means `annotate-lead`, and the skill tells the host which agent to start.
+
+The skill and both agents are installed as described in
 [Installation, step 5](../installation.md#5-register-cellman-with-the-language-model-host).
 
 ## Starting it
@@ -15,7 +24,7 @@ The skill and agent are installed as described in
 Within the host, from the directory into which the skill was installed:
 
 ```text
-/annotate-mode Annotate the h5ad file below using the annotate-expert agent.
+/annotate-mode Annotate the h5ad file below.
 
 - input          : /abs/path/outputs/sample/mouse_kidney_cls.h5ad
 - tissue         : mouse, kidney, normal
@@ -36,6 +45,10 @@ In `out`:
 | `<input>_annotated.h5ad` with `obs['cellman_annotation']` | `map_celltypes(h5ad=...)` |
 | `celltype_markers.yaml`: every emitted label and its ancestors, each with its defining / required / supporting markers | `map_celltypes(marker_genes_path=...)` |
 | `expert_judgment_annotation.csv`: one row per cluster with label, markers and rationale | review |
+| `consensus_report.md`: every cluster the judges disagreed on and what the lead kept (ensemble runs only) | review |
+
+In an ensemble run the annotated h5ad also carries `obs['cellman_consensus_support']` and
+`obs['cellman_consensus_status']`, recording for each cell how many judges supported its label.
 
 A cluster that matches no term is labelled `Unknown` and retained separately per cluster on the map
 (`unknown1..N`); `Background` clusters are discarded.
@@ -48,6 +61,10 @@ column in a reference `h5ad` — the run is started with `/annotate-reference-mo
 space is restricted to the answer key, and any cluster the answer key cannot explain is labelled
 `Unknown`. Only the reference's labels are read; its expression never serves as evidence for the
 clusters under annotation.
+
+Reference runs are **not** ensembled: their labels are the answer key's vocabulary rather than the
+ontology's, so a consensus taken over the ontology hierarchy cannot read them. A reference run is a
+single `annotate-expert`, which is why the prompt below names that agent.
 
 ```text
 /annotate-reference-mode Annotate the h5ad file below using the annotate-expert agent.

@@ -57,7 +57,7 @@ Each cluster is annotated by CeLLMan, run from an agent session; the knowledge g
 the [CeLLMan KG Explorer](https://cellman.pnucolab.com). See [annotate](pipeline/annotate.md).
 
 ```text
-/annotate-mode Annotate the h5ad file below using the annotate-expert agent.
+/annotate-mode Annotate the h5ad file below.
 
 - input          : /abs/outputs/sample/sample_cls.h5ad
 - tissue         : <species>, <organ>, normal

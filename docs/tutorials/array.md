@@ -138,10 +138,11 @@ Ref: [cluster](../pipeline/cluster.md).
 
 As in the imaging-based example, **annotate-mode** runs in Claude Code or Codex, annotates the
 clusters, and writes `mouse_small_intestine_cls_annotated.h5ad` with `obs['cellman_annotation']`
-together with `celltype_markers.yaml`.
+together with `celltype_markers.yaml`. The `annotate-lead` agent judges the dataset three times over
+and merges the judgments, as described in [annotate](../pipeline/annotate.md).
 
 ```text
-/annotate-mode Annotate the h5ad below using the annotate-expert agent.
+/annotate-mode Annotate the h5ad below.
 
 - input          : /abs/outputs/visiumhd_small_intestine/mouse_small_intestine_cls.h5ad
 - tissue         : mouse, small intestine
