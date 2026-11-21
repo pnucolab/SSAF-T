@@ -78,9 +78,11 @@ printf '\n[sandbox_workspace_write]\nnetwork_access = true\n' >> .codex/config.t
 
 ## Documentation
 
-The documentation lives in [`docs/`](docs) and is built with Sphinx (see
-[`.readthedocs.yaml`](.readthedocs.yaml)). It takes the pipeline one stage at a time under
-[`docs/pipeline/`](docs/pipeline) and gives one worked example per data modality:
+The documentation is published at
+**[ssaf-t.readthedocs.io](https://ssaf-t.readthedocs.io/en/latest/)**. Its sources live in
+[`docs/`](docs) and are built with Sphinx (see [`.readthedocs.yaml`](.readthedocs.yaml)). It takes
+the pipeline one stage at a time under [`docs/pipeline/`](docs/pipeline) and gives one worked example
+per data modality:
 
 | tutorial | modality | map |
 |---|---|---|

@@ -5,8 +5,8 @@ import sys
 sys.path.insert(0, os.path.abspath(".."))
 
 project = "SSAF-T"
-author = "PNU Computational Biology Lab"
-copyright = "2026, PNU Computational Biology Lab"
+author = "Yuhui Jeong"
+copyright = "2026, Yuhui Jeong"
 release = "0.1.0"
 version = "0.1"
 
